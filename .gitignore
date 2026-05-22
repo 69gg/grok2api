@@ -1,0 +1,48 @@
+# 本地配置与密钥
+.env
+.env.*
+!.env.example
+config.toml
+config.local.toml
+*.local.toml
+*.secret.toml
+!config.toml.example
+
+# 运行数据、Token、Cookie、API Key
+data/
+logs/
+token.json
+tokens.json
+tokens.*.json
+api_keys.json
+api_key_usage.json
+stats.json
+logs.json
+cookies.txt
+cookies.json
+sessions.json
+*.cookie
+*.cookies
+scripts/turnstile_solver/proxies.txt
+
+# 数据库与日志
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.log
+*.log.*
+
+# Python / 工具缓存
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 构建产物
+dist/
+build/
