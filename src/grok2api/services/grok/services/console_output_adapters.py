@@ -13,6 +13,7 @@ from grok2api.services.grok.services.console_stream_parser import (
     ConsoleEvent,
     ConsoleEventType,
 )
+from grok2api.services.grok.services.console_replay_cache import remember_reasoning_blob
 from grok2api.services.grok.utils.response import make_response_id
 from grok2api.services.grok.utils.usage import from_upstream_responses_usage, to_responses_usage
 
@@ -266,8 +267,29 @@ def _reasoning_item_has_summary_text(item: Dict[str, Any]) -> bool:
     return False
 
 
+_DISPLAY_ONLY_KEY = "_grok2api_display_only"
+
+
+def _is_display_only_replay_item(item: Dict[str, Any]) -> bool:
+    if item.get(_DISPLAY_ONLY_KEY):
+        return True
+    item_id = str(item.get("id") or "").strip()
+    return item_id.startswith("rs_grok2api_")
+
+
+def _make_display_reasoning_item(text: str, *, output_index: int) -> Dict[str, Any]:
+    return {
+        "type": "reasoning",
+        "id": f"rs_grok2api_{output_index}",
+        _DISPLAY_ONLY_KEY: True,
+        "summary": [{"type": "summary_text", "text": text}],
+    }
+
+
 def _inject_reasoning_summary_text(item: Dict[str, Any], text: str) -> Dict[str, Any]:
     if not text or _reasoning_item_has_summary_text(item):
+        return item
+    if item.get("encrypted_content"):
         return item
     patched = copy.deepcopy(item)
     patched["summary"] = [{"type": "summary_text", "text": text}]
@@ -333,6 +355,17 @@ class ConsoleResponsesStreamAdapter:
             if not isinstance(item, dict) or item.get("type") != "reasoning":
                 patched.append(item)
                 continue
+            remember_reasoning_blob(item)
+            if item.get("encrypted_content"):
+                patched.append(item)
+                summary_text = self._summary_text_for_reasoning_item(item, index)
+                if not summary_text:
+                    summary_text = _extract_native_reasoning_text(item)
+                if summary_text:
+                    patched.append(
+                        _make_display_reasoning_item(summary_text, output_index=index)
+                    )
+                continue
             summary_text = self._summary_text_for_reasoning_item(item, index)
             if not summary_text:
                 summary_text = _extract_native_reasoning_text(item)
@@ -367,13 +400,15 @@ class ConsoleResponsesStreamAdapter:
         elif event_type == "response.output_item.done":
             item = data.get("item")
             if isinstance(item, dict) and item.get("type") == "reasoning":
-                summary_text = self._summary_text_for_reasoning_item(
-                    item,
-                    data.get("output_index"),
-                )
-                if summary_text:
-                    data = dict(data)
-                    data["item"] = _inject_reasoning_summary_text(item, summary_text)
+                remember_reasoning_blob(item)
+                if not item.get("encrypted_content"):
+                    summary_text = self._summary_text_for_reasoning_item(
+                        item,
+                        data.get("output_index"),
+                    )
+                    if summary_text:
+                        data = dict(data)
+                        data["item"] = _inject_reasoning_summary_text(item, summary_text)
         elif event_type == "response.completed":
             response = data.get("response")
             if isinstance(response, dict):

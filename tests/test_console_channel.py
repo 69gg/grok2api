@@ -164,8 +164,55 @@ def test_responses_stream_adapter_injects_reasoning_summary_into_completed_outpu
     assert adapter.completed_response is not None
     response = adapter.completed_response["response"]
     reasoning = response["output"][0]
-    assert reasoning["summary"][0]["text"] == "Let me think"
+    assert "summary" not in reasoning
     assert reasoning["encrypted_content"].startswith("abc")
+    assert response["output"][1]["summary"][0]["text"] == "Let me think"
+    assert response["output"][1]["id"].startswith("rs_grok2api_")
+
+
+def test_responses_input_skips_display_only_reasoning_on_replay():
+    blob = "E" * 120
+    input_items = [
+        {"type": "reasoning", "id": "rs_abc", "encrypted_content": blob},
+        {
+            "type": "reasoning",
+            "id": "rs_grok2api_0",
+            "_grok2api_display_only": True,
+            "summary": [{"type": "summary_text", "text": "visible cot"}],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "send_message",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+    ]
+    _, items, history_encrypted = ConsoleInputBuilder.from_responses_input(input_items)
+    assert history_encrypted is True
+    assert len(items) == 3
+    assert items[0]["encrypted_content"] == blob
+    assert all(item.get("id") != "rs_grok2api_0" for item in items)
+
+
+def test_replay_cache_restores_upstream_blob():
+    from grok2api.services.grok.services.console_replay_cache import (
+        clear_reasoning_blobs,
+        remember_reasoning_blob,
+        restore_reasoning_item,
+    )
+
+    clear_reasoning_blobs()
+    upstream = {
+        "type": "reasoning",
+        "id": "rs_cache",
+        "encrypted_content": "Z" * 120,
+    }
+    remember_reasoning_blob(upstream)
+    corrupted = dict(upstream)
+    corrupted["encrypted_content"] = ("Z" * 119) + "Y"
+    restored = restore_reasoning_item(corrupted)
+    assert restored["encrypted_content"] == upstream["encrypted_content"]
 
 
 def test_responses_input_replay_preserves_summary_only_reasoning():
@@ -356,7 +403,12 @@ def test_responses_input_replay_strips_injected_summary_from_encrypted_reasoning
     ]
     _, items, history_encrypted = ConsoleInputBuilder.from_responses_input(input_items)
     assert history_encrypted is True
-    assert items[0] == {"type": "reasoning", "id": "rs_abc", "encrypted_content": blob}
+    assert items[0] == {
+        "type": "reasoning",
+        "id": "rs_abc",
+        "encrypted_content": blob,
+        "status": "completed",
+    }
     assert "summary" not in items[0]
 
 
@@ -401,7 +453,7 @@ def test_responses_input_replay_passthrough_compaction_item():
     assert items[0]["encrypted_content"] == blob
     assert items[0]["id"] == "cmp_abc"
     assert "summary" not in items[0]
-    assert items[0].get("status") is None
+    assert items[0].get("status") == "completed"
 
 
 def test_responses_input_replay_user_message_with_input_image():

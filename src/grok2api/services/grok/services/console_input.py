@@ -13,6 +13,10 @@ from grok2api.services.grok.services.console_capabilities import (
     ConsoleModelCapabilities,
     should_include_encrypted,
 )
+from grok2api.services.grok.services.console_replay_cache import (
+    is_display_only_replay_item,
+    restore_reasoning_item,
+)
 from grok2api.services.grok.utils.tool_call import normalize_function_tool
 from grok2api.services.reverse.console_constants import CONSOLE_ALLOWED_INCLUDE
 
@@ -139,8 +143,9 @@ def _passthrough_replay_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
 def _replay_encrypted_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """Send back only the opaque compaction blob fields x.ai accepts on replay."""
+    item = restore_reasoning_item(item)
     enc = item.get("encrypted_content")
-    if not enc:
+    if not isinstance(enc, str) or not enc:
         return _passthrough_replay_item(item)
     item_type = str(item.get("type") or "reasoning").strip().lower()
     if item_type not in {"reasoning", "compaction"}:
@@ -148,6 +153,7 @@ def _replay_encrypted_item(item: Dict[str, Any]) -> Dict[str, Any]:
     replay: Dict[str, Any] = {
         "type": item_type,
         "encrypted_content": enc,
+        "status": "completed",
     }
     item_id = item.get("id")
     if item_id:
@@ -245,6 +251,9 @@ class ConsoleInputBuilder:
             if not isinstance(item, dict):
                 if isinstance(item, str):
                     items.append({"role": "user", "content": _text_content(item)})
+                continue
+
+            if is_display_only_replay_item(item):
                 continue
 
             item_type = item.get("type")
