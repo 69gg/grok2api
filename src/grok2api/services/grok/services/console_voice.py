@@ -341,6 +341,53 @@ class ConsoleVoiceService:
         return await ConsoleVoiceService._execute_with_token(model, _call)
 
     @staticmethod
+    async def translate(
+        *,
+        model: str,
+        file_bytes: bytes,
+        filename: str,
+        content_type: Optional[str] = None,
+        diarize: Optional[bool] = None,
+        multichannel: Optional[bool] = None,
+        filler_words: Optional[bool] = None,
+        keyterms: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """OpenAI /audio/translations alias: STT with forced English output."""
+        return await ConsoleVoiceService.transcribe(
+            model=model,
+            file_bytes=file_bytes,
+            filename=filename,
+            content_type=content_type,
+            language="en",
+            formatted=True,
+            diarize=diarize,
+            multichannel=multichannel,
+            filler_words=filler_words,
+            keyterms=keyterms,
+        )
+
+    @staticmethod
+    async def relay_stt_websocket(
+        websocket,
+        *,
+        model: str = "grok-stt-1",
+        query_params: Optional[Dict[str, str]] = None,
+    ) -> None:
+        from grok2api.services.reverse.console_voice_ws import relay_stt_websocket as _relay
+
+        ensure_voice_model(model, kind="stt")
+        upstream_query = {
+            k: v
+            for k, v in (query_params or {}).items()
+            if k not in {"model", "api_key"} and v is not None and str(v) != ""
+        }
+
+        async def _call(token: str):
+            await _relay(websocket, token, upstream_query)
+
+        await ConsoleVoiceService._execute_with_token(model, _call)
+
+    @staticmethod
     async def list_voices(*, model: str = "grok-tts-1") -> Dict[str, Any]:
         ensure_voice_model(model, kind="tts")
 

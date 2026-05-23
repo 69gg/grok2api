@@ -475,10 +475,20 @@ def build_console_voice_headers(
     return headers
 
 
+def build_console_voice_ws_headers(
+    cookie_token: str,
+    *,
+    cluster: Optional[str] = None,
+) -> Dict[str, str]:
+    """Build WebSocket headers for console.x.ai Voice APIs."""
+    return build_console_voice_headers(cookie_token, mode="binary", cluster=cluster)
+
+
 __all__ = [
     "build_console_headers",
     "build_console_sso_cookie",
     "build_console_voice_headers",
+    "build_console_voice_ws_headers",
     "build_headers",
     "build_sso_cookie",
     "build_ws_headers",

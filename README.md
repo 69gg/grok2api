@@ -24,11 +24,11 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 
 ## API
 
-保留旧 Python 版 API 能力，包括 OpenAI 兼容聊天、Responses、Anthropic Messages、图片、视频、上传、文件访问、管理 API、function API 和自动注册 API。
+保留旧 Python 版 API 能力，包括 OpenAI 兼容聊天、Responses、Anthropic Messages、图片、视频、**音频（TTS/STT/translations + STT WebSocket）**、上传、文件访问、管理 API、function API 和自动注册 API。
 
 ## 模型池规则
 
-- `ssoBasic`：支持 `grok-4.3-fast`、`grok-imagine-1.0`、`grok-imagine-1.0-edit`，以及全部 **Console Chat Playground** 与 **Console Voice（TTS/STT）** 模型（见下）。
+- `ssoBasic`：支持 `grok-4.3-fast`、`grok-imagine-1.0`、`grok-imagine-1.0-edit`，以及全部 **Console Chat Playground** 与 **Console Voice（TTS/STT/translations + STT WS）** 模型（见下）。
 - `ssoSuper`：保持旧项目模型能力。
 - 图片生成/编辑内部使用 `grok-4.3`。
 
@@ -134,12 +134,12 @@ Playground 五个模型均支持 Image input。网关行为见上文 **图片输
 
 ## Console Voice（TTS/STT）
 
-通过 `console.x.ai` SSO 逆向的 Voice Playground REST API，对外暴露 OpenAI 兼容音频端点。在 `GET /v1/models` 中 `owned_by` 为 `xai-console-voice`。
+通过 `console.x.ai` SSO 逆向的 Voice Playground API，对外暴露 OpenAI 兼容音频端点（REST + STT WebSocket）。在 `GET /v1/models` 中 `owned_by` 为 `xai-console-voice`。
 
 | model_id | 用途 |
 |---|---|
 | `grok-tts-1` | 文字转语音（`/v1/audio/speech`） |
-| `grok-stt-1` | 语音转文字（`/v1/audio/transcriptions`） |
+| `grok-stt-1` | 语音转文字（`/v1/audio/transcriptions`、`/v1/audio/translations`） |
 
 ### 端点
 
@@ -147,7 +147,9 @@ Playground 五个模型均支持 Image input。网关行为见上文 **图片输
 |---|---|
 | `POST /v1/audio/speech` | OpenAI TTS 兼容；JSON body，`input`→上游 `text`，`voice`→`voice_id` |
 | `POST /v1/audio/transcriptions` | OpenAI STT 兼容；multipart，`file` 必填 |
+| `POST /v1/audio/translations` | OpenAI 翻译兼容（**最佳努力**）：内部为 STT + 固定 `language=en` + `format=true`，非独立翻译 API |
 | `GET /v1/audio/voices` | 上游音色列表（`eve` / `ara` / `rex` / `sal` / `leo` 等） |
+| `WS /v1/audio/stt/ws` | xAI STT WebSocket 流式透传（上游 `wss://console.x.ai/v1/stt`）；query 如 `sample_rate=16000&encoding=pcm&interim_results=true&language=en`；认证：`?api_key=` 或 `Authorization: Bearer` |
 
 ### 音色与格式
 
@@ -158,9 +160,17 @@ Playground 五个模型均支持 Image input。网关行为见上文 **图片输
 
 ### 与 OpenAI 的差异（v1）
 
-- 无 `POST /v1/audio/translations`、无流式 TTS/STT WebSocket。
-- `instructions`（TTS）、`prompt` / `temperature`（STT）字段会被忽略。
+- **TTS 无 WebSocket 流式**：Console SSO 仅支持 REST `POST /v1/audio/speech`；官方 `wss://api.x.ai/v1/tts` 需 API Key，不在本实现范围。
+- `POST /v1/audio/translations` 为 STT 英文输出 alias，非严格语义翻译。
+- `instructions`（TTS）、`prompt` / `temperature`（STT/translations）字段会被忽略。
 - 依赖 **`ssoBasic`** 池与 **`proxy.cf_clearance`**（与 Console Chat 相同）。
+
+### STT WebSocket 协议
+
+客户端连接 `WS /v1/audio/stt/ws` 后，消息格式与 [xAI STT WebSocket](https://docs.x.ai/docs/guides/voice) 一致：
+
+- **客户端 → 服务端**：binary PCM 音频块；结束时可发 JSON `{"type":"audio.done"}`
+- **服务端 → 客户端**：JSON 事件 `transcript.created`、`transcript.partial`、`transcript.done`
 
 ### 示例
 
@@ -177,6 +187,15 @@ curl -sS -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
   -H "Authorization: Bearer $API_KEY" \
   -F model=grok-stt-1 \
   -F file=@sample.wav
+
+# Translations (English output via STT)
+curl -sS -X POST http://127.0.0.1:8000/v1/audio/translations \
+  -H "Authorization: Bearer $API_KEY" \
+  -F model=grok-stt-1 \
+  -F file=@sample.wav
+
+# STT WebSocket（需 wscat 或自写客户端；发送 PCM binary，结束发 {"type":"audio.done"}）
+wscat -c "ws://127.0.0.1:8000/v1/audio/stt/ws?api_key=$API_KEY&sample_rate=16000&encoding=pcm&interim_results=true&language=en"
 ```
 
 ## 检查

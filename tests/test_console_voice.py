@@ -180,6 +180,135 @@ async def test_transcribe_mock_upstream():
     assert result["text"] == "hello"
 
 
+@pytest.mark.asyncio
+async def test_translate_forces_english():
+    async def _fake_execute(_model, call):
+        return await call("token")
+
+    with patch(
+        "grok2api.services.grok.services.console_voice.ConsoleSttReverse.request",
+        new=AsyncMock(return_value={"text": "hello", "words": []}),
+    ) as mock_stt:
+        with patch.object(
+            ConsoleVoiceService,
+            "_execute_with_token",
+            new=AsyncMock(side_effect=_fake_execute),
+        ):
+            result = await ConsoleVoiceService.translate(
+                model="grok-stt-1",
+                file_bytes=b"RIFF",
+                filename="sample.wav",
+            )
+    assert result["text"] == "hello"
+    fields = mock_stt.call_args.kwargs["fields"]
+    assert ("language", "en") in fields
+    assert ("format", "true") in fields
+
+
+def test_build_stt_ws_url():
+    from grok2api.services.reverse.console_voice_ws import build_stt_ws_url
+
+    assert build_stt_ws_url() == "wss://console.x.ai/v1/stt"
+    url = build_stt_ws_url({"sample_rate": "16000", "encoding": "pcm"})
+    assert url.startswith("wss://console.x.ai/v1/stt?")
+    assert "sample_rate=16000" in url
+
+
+@pytest.mark.asyncio
+async def test_relay_stt_websocket_mock():
+    from grok2api.services.reverse.console_voice_ws import relay_stt_websocket
+
+    class FakeUpstreamWS:
+        closed = False
+
+        async def send_bytes(self, data):
+            pass
+
+        async def send_str(self, text):
+            pass
+
+        async def close(self):
+            self.closed = True
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    class FakeConn:
+        def __init__(self):
+            self.ws = FakeUpstreamWS()
+
+        async def close(self):
+            await self.ws.close()
+
+    class FakeClientWS:
+        client_state = type("S", (), {"name": "CONNECTED"})()
+
+        def __init__(self):
+            self._messages = [{"type": "websocket.disconnect"}]
+
+        async def receive(self):
+            return self._messages.pop(0)
+
+        async def close(self):
+            pass
+
+    with patch(
+        "grok2api.services.reverse.console_voice_ws.WebSocketClient.connect",
+        new=AsyncMock(return_value=FakeConn()),
+    ):
+        await relay_stt_websocket(FakeClientWS(), "token", {"sample_rate": "16000"})
+
+
+def test_audio_api_translations_json():
+    app = create_app()
+    client = TestClient(app)
+    with patch(
+        "grok2api.api.v1.audio.ConsoleVoiceService.translate",
+        new=AsyncMock(return_value={"text": "translated", "words": []}),
+    ):
+        response = client.post(
+            "/v1/audio/translations",
+            data={"model": "grok-stt-1", "response_format": "json"},
+            files={"file": ("test.wav", b"RIFF", "audio/wav")},
+            headers={"Authorization": "Bearer test-key"},
+        )
+    assert response.status_code == 200
+    assert response.json() == {"text": "translated"}
+
+
+def test_stt_ws_rejects_missing_api_key_when_configured():
+    app = create_app()
+    client = TestClient(app)
+    with patch("grok2api.api.v1.audio_ws.get_admin_api_keys", return_value=["secret-key"]):
+        try:
+            with client.websocket_connect("/v1/audio/stt/ws"):
+                pytest.fail("expected websocket connection to be rejected")
+        except Exception:
+            pass
+
+
+def test_stt_ws_accepts_with_api_key_query():
+    app = create_app()
+    client = TestClient(app)
+
+    async def _fake_relay(ws, *, model, query_params):
+        await ws.send_text('{"type":"transcript.created"}')
+        await ws.close()
+
+    with patch("grok2api.api.v1.audio_ws.get_admin_api_keys", return_value=["secret-key"]):
+        with patch("grok2api.core.auth.get_admin_api_keys", return_value=["secret-key"]):
+            with patch(
+                "grok2api.api.v1.audio_ws.ConsoleVoiceService.relay_stt_websocket",
+                new=AsyncMock(side_effect=_fake_relay),
+            ):
+                with client.websocket_connect("/v1/audio/stt/ws?api_key=secret-key") as ws:
+                    msg = ws.receive_text()
+                    assert "transcript.created" in msg
+
+
 def test_audio_api_speech_route():
     app = create_app()
     client = TestClient(app)
