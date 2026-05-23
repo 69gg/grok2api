@@ -331,9 +331,17 @@ class ModelService:
         return cls._map.get(model_id)
 
     @classmethod
-    def list(cls) -> list[ModelInfo]:
-        """获取所有模型"""
-        return list(cls._map.values())
+    def list(cls, *, has_super_tokens: bool = True) -> list[ModelInfo]:
+        """获取模型列表；无 ssoSuper token 时不返回仅 super 池可用的模型。"""
+        models = list(cls._map.values())
+        if has_super_tokens:
+            return models
+        return [m for m in models if not cls.is_super_pool_only(m.model_id)]
+
+    @classmethod
+    def is_super_pool_only(cls, model_id: str) -> bool:
+        """模型是否仅能通过 ssoSuper 池调用。"""
+        return cls.pool_candidates_for_model(model_id) == ["ssoSuper"]
 
     @classmethod
     def is_console(cls, model_id: str) -> bool:

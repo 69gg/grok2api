@@ -37,14 +37,27 @@ def test_cf_refresh_config_uses_local_solver_route() -> None:
 def test_basic_pool_model_policy() -> None:
     basic_models = {
         model.model_id
-        for model in ModelService.list()
+        for model in ModelService.list(has_super_tokens=True)
         if ModelService.pool_for_model(model.model_id) == "ssoBasic"
     }
     assert "grok-4.3-fast" in basic_models
     assert "grok-imagine-1.0" in basic_models
     assert "grok-4.3" in basic_models
     assert ModelService.pool_candidates_for_model("grok-4") == ["ssoSuper"]
+    assert ModelService.is_super_pool_only("grok-4") is True
+    assert ModelService.is_super_pool_only("grok-4.3-fast") is False
     assert "ssoBasic" in ModelService.pool_candidates_for_model("grok-4.3-fast")
+
+
+def test_model_list_hides_super_only_models_without_super_tokens() -> None:
+    all_ids = {m.model_id for m in ModelService.list(has_super_tokens=True)}
+    basic_ids = {m.model_id for m in ModelService.list(has_super_tokens=False)}
+    assert "grok-4" in all_ids
+    assert "grok-4-heavy" in all_ids
+    assert "grok-4" not in basic_ids
+    assert "grok-4-heavy" not in basic_ids
+    assert "grok-4.3-fast" in basic_ids
+    assert "grok-4.3" in basic_ids
 
 
 def test_image_models_use_grok_43_internally() -> None:
