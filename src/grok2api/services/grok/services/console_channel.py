@@ -189,6 +189,7 @@ class ConsoleChannelService:
                 top_p=top_p,
                 max_output_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
+                reasoning_config={"effort": reasoning_effort} if reasoning_effort else None,
                 text_format=_response_format_to_text_format(response_format),
                 frequency_penalty=frequency_penalty,
                 presence_penalty=presence_penalty,
@@ -251,8 +252,9 @@ class ConsoleChannelService:
         caps = model_info.capabilities or get_console_capabilities(model_info.console_model or model)
         stream_flag = _resolve_stream(stream)
         reasoning_effort = None
-        if isinstance(reasoning, dict):
-            reasoning_effort = reasoning.get("effort")
+        reasoning_config = dict(reasoning) if isinstance(reasoning, dict) else None
+        if reasoning_config:
+            reasoning_effort = reasoning_config.get("effort")
 
         async def build(_token: str) -> Dict[str, Any]:
             instr, input_items, history_encrypted = ConsoleInputBuilder.from_responses_input(
@@ -282,6 +284,7 @@ class ConsoleChannelService:
                 top_p=top_p,
                 max_output_tokens=max_output_tokens,
                 reasoning_effort=reasoning_effort,
+                reasoning_config=reasoning_config,
                 text_format=text_format,
                 frequency_penalty=frequency_penalty,
                 presence_penalty=presence_penalty,
@@ -376,6 +379,7 @@ class ConsoleChannelService:
                 top_p=top_p,
                 max_output_tokens=max_tokens,
                 reasoning_effort=reasoning_effort if thinking_enabled else None,
+                reasoning_config={"effort": reasoning_effort} if thinking_enabled and reasoning_effort else None,
                 history_has_encrypted=history_encrypted,
                 thinking_enabled=thinking_enabled,
             )

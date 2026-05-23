@@ -49,12 +49,18 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 - Console 模型走 **xAI Responses API 原生 tool call**，不使用 grok prompt 的 `<call>` 协议。
 - Token 用量来自上游 `response.completed.usage`，不是本地估算。
 
-### 客户端多轮对话约定
+### 客户端多轮对话约定（对齐 OpenAI Responses API）
 
-1. Playground 上游默认 `store=false`，**不要依赖** `previous_response_id`；每次请求应携带 **完整对话 history**。
-2. Reasoning 模型会返回 `reasoning_content`（Chat）、`thinking` block（Anthropic）或 Responses `reasoning` item；其中 encrypted blob **不可解密**，但应 **原样保存并在下一轮原样回传**，以保留内部推理上下文。
-3. `grok-4.3` 默认返回 **明文 reasoning summary**（非 encrypted）；其余 reasoning 模型为 encrypted 透传。
-4. `-search` 变体会自动注入 `web_search` 与 `x_search`，无需客户端手动添加搜索 tools。
+1. Playground 上游默认 `store=false`，**不要依赖** `previous_response_id`；无状态多轮应携带 **完整 `input[]` history**（reasoning / function_call / function_call_output / message items）。
+2. **Reasoning 标准字段**（见 [OpenAI Reasoning 指南](https://developers.openai.com/api/docs/guides/reasoning)）：
+   - **`/v1/responses`**：`output[]` 中 `{type:"reasoning", summary?, content?, encrypted_content?}` item；**不是** `reasoning_content`
+   - **`/v1/chat/completions`**：网关兼容层映射为 `message.reasoning_content` / `delta.reasoning_content`（便于旧客户端；OpenAI 官方仍推荐 Responses）
+   - **`/v1/messages`**：映射为 `{type:"thinking", thinking:"..."}` block
+3. 无状态续轮：请求带 `include: ["reasoning.encrypted_content"]`，并将上一轮 **完整 reasoning item**（含 `encrypted_content`）原样放入 `input[]`。
+4. Summary：grok-4.3 等模型在 `reasoning.effort != none` 时默认请求 `reasoning.summary: "auto"`（与 OpenAI 一致，需显式开启才返回 summary）。
+5. `grok-4.3` 返回 **明文 summary**（`summary_text` / 流式 `response.reasoning_summary_text.delta`）；build/4.20 等以 **encrypted 透传** 为主。
+6. Assistant message 的 `phase`（`commentary` / `final_answer`）在 replay 时会原样保留。
+7. `-search` 变体会自动注入 `web_search` 与 `x_search`，无需客户端手动添加搜索 tools。
 
 ## 检查
 

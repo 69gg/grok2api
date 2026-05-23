@@ -126,13 +126,23 @@ def _normalize_function_call_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _normalize_reasoning_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    normalized: Dict[str, Any] = {
         "type": "reasoning",
         "id": item.get("id") or _new_reasoning_id(),
-        "status": item.get("status") or "completed",
-        "encrypted_content": item.get("encrypted_content"),
-        "summary": item.get("summary") or [],
     }
+    status = item.get("status")
+    if status:
+        normalized["status"] = status
+    summary = item.get("summary")
+    if isinstance(summary, list) and summary:
+        normalized["summary"] = summary
+    content = item.get("content")
+    if isinstance(content, list) and content:
+        normalized["content"] = content
+    enc = item.get("encrypted_content")
+    if enc:
+        normalized["encrypted_content"] = enc
+    return normalized
 
 
 def _normalize_replay_message_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -166,7 +176,19 @@ def _normalize_replay_message_item(item: Dict[str, Any]) -> Optional[Dict[str, A
                 elif part_type == "refusal":
                     parts.append(part)
             if parts:
-                return {"type": "message", "role": "assistant", "content": parts}
+                msg: Dict[str, Any] = {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": parts,
+                }
+                if item.get("id"):
+                    msg["id"] = item.get("id")
+                if item.get("status"):
+                    msg["status"] = item.get("status")
+                phase = item.get("phase")
+                if phase is not None:
+                    msg["phase"] = str(phase)
+                return msg
     return None
 
 
@@ -205,10 +227,9 @@ class ConsoleInputBuilder:
                 continue
 
             if item_type == "reasoning" or (item_type is None and item.get("encrypted_content")):
-                enc = item.get("encrypted_content")
-                if enc:
+                if item.get("encrypted_content"):
                     history_encrypted = True
-                    items.append(_normalize_reasoning_item(item))
+                items.append(_normalize_reasoning_item(item))
                 continue
 
             if item_type == "function_call":
@@ -441,6 +462,7 @@ class ConsoleInputBuilder:
         top_p: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
+        reasoning_config: Optional[Dict[str, Any]] = None,
         text_format: Optional[Dict[str, Any]] = None,
         frequency_penalty: Optional[float] = None,
         presence_penalty: Optional[float] = None,
@@ -478,26 +500,37 @@ class ConsoleInputBuilder:
             payload["text"] = {"format": text_format}
 
         reasoning: Dict[str, Any] = {}
-        if caps.supports_reasoning_effort and reasoning_effort:
-            reasoning["effort"] = reasoning_effort
-        if caps.supports_reasoning_summary:
-            reasoning["summary"] = "detailed"
+        if isinstance(reasoning_config, dict):
+            for key, value in reasoning_config.items():
+                if value is not None:
+                    reasoning[key] = value
+        effort = reasoning.get("effort") or reasoning_effort
+        if caps.supports_reasoning_effort and effort is not None and "effort" not in reasoning:
+            reasoning["effort"] = effort
+        if caps.supports_reasoning_summary and "summary" not in reasoning:
+            effort_text = str(reasoning.get("effort") or reasoning_effort or "").lower()
+            if effort_text not in ("none", ""):
+                reasoning["summary"] = "auto"
         if reasoning:
             payload["reasoning"] = reasoning
 
+        include_values: List[str] = []
+        if request_include:
+            include_values.extend(
+                item for item in request_include if item in CONSOLE_ALLOWED_INCLUDE
+            )
         include_encrypted = should_include_encrypted(
             caps,
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=str(reasoning.get("effort") or reasoning_effort or ""),
             thinking_enabled=thinking_enabled,
             request_include=request_include,
             history_has_encrypted=history_has_encrypted,
         )
         if include_encrypted and caps.supports_encrypted_reasoning:
-            payload["include"] = ["reasoning.encrypted_content"]
-        elif request_include:
-            allowed = [item for item in request_include if item in CONSOLE_ALLOWED_INCLUDE]
-            if allowed:
-                payload["include"] = allowed
+            if "reasoning.encrypted_content" not in include_values:
+                include_values.append("reasoning.encrypted_content")
+        if include_values:
+            payload["include"] = include_values
 
         return payload
 

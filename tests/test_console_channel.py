@@ -118,6 +118,41 @@ def test_build_payload_filters_invalid_include_and_tool_choice():
     assert payload.get("include") == ["reasoning.encrypted_content"]
     assert "tool_choice" not in payload
     assert "tools" not in payload
+    assert "reasoning" not in payload
+
+
+def test_build_payload_uses_openai_reasoning_summary_auto():
+    from grok2api.services.grok.services.console_capabilities import CAP_GROK_43
+
+    payload = ConsoleInputBuilder.build_payload(
+        console_model="grok-4.3",
+        caps=CAP_GROK_43,
+        input_items=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        stream=True,
+        reasoning_config={"effort": "medium"},
+    )
+    assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
+
+
+def test_responses_input_replay_preserves_summary_only_reasoning():
+    input_items = [
+        {
+            "type": "reasoning",
+            "id": "rs_abc",
+            "summary": [{"type": "summary_text", "text": "thinking..."}],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "hello"}],
+        },
+    ]
+    _, items, history_encrypted = ConsoleInputBuilder.from_responses_input(input_items)
+    assert history_encrypted is False
+    assert items[0]["type"] == "reasoning"
+    assert items[0]["summary"][0]["text"] == "thinking..."
+    assert items[1]["phase"] == "final_answer"
 
 
 def test_stream_parser_completed_carries_usage():
