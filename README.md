@@ -28,9 +28,35 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 
 ## 模型池规则
 
-- `ssoBasic`：仅支持 `grok-4.3-fast`、`grok-imagine-1.0`、`grok-imagine-1.0-edit`。
+- `ssoBasic`：支持 `grok-4.3-fast`、`grok-imagine-1.0`、`grok-imagine-1.0-edit`，以及全部 **Console Chat Playground** 模型（见下）。
 - `ssoSuper`：保持旧项目模型能力。
 - 图片生成/编辑内部使用 `grok-4.3`。
+
+## Console Chat Playground 模型
+
+通过 `console.x.ai` SSO 逆向的 Playground 免费高级模型。在 `GET /v1/models` 中 `owned_by` 为 `xai-console`。
+
+| model_id | 说明 |
+|---|---|
+| `grok-4.3` / `grok-4.3-search` | grok-4.3；`-search` 自动启用 web/x 搜索 |
+| `grok-build-0.1` / `grok-build-0.1-search` | build 模型 |
+| `grok-4.20-0309-non-reasoning` / `...-search` | 支持 frequency/presence penalty |
+| `grok-4.20-0309-reasoning` / `...-search` | 内置 reasoning + encrypted CoT |
+| `grok-4.20-multi-agent-0309` / `...-search` | multi-agent |
+
+### 与 grok.com 通道的区别
+
+- Console 模型走 **xAI Responses API 原生 tool call**，不使用 grok prompt 的 `<call>` 协议。
+- Token 用量来自上游 `response.completed.usage`，不是本地估算。
+
+### 客户端多轮对话约定
+
+1. Playground 上游默认 `store=false`，**不要依赖** `previous_response_id`；每次请求应携带 **完整对话 history**。
+2. Reasoning 模型会返回 `reasoning_content`（Chat）、`thinking` block（Anthropic）或 Responses `reasoning` item；其中 encrypted blob **不可解密**，但应 **原样保存并在下一轮原样回传**，以保留内部推理上下文。
+3. `grok-4.3` 默认返回 **明文 reasoning summary**（非 encrypted）；其余 reasoning 模型为 encrypted 透传。
+4. `-search` 变体会自动注入 `web_search_preview` 与 `x_search`，无需客户端手动添加搜索 tools。
+
+配置见 `config.toml.example` 的 `[console]` 段。
 
 ## 检查
 

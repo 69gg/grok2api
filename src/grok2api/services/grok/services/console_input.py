@@ -1,0 +1,428 @@
+"""Build console.x.ai Responses API input[] from Chat/Anthropic/Responses requests."""
+
+from __future__ import annotations
+
+import re
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
+
+import orjson
+
+from grok2api.services.grok.services.console_capabilities import (
+    ConsoleModelCapabilities,
+    should_include_encrypted,
+)
+from grok2api.services.grok.utils.tool_call import normalize_function_tool
+
+_ENCRYPTED_RE = re.compile(r"^[A-Za-z0-9+/=_-]{80,}$")
+
+
+def _new_reasoning_id() -> str:
+    return f"rs_{uuid.uuid4().hex[:24]}"
+
+
+def _new_call_id() -> str:
+    return f"call_{uuid.uuid4().hex[:24]}"
+
+
+def is_encrypted_reasoning(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.replace("\n", "").replace(" ", "").replace("\r", "")
+    if len(stripped) < 80:
+        return False
+    sample = stripped[:512]
+    return bool(_ENCRYPTED_RE.match(sample))
+
+
+def _text_content(text: str) -> List[Dict[str, Any]]:
+    return [{"type": "input_text", "text": text}]
+
+
+def _output_text_content(text: str) -> List[Dict[str, Any]]:
+    return [{"type": "output_text", "text": text}]
+
+
+class ConsoleInputBuilder:
+    """Convert heterogeneous client history into Responses input[]."""
+
+    @staticmethod
+    def from_responses_input(
+        input_value: Any,
+        *,
+        instructions: Optional[str] = None,
+    ) -> Tuple[Optional[str], List[Dict[str, Any]], bool]:
+        instructions_parts: List[str] = []
+        if instructions:
+            instructions_parts.append(instructions)
+        items: List[Dict[str, Any]] = []
+        history_encrypted = False
+
+        if input_value is None:
+            return ("\n\n".join(instructions_parts) or None), items, history_encrypted
+
+        raw_items = input_value if isinstance(input_value, list) else [input_value]
+        for item in raw_items:
+            if not isinstance(item, dict):
+                if isinstance(item, str):
+                    items.append({"role": "user", "content": _text_content(item)})
+                continue
+
+            item_type = item.get("type")
+            role = item.get("role")
+
+            if role in {"system", "developer"}:
+                content = item.get("content")
+                if isinstance(content, str) and content.strip():
+                    instructions_parts.append(content.strip())
+                continue
+
+            if item_type == "reasoning" or (item_type is None and item.get("encrypted_content")):
+                enc = item.get("encrypted_content")
+                if enc:
+                    history_encrypted = True
+                    items.append(
+                        {
+                            "type": "reasoning",
+                            "id": item.get("id") or _new_reasoning_id(),
+                            "status": item.get("status") or "completed",
+                            "encrypted_content": enc,
+                            "summary": item.get("summary") or [],
+                        }
+                    )
+                continue
+
+            if item_type == "function_call":
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": item.get("call_id") or item.get("id") or _new_call_id(),
+                        "name": item.get("name"),
+                        "arguments": item.get("arguments")
+                        if isinstance(item.get("arguments"), str)
+                        else orjson.dumps(item.get("arguments") or {}).decode(),
+                    }
+                )
+                continue
+
+            if item_type in {"function_call_output", "tool_call_output", "tool_output"}:
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": item.get("call_id") or item.get("tool_call_id") or item.get("id"),
+                        "output": item.get("output") or item.get("content") or "",
+                    }
+                )
+                continue
+
+            if item_type == "message" or role in {"user", "assistant"}:
+                content = item.get("content")
+                if role == "assistant" or item.get("role") == "assistant":
+                    if isinstance(content, str) and content:
+                        items.append(
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": _output_text_content(content),
+                            }
+                        )
+                    elif isinstance(content, list):
+                        texts = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") in {
+                                "output_text",
+                                "text",
+                            }:
+                                text = part.get("text") or part.get("content") or ""
+                                if text:
+                                    texts.append(text)
+                        if texts:
+                            items.append(
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": _output_text_content("\n".join(texts)),
+                                }
+                            )
+                else:
+                    if isinstance(content, str):
+                        items.append({"role": "user", "content": _text_content(content)})
+                    elif isinstance(content, list):
+                        items.append({"role": "user", "content": content})
+                continue
+
+            if role == "user":
+                content = item.get("content")
+                if isinstance(content, str):
+                    items.append({"role": "user", "content": _text_content(content)})
+                elif isinstance(content, list):
+                    items.append({"role": "user", "content": content})
+
+        merged_instructions = "\n\n".join(instructions_parts) if instructions_parts else None
+        return merged_instructions, items, history_encrypted
+
+    @staticmethod
+    def from_chat_messages(
+        messages: List[Dict[str, Any]],
+    ) -> Tuple[Optional[str], List[Dict[str, Any]], bool]:
+        instructions_parts: List[str] = []
+        items: List[Dict[str, Any]] = []
+        history_encrypted = False
+
+        for message in messages:
+            role = message.get("role")
+            if role in {"system", "developer"}:
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    instructions_parts.append(content.strip())
+                continue
+
+            if role == "user":
+                content = message.get("content")
+                if isinstance(content, str):
+                    items.append({"role": "user", "content": _text_content(content)})
+                elif isinstance(content, list):
+                    blocks = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                blocks.append(
+                                    {"type": "input_text", "text": block.get("text") or ""}
+                                )
+                            else:
+                                blocks.append(block)
+                    items.append({"role": "user", "content": blocks or _text_content("")})
+                continue
+
+            if role == "assistant":
+                reasoning = message.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning.strip():
+                    if is_encrypted_reasoning(reasoning):
+                        history_encrypted = True
+                        items.append(
+                            {
+                                "type": "reasoning",
+                                "id": _new_reasoning_id(),
+                                "status": "completed",
+                                "encrypted_content": reasoning.strip(),
+                                "summary": [],
+                            }
+                        )
+                    # plaintext summary stays in visible content path for grok-4.3
+
+                tool_calls = message.get("tool_calls") or []
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    fn = tool_call.get("function") or {}
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tool_call.get("id") or _new_call_id(),
+                            "name": fn.get("name"),
+                            "arguments": fn.get("arguments") or "{}",
+                        }
+                    )
+
+                content = message.get("content")
+                text = ""
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            parts.append(block.get("text") or "")
+                    text = "\n".join(p for p in parts if p)
+                if isinstance(reasoning, str) and reasoning.strip() and not is_encrypted_reasoning(reasoning):
+                    prefix = reasoning.strip()
+                    text = f"{prefix}\n\n{text}" if text else prefix
+                if text or not tool_calls:
+                    items.append(
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": _output_text_content(text or ""),
+                        }
+                    )
+                continue
+
+            if role == "tool":
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": message.get("tool_call_id") or _new_call_id(),
+                        "output": message.get("content") or "",
+                    }
+                )
+
+        return ("\n\n".join(instructions_parts) or None), items, history_encrypted
+
+    @staticmethod
+    def from_anthropic_raw_messages(
+        messages: List[Dict[str, Any]],
+    ) -> Tuple[Optional[str], List[Dict[str, Any]], bool]:
+        chat_messages: List[Dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role")
+            if role == "assistant":
+                content = message.get("content")
+                assistant: Dict[str, Any] = {"role": "assistant"}
+                text_parts: List[str] = []
+                if isinstance(content, str):
+                    text_parts.append(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = block.get("type")
+                        if block_type == "thinking":
+                            thinking = block.get("thinking") or ""
+                            if thinking:
+                                assistant["reasoning_content"] = thinking
+                        elif block_type == "text":
+                            text = block.get("text") or ""
+                            if text:
+                                text_parts.append(text)
+                        elif block_type == "tool_use":
+                            if "tool_calls" not in assistant:
+                                assistant["tool_calls"] = []
+                            assistant["tool_calls"].append(
+                                {
+                                    "id": block.get("id") or _new_call_id(),
+                                    "type": "function",
+                                    "function": {
+                                        "name": block.get("name"),
+                                        "arguments": orjson.dumps(block.get("input") or {}).decode(),
+                                    },
+                                }
+                            )
+                if text_parts:
+                    assistant["content"] = "\n\n".join(text_parts)
+                if len(assistant) > 1:
+                    chat_messages.append(assistant)
+                continue
+            if role == "user":
+                content = message.get("content")
+                if isinstance(content, str):
+                    chat_messages.append({"role": "user", "content": content})
+                elif isinstance(content, list):
+                    tool_results: List[Dict[str, Any]] = []
+                    user_text: List[str] = []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "tool_result":
+                            tool_results.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": block.get("tool_use_id") or _new_call_id(),
+                                    "content": block.get("content") or "",
+                                }
+                            )
+                        elif block.get("type") == "text":
+                            user_text.append(block.get("text") or "")
+                    if user_text:
+                        chat_messages.append({"role": "user", "content": "\n".join(user_text)})
+                    chat_messages.extend(tool_results)
+        return ConsoleInputBuilder.from_chat_messages(chat_messages)
+
+    @staticmethod
+    def normalize_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        if not tools:
+            return []
+        normalized: List[Dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_type = tool.get("type")
+            if tool_type in {"web_search_preview", "x_search"}:
+                normalized.append({"type": tool_type})
+                continue
+            if tool_type == "function":
+                flat = normalize_function_tool(tool)
+                if flat:
+                    normalized.append(
+                        {
+                            "type": "function",
+                            "name": flat.get("name"),
+                            "description": flat.get("description") or "",
+                            "parameters": flat.get("parameters") or {"type": "object", "properties": {}},
+                        }
+                    )
+        return normalized
+
+    @staticmethod
+    def build_payload(
+        *,
+        console_model: str,
+        caps: ConsoleModelCapabilities,
+        input_items: List[Dict[str, Any]],
+        instructions: Optional[str] = None,
+        stream: bool = True,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+        text_format: Optional[Dict[str, Any]] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        parallel_tool_calls: Optional[bool] = True,
+        request_include: Optional[List[str]] = None,
+        history_has_encrypted: bool = False,
+        thinking_enabled: bool = False,
+        store: bool = False,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": console_model,
+            "input": input_items,
+            "stream": stream,
+            "store": store,
+        }
+        if instructions:
+            payload["instructions"] = instructions
+        if tools:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if max_output_tokens is not None:
+            payload["max_output_tokens"] = max_output_tokens
+        if parallel_tool_calls is not None:
+            payload["parallel_tool_calls"] = parallel_tool_calls
+        if frequency_penalty is not None:
+            payload["frequency_penalty"] = frequency_penalty
+        if presence_penalty is not None:
+            payload["presence_penalty"] = presence_penalty
+        if text_format:
+            payload["text"] = {"format": text_format}
+
+        reasoning: Dict[str, Any] = {}
+        if caps.supports_reasoning_effort and reasoning_effort:
+            reasoning["effort"] = reasoning_effort
+        if caps.supports_reasoning_summary:
+            reasoning["summary"] = "detailed"
+        if reasoning:
+            payload["reasoning"] = reasoning
+
+        include_encrypted = should_include_encrypted(
+            caps,
+            reasoning_effort=reasoning_effort,
+            thinking_enabled=thinking_enabled,
+            request_include=request_include,
+            history_has_encrypted=history_has_encrypted,
+        )
+        if include_encrypted and caps.supports_encrypted_reasoning:
+            payload["include"] = ["reasoning.encrypted_content"]
+        elif request_include:
+            payload["include"] = list(request_include)
+
+        return payload
+
+
+__all__ = ["ConsoleInputBuilder", "is_encrypted_reasoning"]

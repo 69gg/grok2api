@@ -24,7 +24,8 @@ from grok2api.core.exceptions import (
 )
 from grok2api.core.logger import logger
 from grok2api.services.grok.services.chat import ChatService
-from grok2api.services.grok.services.model import ModelService
+from grok2api.services.grok.services.console_channel import ConsoleChannelService
+from grok2api.services.grok.services.model import Channel, ModelService
 from grok2api.services.grok.utils import process as proc_base
 
 
@@ -895,6 +896,28 @@ async def create_message(request: Request, payload: AnthropicMessagesRequest):
         internal_messages.extend(_normalize_anthropic_messages(payload.messages))
         if not internal_messages:
             return _anthropic_json_error("messages cannot be empty")
+
+        if ModelService.is_console(payload.model):
+            raw_messages = [msg.model_dump() for msg in payload.messages]
+            result = await ConsoleChannelService.messages(
+                model=payload.model,
+                messages=raw_messages,
+                system=payload.system,
+                stream=bool(payload.stream),
+                max_tokens=payload.max_tokens,
+                temperature=payload.temperature,
+                top_p=payload.top_p,
+                tools=tools or None,
+                tool_choice=tool_choice,
+                thinking=payload.thinking.model_dump() if payload.thinking else None,
+            )
+            if payload.stream:
+                return StreamingResponse(
+                    result,
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                )
+            return JSONResponse(content=result)
 
         result = await ChatService.completions(
             model=payload.model,

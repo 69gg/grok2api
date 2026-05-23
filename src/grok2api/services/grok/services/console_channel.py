@@ -1,0 +1,488 @@
+"""Console.x.ai channel orchestration for chat / responses / anthropic APIs."""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
+
+import orjson
+from curl_cffi.requests import AsyncSession
+
+from grok2api.core.config import get_config
+from grok2api.core.exceptions import UpstreamException, ValidationException
+from grok2api.services.grok.services.console_capabilities import (
+    filter_payload,
+    get_console_capabilities,
+    merge_tools,
+)
+from grok2api.services.grok.services.console_input import ConsoleInputBuilder
+from grok2api.services.grok.services.console_output_adapters import (
+    ConsoleChatStreamAdapter,
+    ConsoleResponsesStreamAdapter,
+    anthropic_usage_from_chat,
+)
+from grok2api.services.grok.services.console_stream_parser import ConsoleStreamParser
+from grok2api.services.grok.services.model import Channel, ModelService
+from grok2api.services.grok.utils.errors import no_token_error
+from grok2api.services.grok.utils.retry import pick_token
+from grok2api.services.grok.utils.usage import from_upstream_responses_usage, to_responses_usage
+from grok2api.services.reverse.console_auth import ensure_console_team_id
+from grok2api.services.reverse.console_responses import ConsoleResponsesReverse
+from grok2api.services.token import get_token_manager
+from grok2api.services.token.models import TokenInfo
+
+
+def _console_enabled() -> bool:
+    return bool(get_config("console.enabled", True))
+
+
+def _resolve_model(model_id: str):
+    if not _console_enabled():
+        raise ValidationException(
+            message="Console channel is disabled",
+            param="model",
+            code="invalid_request_error",
+        )
+    model = ModelService.get(model_id)
+    if not model or model.channel != Channel.CONSOLE:
+        raise ValidationException(
+            message=f"Model `{model_id}` is not a console model",
+            param="model",
+            code="model_not_found",
+        )
+    return model
+
+
+def _response_format_to_text_format(response_format: Any) -> Optional[Dict[str, Any]]:
+    if response_format is None:
+        return None
+    if isinstance(response_format, str):
+        if response_format == "json_object":
+            return {"type": "json_object"}
+        return {"type": "text"}
+    if isinstance(response_format, dict):
+        rf_type = response_format.get("type")
+        if rf_type == "json_schema":
+            schema = response_format.get("json_schema") or response_format.get("schema") or {}
+            if isinstance(schema, dict) and "schema" in schema:
+                schema = schema["schema"]
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_format.get("name") or "response",
+                    "schema": schema,
+                    "strict": response_format.get("strict", True),
+                },
+            }
+        if rf_type == "json_object":
+            return {"type": "json_object"}
+    return {"type": "text"}
+
+
+async def _get_token_meta(token: str) -> Optional[TokenInfo]:
+    manager = await get_token_manager()
+    for pool in manager.pools.values():
+        info = pool.get(token)
+        if info:
+            return info
+    return None
+
+
+async def _resolve_team_id(session: AsyncSession, token: str) -> str:
+    manager = await get_token_manager()
+    meta = await _get_token_meta(token)
+    if meta and meta.console_team_id:
+        return meta.console_team_id
+    team_id = await ensure_console_team_id(session, token, None)
+    if meta:
+        meta.console_team_id = team_id
+        manager._dirty = True
+        manager._schedule_save()
+    return team_id
+
+
+class ConsoleChannelService:
+    @staticmethod
+    async def _stream_upstream(
+        payload: Dict[str, Any],
+        *,
+        token: str,
+        team_id: str,
+    ) -> AsyncIterator[str]:
+        session = AsyncSession()
+        line_iter = await ConsoleResponsesReverse.request(
+            session,
+            token,
+            payload,
+            team_id=team_id,
+            stream=True,
+        )
+        async for line in line_iter:
+            yield line
+
+    @staticmethod
+    async def _execute_with_token(
+        model_id: str,
+        build_payload_fn,
+        *,
+        stream: bool,
+    ):
+        if not _console_enabled():
+            raise ValidationException(message="Console channel is disabled", param="model")
+
+        token_mgr = await get_token_manager()
+        await token_mgr.reload_if_stale()
+        tried: set[str] = set()
+        max_retries = int(get_config("retry.max_retry") or 3)
+        last_error = None
+
+        for _ in range(max_retries):
+            token = await pick_token(token_mgr, model_id, tried)
+            if not token:
+                if last_error:
+                    raise last_error
+                raise no_token_error(model_id)
+            tried.add(token)
+            session = AsyncSession()
+            try:
+                team_id = await _resolve_team_id(session, token)
+                payload = await build_payload_fn(token, team_id)
+                if stream:
+                    async def gen():
+                        async for line in ConsoleChannelService._stream_upstream(
+                            payload, token=token, team_id=team_id
+                        ):
+                            yield line
+                    return gen()
+                lines = []
+                async for line in ConsoleChannelService._stream_upstream(
+                    payload, token=token, team_id=team_id
+                ):
+                    lines.append(line)
+                return lines
+            except UpstreamException as exc:
+                last_error = exc
+                continue
+            finally:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+        if last_error:
+            raise last_error
+        raise no_token_error(model_id)
+
+    @staticmethod
+    async def chat_completions(
+        *,
+        model: str,
+        messages: List[Dict[str, Any]],
+        stream: bool = False,
+        reasoning_effort: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: Optional[bool] = True,
+        max_tokens: Optional[int] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        response_format: Any = None,
+    ):
+        model_info = _resolve_model(model)
+        caps = model_info.capabilities or get_console_capabilities(model_info.console_model or model)
+
+        async def build(_token: str, _team_id: str) -> Dict[str, Any]:
+            instructions, input_items, history_encrypted = ConsoleInputBuilder.from_chat_messages(
+                messages
+            )
+            merged_tools = merge_tools(
+                ConsoleInputBuilder.normalize_tools(tools),
+                console_search=bool(model_info.console_search),
+            )
+            payload = ConsoleInputBuilder.build_payload(
+                console_model=model_info.console_model or model,
+                caps=caps,
+                input_items=input_items,
+                instructions=instructions,
+                stream=stream,
+                tools=merged_tools or None,
+                tool_choice=tool_choice,
+                temperature=temperature,
+                top_p=top_p,
+                max_output_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                text_format=_response_format_to_text_format(response_format),
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                parallel_tool_calls=parallel_tool_calls,
+                history_has_encrypted=history_encrypted,
+                thinking_enabled=bool(reasoning_effort and reasoning_effort.lower() != "none"),
+            )
+            return filter_payload(caps, payload)
+
+        result = await ConsoleChannelService._execute_with_token(
+            model, build, stream=stream
+        )
+
+        if stream:
+            async def chat_stream():
+                adapter = ConsoleChatStreamAdapter(model)
+                parser = ConsoleStreamParser()
+                async for line in result:
+                    for event in parser.ingest_line(line):
+                        for chunk in adapter.ingest(event):
+                            yield chunk
+                for chunk in adapter.finalize():
+                    yield chunk
+            return chat_stream()
+
+        parser = ConsoleStreamParser()
+        adapter = ConsoleChatStreamAdapter(model)
+        for line in result:
+            for event in parser.ingest_line(line):
+                adapter.ingest(event)
+        return adapter.build_non_stream_response()
+
+    @staticmethod
+    async def responses(
+        *,
+        model: str,
+        input_value: Any,
+        instructions: Optional[str] = None,
+        stream: bool = False,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: Optional[bool] = True,
+        reasoning: Optional[Dict[str, Any]] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
+        text: Optional[Dict[str, Any]] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        include: Optional[List[str]] = None,
+        store: Optional[bool] = False,
+        previous_response_id: Optional[str] = None,
+        **extra: Any,
+    ):
+        if previous_response_id and not get_config("console.allow_previous_response_id"):
+            previous_response_id = None
+
+        model_info = _resolve_model(model)
+        caps = model_info.capabilities or get_console_capabilities(model_info.console_model or model)
+        reasoning_effort = None
+        if isinstance(reasoning, dict):
+            reasoning_effort = reasoning.get("effort")
+
+        async def build(_token: str, _team_id: str) -> Dict[str, Any]:
+            instr, input_items, history_encrypted = ConsoleInputBuilder.from_responses_input(
+                input_value, instructions=instructions
+            )
+            merged_tools = merge_tools(
+                ConsoleInputBuilder.normalize_tools(tools),
+                console_search=bool(model_info.console_search),
+            )
+            text_format = None
+            if isinstance(text, dict):
+                text_format = text.get("format")
+            payload = ConsoleInputBuilder.build_payload(
+                console_model=model_info.console_model or model,
+                caps=caps,
+                input_items=input_items,
+                instructions=instr,
+                stream=stream,
+                tools=merged_tools or None,
+                tool_choice=tool_choice,
+                temperature=temperature,
+                top_p=top_p,
+                max_output_tokens=max_output_tokens,
+                reasoning_effort=reasoning_effort,
+                text_format=text_format,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                parallel_tool_calls=parallel_tool_calls,
+                request_include=include,
+                history_has_encrypted=history_encrypted,
+                store=bool(store),
+            )
+            if previous_response_id and get_config("console.allow_previous_response_id"):
+                payload["previous_response_id"] = previous_response_id
+            payload.update({k: v for k, v in extra.items() if v is not None})
+            return filter_payload(caps, payload)
+
+        result = await ConsoleChannelService._execute_with_token(
+            model, build, stream=stream
+        )
+
+        if stream:
+            async def resp_stream():
+                adapter = ConsoleResponsesStreamAdapter(model)
+                async for line in result:
+                    out = adapter.ingest_raw_line(line)
+                    if out:
+                        yield out
+            return resp_stream()
+
+        adapter = ConsoleResponsesStreamAdapter(model)
+        for line in result:
+            adapter.ingest_raw_line(line)
+        if adapter.completed_response:
+            response = adapter.completed_response.get("response") or adapter.completed_response
+            response["model"] = model
+            return response
+        return {"id": f"resp_{uuid.uuid4().hex[:24]}", "object": "response", "model": model, "output": []}
+
+    @staticmethod
+    async def messages(
+        *,
+        model: str,
+        messages: List[Dict[str, Any]],
+        system: Optional[Any] = None,
+        stream: bool = False,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
+        thinking: Optional[Dict[str, Any]] = None,
+    ):
+        model_info = _resolve_model(model)
+        caps = model_info.capabilities or get_console_capabilities(model_info.console_model or model)
+
+        instr, input_items, history_encrypted = ConsoleInputBuilder.from_anthropic_raw_messages(
+            messages
+        )
+        if system:
+            if isinstance(system, str):
+                instr = f"{system}\n\n{instr}" if instr else system
+            elif isinstance(system, list):
+                parts = []
+                for block in system:
+                    if isinstance(block, dict) and block.get("text"):
+                        parts.append(str(block["text"]))
+                if parts:
+                    sys_text = "\n".join(parts)
+                    instr = f"{sys_text}\n\n{instr}" if instr else sys_text
+
+        thinking_enabled = False
+        reasoning_effort = None
+        if isinstance(thinking, dict) and thinking.get("enabled"):
+            thinking_enabled = True
+            reasoning_effort = thinking.get("effort") or "low"
+
+        async def build(_token: str, _team_id: str) -> Dict[str, Any]:
+            merged_tools = merge_tools(
+                ConsoleInputBuilder.normalize_tools(tools),
+                console_search=bool(model_info.console_search),
+            )
+            payload = ConsoleInputBuilder.build_payload(
+                console_model=model_info.console_model or model,
+                caps=caps,
+                input_items=input_items,
+                instructions=instr,
+                stream=stream,
+                tools=merged_tools or None,
+                tool_choice=tool_choice,
+                temperature=temperature,
+                top_p=top_p,
+                max_output_tokens=max_tokens,
+                reasoning_effort=reasoning_effort if thinking_enabled else None,
+                history_has_encrypted=history_encrypted,
+                thinking_enabled=thinking_enabled,
+            )
+            return filter_payload(caps, payload)
+
+        result = await ConsoleChannelService._execute_with_token(model, build, stream=stream)
+
+        if stream:
+            async def anthropic_stream():
+                from grok2api.api.v1.messages import _AnthropicStreamAdapter
+
+                message_id = f"msg_{uuid.uuid4().hex[:24]}"
+                adapter = _AnthropicStreamAdapter(
+                    model=model,
+                    message_id=message_id,
+                    include_thinking=thinking_enabled,
+                    stop_sequences=[],
+                )
+                chat_adapter = ConsoleChatStreamAdapter(model)
+                parser = ConsoleStreamParser()
+                async for line in result:
+                    for event in parser.ingest_line(line):
+                        for chunk in chat_adapter.ingest(event):
+                            if not chunk.startswith("data:"):
+                                continue
+                            payload_text = chunk[5:].strip()
+                            if payload_text == "[DONE]":
+                                break
+                            try:
+                                data = orjson.loads(payload_text)
+                            except orjson.JSONDecodeError:
+                                continue
+                            if data.get("object") != "chat.completion.chunk":
+                                continue
+                            for ev in adapter.ensure_message_started():
+                                yield ev
+                            choice = (data.get("choices") or [{}])[0]
+                            delta = choice.get("delta") or {}
+                            if isinstance(delta.get("reasoning_content"), str):
+                                for ev in adapter.ingest_reasoning(delta["reasoning_content"]):
+                                    yield ev
+                            if isinstance(delta.get("content"), str):
+                                for ev in adapter.ingest_text(delta["content"]):
+                                    yield ev
+                            for tool_call in delta.get("tool_calls") or []:
+                                if isinstance(tool_call, dict):
+                                    for ev in adapter.ingest_tool_call(tool_call):
+                                        yield ev
+                            usage = data.get("usage")
+                            finish = choice.get("finish_reason")
+                            if finish is not None:
+                                for ev in adapter.finalize(usage, finish):
+                                    yield ev
+            return anthropic_stream()
+
+        parser = ConsoleStreamParser()
+        chat_adapter = ConsoleChatStreamAdapter(model)
+        for line in result:
+            for event in parser.ingest_line(line):
+                chat_adapter.ingest(event)
+        chat_result = chat_adapter.build_non_stream_response()
+        choice = (chat_result.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content_blocks: List[Dict[str, Any]] = []
+        if message.get("reasoning_content"):
+            content_blocks.append(
+                {"type": "thinking", "thinking": message["reasoning_content"], "signature": ""}
+            )
+        if message.get("content"):
+            content_blocks.append({"type": "text", "text": message["content"]})
+        for tool_call in message.get("tool_calls") or []:
+            fn = tool_call.get("function") or {}
+            try:
+                parsed = orjson.loads(fn.get("arguments") or "{}")
+            except orjson.JSONDecodeError:
+                parsed = {}
+            content_blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": tool_call.get("id"),
+                    "name": fn.get("name"),
+                    "input": parsed if isinstance(parsed, dict) else {},
+                }
+            )
+        usage = anthropic_usage_from_chat(chat_result.get("usage"))
+        return {
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content_blocks,
+            "stop_reason": "tool_use" if message.get("tool_calls") else "end_turn",
+            "stop_sequence": None,
+            "usage": usage,
+        }
+
+
+__all__ = ["ConsoleChannelService"]

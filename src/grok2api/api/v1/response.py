@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from grok2api.core.exceptions import ValidationException
+from grok2api.services.grok.services.console_channel import ConsoleChannelService
+from grok2api.services.grok.services.model import ModelService
 from grok2api.services.grok.services.responses import ResponsesService
 
 
@@ -49,24 +51,52 @@ async def create_response(request: ResponseCreateRequest):
     if isinstance(request.reasoning, dict):
         reasoning_effort = request.reasoning.get("effort") or request.reasoning.get("reasoning_effort")
 
-    result = await ResponsesService.create(
-        model=request.model,
-        input_value=request.input,
-        instructions=request.instructions,
-        stream=bool(request.stream),
-        temperature=request.temperature,
-        top_p=request.top_p,
-        tools=request.tools,
-        tool_choice=request.tool_choice,
-        parallel_tool_calls=request.parallel_tool_calls,
-        reasoning_effort=reasoning_effort,
-        max_output_tokens=request.max_output_tokens,
-        metadata=request.metadata,
-        user=request.user,
-        store=request.store,
-        previous_response_id=request.previous_response_id,
-        truncation=request.truncation,
-    )
+    extra_fields = request.model_dump(exclude={
+        "model", "input", "instructions", "stream", "max_output_tokens",
+        "temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls",
+        "reasoning", "metadata", "user", "store", "previous_response_id", "truncation",
+    }, exclude_none=True)
+
+    if ModelService.is_console(request.model):
+        result = await ConsoleChannelService.responses(
+            model=request.model,
+            input_value=request.input,
+            instructions=request.instructions,
+            stream=bool(request.stream),
+            temperature=request.temperature,
+            top_p=request.top_p,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
+            reasoning=request.reasoning,
+            max_output_tokens=request.max_output_tokens,
+            include=extra_fields.pop("include", None),
+            text=extra_fields.pop("text", None),
+            frequency_penalty=extra_fields.pop("frequency_penalty", None),
+            presence_penalty=extra_fields.pop("presence_penalty", None),
+            store=request.store,
+            previous_response_id=request.previous_response_id,
+            **extra_fields,
+        )
+    else:
+        result = await ResponsesService.create(
+            model=request.model,
+            input_value=request.input,
+            instructions=request.instructions,
+            stream=bool(request.stream),
+            temperature=request.temperature,
+            top_p=request.top_p,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=request.max_output_tokens,
+            metadata=request.metadata,
+            user=request.user,
+            store=request.store,
+            previous_response_id=request.previous_response_id,
+            truncation=request.truncation,
+        )
 
     if request.stream:
         return StreamingResponse(

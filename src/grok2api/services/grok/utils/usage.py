@@ -120,17 +120,56 @@ def estimate_chat_usage(
     )
 
 
+def from_upstream_responses_usage(usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Map upstream Responses API usage to OpenAI chat usage format."""
+    if not usage:
+        return build_chat_usage(0, 0)
+
+    prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    completion_tokens = int(
+        usage.get("output_tokens") or usage.get("completion_tokens") or 0
+    )
+    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+
+    input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+    output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
+    reasoning_tokens = int(output_details.get("reasoning_tokens") or 0)
+    cached_tokens = int(input_details.get("cached_tokens") or 0)
+    text_tokens = max(0, completion_tokens - reasoning_tokens)
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "prompt_tokens_details": {
+            "cached_tokens": cached_tokens,
+            "text_tokens": int(input_details.get("text_tokens") or prompt_tokens),
+            "audio_tokens": int(input_details.get("audio_tokens") or 0),
+            "image_tokens": int(input_details.get("image_tokens") or 0),
+        },
+        "completion_tokens_details": {
+            "text_tokens": int(output_details.get("text_tokens") or text_tokens),
+            "audio_tokens": int(output_details.get("audio_tokens") or 0),
+            "reasoning_tokens": reasoning_tokens,
+        },
+    }
+
+
 def normalize_chat_usage(usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not usage:
         return build_chat_usage(0, 0)
 
-    prompt_tokens = usage.get("prompt_tokens")
-    if prompt_tokens is None:
-        prompt_tokens = usage.get("input_tokens", 0)
+    if "input_tokens" in usage or "output_tokens" in usage:
+        return from_upstream_responses_usage(usage)
 
-    completion_tokens = usage.get("completion_tokens")
-    if completion_tokens is None:
-        completion_tokens = usage.get("output_tokens", 0)
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    input_details = usage.get("input_tokens_details") or {}
+    cached_tokens = int(
+        prompt_details.get("cached_tokens") or input_details.get("cached_tokens") or 0
+    )
 
     reasoning_tokens = int(
         (
@@ -140,11 +179,14 @@ def normalize_chat_usage(usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         ).get("reasoning_tokens")
         or 0
     )
-    return build_chat_usage(
+    result = build_chat_usage(
         prompt_tokens,
         completion_tokens,
         reasoning_tokens=reasoning_tokens,
     )
+    if cached_tokens:
+        result["prompt_tokens_details"]["cached_tokens"] = cached_tokens
+    return result
 
 
 def to_responses_usage(usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -186,6 +228,7 @@ __all__ = [
     "estimate_completion_tokens",
     "estimate_prompt_tokens",
     "estimate_tokens",
+    "from_upstream_responses_usage",
     "normalize_chat_usage",
     "to_responses_usage",
 ]

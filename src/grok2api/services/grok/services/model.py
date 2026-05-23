@@ -4,9 +4,18 @@ Grok 模型管理服务
 
 from enum import Enum
 from typing import Optional, Tuple, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
+from grok2api.core.config import get_config
 from grok2api.core.exceptions import ValidationException
+from grok2api.services.grok.services.console_capabilities import (
+    ConsoleModelCapabilities,
+    CAP_BUILD,
+    CAP_GROK_43,
+    CAP_420_NON_REASONING,
+    CAP_420_REASONING,
+    CAP_MULTI_AGENT,
+)
 
 
 class Tier(str, Enum):
@@ -23,8 +32,15 @@ class Cost(str, Enum):
     HIGH = "high"
 
 
+class Channel(str, Enum):
+    GROK = "grok"
+    CONSOLE = "console"
+
+
 class ModelInfo(BaseModel):
     """模型信息"""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     model_id: str
     grok_model: str
@@ -36,6 +52,70 @@ class ModelInfo(BaseModel):
     is_image: bool = False
     is_image_edit: bool = False
     is_video: bool = False
+    channel: Channel = Channel.GROK
+    console_model: Optional[str] = None
+    console_search: bool = False
+    capabilities: Optional[ConsoleModelCapabilities] = None
+
+    @property
+    def owned_by(self) -> str:
+        if self.channel == Channel.CONSOLE:
+            return "xai-console"
+        return "grok2api@chenyme"
+
+
+def _console_model(
+    model_id: str,
+    console_model: str,
+    *,
+    console_search: bool = False,
+    capabilities: ConsoleModelCapabilities,
+    display_name: Optional[str] = None,
+) -> ModelInfo:
+    return ModelInfo(
+        model_id=model_id,
+        grok_model=console_model,
+        model_mode="CONSOLE",
+        tier=Tier.BASIC,
+        cost=Cost.LOW,
+        display_name=display_name or model_id.upper(),
+        description="Console Chat Playground model",
+        channel=Channel.CONSOLE,
+        console_model=console_model,
+        console_search=console_search,
+        capabilities=capabilities,
+    )
+
+
+_CONSOLE_MODELS = [
+    _console_model("grok-4.3", "grok-4.3", capabilities=CAP_GROK_43),
+    _console_model("grok-4.3-search", "grok-4.3", console_search=True, capabilities=CAP_GROK_43),
+    _console_model("grok-build-0.1", "grok-build-0.1", capabilities=CAP_BUILD),
+    _console_model("grok-build-0.1-search", "grok-build-0.1", console_search=True, capabilities=CAP_BUILD),
+    _console_model("grok-4.20-0309-non-reasoning", "grok-4.20-0309-non-reasoning", capabilities=CAP_420_NON_REASONING),
+    _console_model(
+        "grok-4.20-0309-non-reasoning-search",
+        "grok-4.20-0309-non-reasoning",
+        console_search=True,
+        capabilities=CAP_420_NON_REASONING,
+    ),
+    _console_model("grok-4.20-0309-reasoning", "grok-4.20-0309-reasoning", capabilities=CAP_420_REASONING),
+    _console_model(
+        "grok-4.20-0309-reasoning-search",
+        "grok-4.20-0309-reasoning",
+        console_search=True,
+        capabilities=CAP_420_REASONING,
+    ),
+    _console_model("grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", capabilities=CAP_MULTI_AGENT),
+    _console_model(
+        "grok-4.20-multi-agent-0309-search",
+        "grok-4.20-multi-agent-0309",
+        console_search=True,
+        capabilities=CAP_MULTI_AGENT,
+    ),
+]
+
+CONSOLE_MODEL_IDS = {m.model_id for m in _CONSOLE_MODELS}
 
 
 class ModelService:
@@ -45,6 +125,7 @@ class ModelService:
         "grok-4.3-fast",
         "grok-imagine-1.0",
         "grok-imagine-1.0-edit",
+        *CONSOLE_MODEL_IDS,
     }
 
     MODELS = [
@@ -240,6 +321,7 @@ class ModelService:
             is_image_edit=False,
             is_video=True,
         ),
+        *_CONSOLE_MODELS,
     ]
 
     _map = {m.model_id: m for m in MODELS}
@@ -252,7 +334,15 @@ class ModelService:
     @classmethod
     def list(cls) -> list[ModelInfo]:
         """获取所有模型"""
-        return list(cls._map.values())
+        models = list(cls._map.values())
+        if not get_config("console.enabled", True):
+            models = [m for m in models if m.channel != Channel.CONSOLE]
+        return models
+
+    @classmethod
+    def is_console(cls, model_id: str) -> bool:
+        model = cls.get(model_id)
+        return bool(model and model.channel == Channel.CONSOLE)
 
     @classmethod
     def valid(cls, model_id: str) -> bool:
@@ -271,6 +361,8 @@ class ModelService:
     def pool_for_model(cls, model_id: str) -> str:
         """根据模型选择 Token 池"""
         model = cls.get(model_id)
+        if model and model.channel == Channel.CONSOLE:
+            return "ssoBasic"
         if model and model.model_id not in cls.BASIC_MODEL_IDS:
             return "ssoSuper"
         return "ssoBasic"
@@ -281,11 +373,11 @@ class ModelService:
         model = cls.get(model_id)
         if not model:
             return ["ssoSuper"]
-        if model.model_id in cls.BASIC_MODEL_IDS:
+        if model.channel == Channel.CONSOLE or model.model_id in cls.BASIC_MODEL_IDS:
             return ["ssoBasic", "ssoSuper"]
         if model.tier == Tier.SUPER or model.model_id not in cls.BASIC_MODEL_IDS:
             return ["ssoSuper"]
         return ["ssoSuper"]
 
 
-__all__ = ["ModelService"]
+__all__ = ["Channel", "CONSOLE_MODEL_IDS", "ModelInfo", "ModelService"]

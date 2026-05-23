@@ -18,7 +18,7 @@ async def list_models():
             "id": m.model_id,
             "object": "model",
             "created": 0,
-            "owned_by": "grok2api@chenyme",
+            "owned_by": m.owned_by,
         }
         for m in ModelService.list()
     ]

@@ -66,6 +66,18 @@ browser = "chrome136"
 user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
 
+[console]
+enabled = true
+base_url = "https://console.x.ai"
+default_cluster = "https://us-east-1.api.x.ai"
+default_team_id = ""
+cf_clearance = ""
+cf_cookies = ""
+timeout = 120
+allow_previous_response_id = false
+strict_param_validation = false
+search_tools = ["web_search_preview", "x_search"]
+
 # ==================== 重试策略 ====================
 [retry]
 # 最大重试次数

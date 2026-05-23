@@ -14,9 +14,10 @@ from pydantic import BaseModel, Field
 import orjson
 
 from grok2api.services.grok.services.chat import ChatService
+from grok2api.services.grok.services.console_channel import ConsoleChannelService
 from grok2api.services.grok.services.image import ImageGenerationService
 from grok2api.services.grok.services.image_edit import ImageEditService
-from grok2api.services.grok.services.model import ModelService
+from grok2api.services.grok.services.model import Channel, ModelService
 from grok2api.services.grok.services.video import VideoService
 from grok2api.services.grok.utils.response import make_chat_response
 from grok2api.services.grok.utils.errors import no_token_error
@@ -29,7 +30,8 @@ class MessageItem(BaseModel):
     """消息项"""
 
     role: str
-    content: Optional[Union[str, Dict[str, Any], List[Dict[str, Any]]]]
+    content: Optional[Union[str, Dict[str, Any], List[Dict[str, Any]]]] = None
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
@@ -69,6 +71,10 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = Field(None, description="Tool definitions")
     tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(None, description="Tool choice: auto/required/none/specific")
     parallel_tool_calls: Optional[bool] = Field(True, description="Allow parallel tool calls")
+    max_tokens: Optional[int] = Field(None, description="Max output tokens (console models)")
+    frequency_penalty: Optional[float] = Field(None, description="Frequency penalty (console non-reasoning 4.20)")
+    presence_penalty: Optional[float] = Field(None, description="Presence penalty (console non-reasoning 4.20)")
+    response_format: Optional[Union[str, Dict[str, Any]]] = Field(None, description="Response format")
 
 
 VALID_ROLES = {"developer", "system", "user", "assistant", "tool"}
@@ -845,17 +851,34 @@ async def chat_completions(request: ChatCompletionRequest):
             raise
     else:
         try:
-            result = await ChatService.completions(
-                model=request.model,
-                messages=[msg.model_dump() for msg in request.messages],
-                stream=request.stream,
-                reasoning_effort=request.reasoning_effort,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                tools=request.tools,
-                tool_choice=request.tool_choice,
-                parallel_tool_calls=request.parallel_tool_calls,
-            )
+            if model_info and model_info.channel == Channel.CONSOLE:
+                result = await ConsoleChannelService.chat_completions(
+                    model=request.model,
+                    messages=[msg.model_dump(exclude_none=True) for msg in request.messages],
+                    stream=request.stream,
+                    reasoning_effort=request.reasoning_effort,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    tools=request.tools,
+                    tool_choice=request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                    max_tokens=request.max_tokens,
+                    frequency_penalty=request.frequency_penalty,
+                    presence_penalty=request.presence_penalty,
+                    response_format=request.response_format,
+                )
+            else:
+                result = await ChatService.completions(
+                    model=request.model,
+                    messages=[msg.model_dump() for msg in request.messages],
+                    stream=request.stream,
+                    reasoning_effort=request.reasoning_effort,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    tools=request.tools,
+                    tool_choice=request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                )
         except Exception as e:
             if request.stream is not False:
                 return _streaming_error_response(e)
