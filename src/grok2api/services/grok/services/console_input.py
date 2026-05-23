@@ -143,15 +143,24 @@ def _is_compaction_item(item: Any) -> bool:
     return str(item.get("type") or "").strip().lower() == "compaction"
 
 
+def _is_encrypted_replay_blob(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if _is_compaction_item(item):
+        return True
+    enc = item.get("encrypted_content")
+    return isinstance(enc, str) and bool(enc)
+
+
 def drop_compaction_blobs_from_payload(payload: Dict[str, Any]) -> int:
-    """Remove compaction items from a Console Responses upstream payload."""
+    """Remove compaction and encrypted reasoning replay blobs from upstream payload."""
     input_items = payload.get("input")
     if not isinstance(input_items, list):
         return 0
     kept: List[Any] = []
     removed = 0
     for item in input_items:
-        if _is_compaction_item(item):
+        if _is_encrypted_replay_blob(item):
             removed += 1
             continue
         kept.append(item)

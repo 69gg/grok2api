@@ -430,10 +430,9 @@ def test_drop_compaction_blobs_from_payload():
         ],
     }
     removed = drop_compaction_blobs_from_payload(payload)
-    assert removed == 2
-    assert len(payload["input"]) == 2
-    assert payload["input"][0]["type"] == "reasoning"
-    assert payload["input"][1]["role"] == "user"
+    assert removed == 3
+    assert len(payload["input"]) == 1
+    assert payload["input"][0]["role"] == "user"
 
 
 def test_is_compaction_blob_decode_error():

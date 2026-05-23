@@ -116,9 +116,12 @@ class ConsoleResponsesReverse:
                     if removed > 0:
                         compaction_stripped = True
                         logger.warning(
-                            f"ConsoleResponsesReverse: dropped {removed} compaction blob(s), retrying request"
+                            f"ConsoleResponsesReverse: dropped {removed} encrypted/compaction blob(s), retrying request"
                         )
                         continue
+                    logger.warning(
+                        "ConsoleResponsesReverse: compaction blob decode error but input has no encrypted replay blobs to drop"
+                    )
                 raise UpstreamException(
                     message=f"ConsoleResponsesReverse: request failed, {response.status_code}",
                     details={"status": response.status_code, "body": content[:2000]},
