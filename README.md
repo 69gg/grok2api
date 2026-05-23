@@ -56,8 +56,6 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 3. `grok-4.3` 默认返回 **明文 reasoning summary**（非 encrypted）；其余 reasoning 模型为 encrypted 透传。
 4. `-search` 变体会自动注入 `web_search_preview` 与 `x_search`，无需客户端手动添加搜索 tools。
 
-配置见 `config.toml.example` 的 `[console]` 段。
-
 ## 检查
 
 ```bash

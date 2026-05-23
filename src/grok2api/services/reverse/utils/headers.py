@@ -9,6 +9,7 @@ from typing import Dict, Optional
 from grok2api.core.logger import logger
 from grok2api.core.config import get_config
 from grok2api.services.grok.fingerprint import BROWSER_CHROME, BROWSER_FIREFOX
+from grok2api.services.reverse.console_constants import CONSOLE_BASE_URL, CONSOLE_DEFAULT_CLUSTER
 from grok2api.services.reverse.utils.statsig import StatsigGenerator
 
 _HEADER_CHAR_REPLACEMENTS = str.maketrans(
@@ -359,15 +360,15 @@ def build_console_sso_cookie(
     cf_cookies: Optional[str] = None,
     cf_clearance: Optional[str] = None,
 ) -> str:
-    """Build SSO cookie for console.x.ai, optionally with console-specific CF clearance."""
+    """Build SSO cookie for console.x.ai, reusing proxy CF clearance when present."""
     sso_token = sso_token[4:] if sso_token.startswith("sso=") else sso_token
     sso_token = _sanitize_header_value(
         sso_token, field_name="sso_token", remove_all_spaces=True
     )
     cookie = f"sso={sso_token}; sso-rw={sso_token}"
     merged_cf = merge_cf_clearance_cookie(
-        cf_cookies if cf_cookies is not None else get_config("console.cf_cookies") or get_config("proxy.cf_cookies") or "",
-        cf_clearance if cf_clearance is not None else get_config("console.cf_clearance") or get_config("proxy.cf_clearance") or "",
+        cf_cookies if cf_cookies is not None else get_config("proxy.cf_cookies") or "",
+        cf_clearance if cf_clearance is not None else get_config("proxy.cf_clearance") or "",
     )
     if merged_cf:
         cookie = f"{cookie}; {merged_cf}" if cookie else merged_cf
@@ -377,18 +378,16 @@ def build_console_sso_cookie(
 def build_console_headers(
     cookie_token: str,
     *,
-    team_id: str = "",
     content_type: Optional[str] = "application/json",
     cluster: Optional[str] = None,
 ) -> Dict[str, str]:
-    """Build headers for console.x.ai /v1/responses and gRPC."""
+    """Build headers for console.x.ai /v1/responses."""
     user_agent = _sanitize_header_value(
         get_config("proxy.user_agent"), field_name="proxy.user_agent"
     )
-    base_url = str(get_config("console.base_url") or "https://console.x.ai").rstrip("/")
-    team = str(team_id or get_config("console.default_team_id") or "").strip()
-    referer = f"{base_url}/team/{team}/chat-playground" if team else f"{base_url}/"
-    cluster_url = cluster or get_config("console.default_cluster") or "https://us-east-1.api.x.ai"
+    base_url = CONSOLE_BASE_URL.rstrip("/")
+    referer = f"{base_url}/"
+    cluster_url = cluster or CONSOLE_DEFAULT_CLUSTER
 
     headers = {
         "Accept-Encoding": "gzip, deflate, br, zstd",

@@ -5,11 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from grok2api.core.config import get_config
 from grok2api.core.logger import logger
+from grok2api.services.reverse.console_constants import (
+    CONSOLE_SEARCH_TOOLS,
+    CONSOLE_STRICT_PARAM_VALIDATION,
+)
 
-
-SEARCH_TOOL_TYPES = ("web_search_preview", "x_search")
 
 
 @dataclass(frozen=True)
@@ -81,10 +82,7 @@ def get_console_capabilities(console_model: str) -> ConsoleModelCapabilities:
 
 
 def default_search_tools() -> List[Dict[str, str]]:
-    configured = get_config("console.search_tools")
-    if isinstance(configured, list) and configured:
-        return [{"type": str(t)} for t in configured if t]
-    return [{"type": t} for t in SEARCH_TOOL_TYPES]
+    return [{"type": t} for t in CONSOLE_SEARCH_TOOLS]
 
 
 def merge_tools(
@@ -135,11 +133,7 @@ def filter_payload(
     *,
     strict: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    strict = (
-        bool(get_config("console.strict_param_validation"))
-        if strict is None
-        else strict
-    )
+    strict = CONSOLE_STRICT_PARAM_VALIDATION if strict is None else strict
     result = dict(payload)
 
     max_tokens = result.get("max_output_tokens")

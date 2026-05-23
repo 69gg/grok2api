@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import orjson
 from curl_cffi.requests import AsyncSession
@@ -25,24 +25,12 @@ from grok2api.services.grok.services.console_stream_parser import ConsoleStreamP
 from grok2api.services.grok.services.model import Channel, ModelService
 from grok2api.services.grok.utils.errors import no_token_error
 from grok2api.services.grok.utils.retry import pick_token
-from grok2api.services.grok.utils.usage import from_upstream_responses_usage, to_responses_usage
-from grok2api.services.reverse.console_auth import ensure_console_team_id
+from grok2api.services.reverse.console_constants import CONSOLE_ALLOW_PREVIOUS_RESPONSE_ID
 from grok2api.services.reverse.console_responses import ConsoleResponsesReverse
 from grok2api.services.token import get_token_manager
-from grok2api.services.token.models import TokenInfo
-
-
-def _console_enabled() -> bool:
-    return bool(get_config("console.enabled", True))
 
 
 def _resolve_model(model_id: str):
-    if not _console_enabled():
-        raise ValidationException(
-            message="Console channel is disabled",
-            param="model",
-            code="invalid_request_error",
-        )
     model = ModelService.get(model_id)
     if not model or model.channel != Channel.CONSOLE:
         raise ValidationException(
@@ -79,42 +67,18 @@ def _response_format_to_text_format(response_format: Any) -> Optional[Dict[str, 
     return {"type": "text"}
 
 
-async def _get_token_meta(token: str) -> Optional[TokenInfo]:
-    manager = await get_token_manager()
-    for pool in manager.pools.values():
-        info = pool.get(token)
-        if info:
-            return info
-    return None
-
-
-async def _resolve_team_id(session: AsyncSession, token: str) -> str:
-    manager = await get_token_manager()
-    meta = await _get_token_meta(token)
-    if meta and meta.console_team_id:
-        return meta.console_team_id
-    team_id = await ensure_console_team_id(session, token, None)
-    if meta:
-        meta.console_team_id = team_id
-        manager._dirty = True
-        manager._schedule_save()
-    return team_id
-
-
 class ConsoleChannelService:
     @staticmethod
     async def _stream_upstream(
         payload: Dict[str, Any],
         *,
         token: str,
-        team_id: str,
     ) -> AsyncIterator[str]:
         session = AsyncSession()
         line_iter = await ConsoleResponsesReverse.request(
             session,
             token,
             payload,
-            team_id=team_id,
             stream=True,
         )
         async for line in line_iter:
@@ -127,9 +91,6 @@ class ConsoleChannelService:
         *,
         stream: bool,
     ):
-        if not _console_enabled():
-            raise ValidationException(message="Console channel is disabled", param="model")
-
         token_mgr = await get_token_manager()
         await token_mgr.reload_if_stale()
         tried: set[str] = set()
@@ -143,31 +104,24 @@ class ConsoleChannelService:
                     raise last_error
                 raise no_token_error(model_id)
             tried.add(token)
-            session = AsyncSession()
             try:
-                team_id = await _resolve_team_id(session, token)
-                payload = await build_payload_fn(token, team_id)
+                payload = await build_payload_fn(token)
                 if stream:
                     async def gen():
                         async for line in ConsoleChannelService._stream_upstream(
-                            payload, token=token, team_id=team_id
+                            payload, token=token
                         ):
                             yield line
                     return gen()
                 lines = []
                 async for line in ConsoleChannelService._stream_upstream(
-                    payload, token=token, team_id=team_id
+                    payload, token=token
                 ):
                     lines.append(line)
                 return lines
             except UpstreamException as exc:
                 last_error = exc
                 continue
-            finally:
-                try:
-                    await session.close()
-                except Exception:
-                    pass
         if last_error:
             raise last_error
         raise no_token_error(model_id)
@@ -192,7 +146,7 @@ class ConsoleChannelService:
         model_info = _resolve_model(model)
         caps = model_info.capabilities or get_console_capabilities(model_info.console_model or model)
 
-        async def build(_token: str, _team_id: str) -> Dict[str, Any]:
+        async def build(_token: str) -> Dict[str, Any]:
             instructions, input_items, history_encrypted = ConsoleInputBuilder.from_chat_messages(
                 messages
             )
@@ -266,7 +220,7 @@ class ConsoleChannelService:
         previous_response_id: Optional[str] = None,
         **extra: Any,
     ):
-        if previous_response_id and not get_config("console.allow_previous_response_id"):
+        if previous_response_id and not CONSOLE_ALLOW_PREVIOUS_RESPONSE_ID:
             previous_response_id = None
 
         model_info = _resolve_model(model)
@@ -275,7 +229,7 @@ class ConsoleChannelService:
         if isinstance(reasoning, dict):
             reasoning_effort = reasoning.get("effort")
 
-        async def build(_token: str, _team_id: str) -> Dict[str, Any]:
+        async def build(_token: str) -> Dict[str, Any]:
             instr, input_items, history_encrypted = ConsoleInputBuilder.from_responses_input(
                 input_value, instructions=instructions
             )
@@ -306,7 +260,7 @@ class ConsoleChannelService:
                 history_has_encrypted=history_encrypted,
                 store=bool(store),
             )
-            if previous_response_id and get_config("console.allow_previous_response_id"):
+            if previous_response_id and CONSOLE_ALLOW_PREVIOUS_RESPONSE_ID:
                 payload["previous_response_id"] = previous_response_id
             payload.update({k: v for k, v in extra.items() if v is not None})
             return filter_payload(caps, payload)
@@ -371,7 +325,7 @@ class ConsoleChannelService:
             thinking_enabled = True
             reasoning_effort = thinking.get("effort") or "low"
 
-        async def build(_token: str, _team_id: str) -> Dict[str, Any]:
+        async def build(_token: str) -> Dict[str, Any]:
             merged_tools = merge_tools(
                 ConsoleInputBuilder.normalize_tools(tools),
                 console_search=bool(model_info.console_search),

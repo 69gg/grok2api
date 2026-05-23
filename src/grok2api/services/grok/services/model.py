@@ -6,7 +6,6 @@ from enum import Enum
 from typing import Optional, Tuple, List
 from pydantic import BaseModel, Field, ConfigDict
 
-from grok2api.core.config import get_config
 from grok2api.core.exceptions import ValidationException
 from grok2api.services.grok.services.console_capabilities import (
     ConsoleModelCapabilities,
@@ -334,10 +333,7 @@ class ModelService:
     @classmethod
     def list(cls) -> list[ModelInfo]:
         """获取所有模型"""
-        models = list(cls._map.values())
-        if not get_config("console.enabled", True):
-            models = [m for m in models if m.channel != Channel.CONSOLE]
-        return models
+        return list(cls._map.values())
 
     @classmethod
     def is_console(cls, model_id: str) -> bool:

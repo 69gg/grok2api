@@ -13,11 +13,10 @@ from grok2api.core.config import get_config
 from grok2api.core.exceptions import UpstreamException
 from grok2api.core.logger import logger
 from grok2api.core.proxy_pool import get_current_proxy_from, rotate_proxy, should_rotate_proxy
+from grok2api.services.reverse.console_constants import CONSOLE_RESPONSES_API, CONSOLE_TIMEOUT
 from grok2api.services.reverse.utils.headers import build_console_headers
 from grok2api.services.reverse.utils.retry import extract_status_for_retry, retry_on_status
 from grok2api.services.token.service import TokenService
-
-CONSOLE_RESPONSES_API = "https://console.x.ai/v1/responses"
 
 
 def _normalize_proxy(proxy_url: str) -> str:
@@ -60,11 +59,10 @@ class ConsoleResponsesReverse:
         token: str,
         payload: Dict[str, Any],
         *,
-        team_id: str,
         stream: bool = True,
     ) -> AsyncIterator[str]:
-        headers = build_console_headers(cookie_token=token, team_id=team_id)
-        timeout = float(get_config("console.timeout") or get_config("chat.timeout") or 120)
+        headers = build_console_headers(cookie_token=token)
+        timeout = float(CONSOLE_TIMEOUT)
         browser = get_config("proxy.browser")
         active_proxy_key = None
 
