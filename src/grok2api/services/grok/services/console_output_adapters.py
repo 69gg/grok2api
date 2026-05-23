@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -225,12 +226,148 @@ class ConsoleChatStreamAdapter:
         }
 
 
+def _reasoning_item_has_summary_text(item: Dict[str, Any]) -> bool:
+    summary = item.get("summary")
+    if not isinstance(summary, list):
+        return False
+    for part in summary:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "summary_text" and str(part.get("text") or "").strip():
+            return True
+    content = item.get("content")
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "reasoning_text" and str(part.get("text") or "").strip():
+            return True
+    return False
+
+
+def _inject_reasoning_summary_text(item: Dict[str, Any], text: str) -> Dict[str, Any]:
+    if not text or _reasoning_item_has_summary_text(item):
+        return item
+    patched = copy.deepcopy(item)
+    patched["summary"] = [{"type": "summary_text", "text": text}]
+    return patched
+
+
 class ConsoleResponsesStreamAdapter:
-    """Mostly passthrough upstream SSE with optional model id substitution."""
+    """Passthrough upstream SSE while ensuring reasoning summary reaches clients."""
+
+    _REASONING_DELTA_EVENTS = frozenset(
+        {
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        }
+    )
+    _REASONING_DONE_EVENTS = frozenset(
+        {
+            "response.reasoning_summary_text.done",
+            "response.reasoning_text.done",
+        }
+    )
 
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
         self.completed_response: Optional[Dict[str, Any]] = None
+        self._reasoning_summary_by_item_id: Dict[str, List[str]] = {}
+        self._reasoning_summary_by_output_index: Dict[int, List[str]] = {}
+
+    def _accumulate_reasoning_text(
+        self,
+        *,
+        item_id: Any = None,
+        output_index: Any = None,
+        text: str,
+    ) -> None:
+        if not text:
+            return
+        if item_id is not None:
+            key = str(item_id).strip()
+            if key:
+                self._reasoning_summary_by_item_id.setdefault(key, []).append(text)
+        if isinstance(output_index, int):
+            self._reasoning_summary_by_output_index.setdefault(output_index, []).append(text)
+
+    def _summary_text_for_reasoning_item(
+        self,
+        item: Dict[str, Any],
+        output_index: Any = None,
+    ) -> str:
+        item_id = str(item.get("id") or "").strip()
+        if item_id and item_id in self._reasoning_summary_by_item_id:
+            return "".join(self._reasoning_summary_by_item_id[item_id])
+        if isinstance(output_index, int) and output_index in self._reasoning_summary_by_output_index:
+            return "".join(self._reasoning_summary_by_output_index[output_index])
+        return ""
+
+    def _patch_reasoning_items_in_output(
+        self,
+        output: List[Any],
+    ) -> List[Any]:
+        patched: List[Any] = []
+        for index, item in enumerate(output):
+            if not isinstance(item, dict) or item.get("type") != "reasoning":
+                patched.append(item)
+                continue
+            summary_text = self._summary_text_for_reasoning_item(item, index)
+            patched.append(
+                _inject_reasoning_summary_text(item, summary_text) if summary_text else item
+            )
+        return patched
+
+    def _patch_response_reasoning(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        output = response.get("output")
+        if not isinstance(output, list):
+            return response
+        patched = dict(response)
+        patched["output"] = self._patch_reasoning_items_in_output(output)
+        return patched
+
+    def _process_event(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        event_type = str(data.get("type") or "")
+        if event_type in self._REASONING_DELTA_EVENTS:
+            self._accumulate_reasoning_text(
+                item_id=data.get("item_id"),
+                output_index=data.get("output_index"),
+                text=str(data.get("delta") or ""),
+            )
+        elif event_type in self._REASONING_DONE_EVENTS:
+            self._accumulate_reasoning_text(
+                item_id=data.get("item_id"),
+                output_index=data.get("output_index"),
+                text=str(data.get("text") or ""),
+            )
+        elif event_type == "response.output_item.done":
+            item = data.get("item")
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                summary_text = self._summary_text_for_reasoning_item(
+                    item,
+                    data.get("output_index"),
+                )
+                if summary_text:
+                    data = dict(data)
+                    data["item"] = _inject_reasoning_summary_text(item, summary_text)
+        elif event_type == "response.completed":
+            response = data.get("response")
+            if isinstance(response, dict):
+                data = dict(data)
+                patched = self._patch_response_reasoning(response)
+                patched["model"] = self.model_id
+                data["response"] = patched
+            self.completed_response = data
+            return data
+
+        response = data.get("response")
+        if isinstance(response, dict):
+            data = dict(data)
+            data["response"] = dict(response)
+            data["response"]["model"] = self.model_id
+            return data
+        return data
 
     def ingest_raw_line(self, line: str | bytes) -> Optional[str]:
         if isinstance(line, bytes):
@@ -244,11 +381,7 @@ class ConsoleResponsesStreamAdapter:
             if isinstance(data, dict) and data.get("object") == "response":
                 data = {"type": "response.completed", "response": data}
             if isinstance(data, dict):
-                response = data.get("response")
-                if isinstance(response, dict):
-                    response["model"] = self.model_id
-                if data.get("type") == "response.completed":
-                    self.completed_response = data
+                data = self._process_event(data)
                 return f"data: {orjson.dumps(data).decode()}\n\n"
         if not stripped.startswith("data:"):
             return line if line.endswith("\n") else line + "\n"
@@ -260,11 +393,7 @@ class ConsoleResponsesStreamAdapter:
         except orjson.JSONDecodeError:
             return line if line.endswith("\n") else line + "\n"
         if isinstance(data, dict):
-            response = data.get("response")
-            if isinstance(response, dict):
-                response["model"] = self.model_id
-            if data.get("type") == "response.completed":
-                self.completed_response = data
+            data = self._process_event(data)
         return f"data: {orjson.dumps(data).decode()}\n\n"
 
 

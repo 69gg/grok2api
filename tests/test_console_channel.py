@@ -118,7 +118,7 @@ def test_build_payload_filters_invalid_include_and_tool_choice():
     assert payload.get("include") == ["reasoning.encrypted_content"]
     assert "tool_choice" not in payload
     assert "tools" not in payload
-    assert "reasoning" not in payload
+    assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
 
 
 def test_build_payload_uses_openai_reasoning_summary_auto():
@@ -132,6 +132,40 @@ def test_build_payload_uses_openai_reasoning_summary_auto():
         reasoning_config={"effort": "medium"},
     )
     assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
+
+
+def test_build_payload_infers_reasoning_when_client_requests_encrypted_only():
+    from grok2api.services.grok.services.console_capabilities import CAP_GROK_43
+
+    payload = ConsoleInputBuilder.build_payload(
+        console_model="grok-4.3",
+        caps=CAP_GROK_43,
+        input_items=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        stream=True,
+        request_include=["reasoning.encrypted_content"],
+    )
+    assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
+    assert payload["include"] == ["reasoning.encrypted_content"]
+
+
+def test_responses_stream_adapter_injects_reasoning_summary_into_completed_output():
+    from grok2api.services.grok.services.console_output_adapters import (
+        ConsoleResponsesStreamAdapter,
+    )
+
+    adapter = ConsoleResponsesStreamAdapter("grok-4.3")
+    adapter.ingest_raw_line(
+        'data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"delta":"Let me think"}'
+    )
+    completed = adapter.ingest_raw_line(
+        'data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"abc1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}]}}'
+    )
+    assert completed is not None
+    assert adapter.completed_response is not None
+    response = adapter.completed_response["response"]
+    reasoning = response["output"][0]
+    assert reasoning["summary"][0]["text"] == "Let me think"
+    assert reasoning["encrypted_content"].startswith("abc")
 
 
 def test_responses_input_replay_preserves_summary_only_reasoning():

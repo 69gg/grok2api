@@ -538,6 +538,16 @@ class ConsoleInputBuilder:
             effort_text = str(reasoning.get("effort") or reasoning_effort or "").lower()
             if effort_text not in ("none", ""):
                 reasoning["summary"] = "auto"
+        if (
+            not reasoning
+            and caps.supports_reasoning_output
+            and request_include
+            and "reasoning.encrypted_content" in request_include
+            and caps.supports_reasoning_effort
+        ):
+            reasoning = {"effort": str(reasoning_effort or "medium").lower()}
+            if caps.supports_reasoning_summary and reasoning.get("effort") not in ("none", ""):
+                reasoning["summary"] = "auto"
         if reasoning:
             payload["reasoning"] = reasoning
 

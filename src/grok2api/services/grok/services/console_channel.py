@@ -32,6 +32,17 @@ from grok2api.services.reverse.console_responses import ConsoleResponsesReverse
 from grok2api.services.token import get_token_manager
 
 
+def _reasoning_config_from_thinking(thinking: Any) -> Optional[Dict[str, Any]]:
+    """Map legacy Undefined ``thinking`` payloads to Responses ``reasoning``."""
+    if not isinstance(thinking, dict):
+        return None
+    thinking_type = str(thinking.get("type") or "").strip().lower()
+    if not (thinking.get("enabled") or thinking_type in {"enabled", "on", "true"}):
+        return None
+    effort = str(thinking.get("effort") or "medium").strip().lower() or "medium"
+    return {"effort": effort}
+
+
 def _resolve_stream(stream: Optional[bool]) -> bool:
     if stream is not None:
         return bool(stream)
@@ -255,6 +266,11 @@ class ConsoleChannelService:
         reasoning_config = dict(reasoning) if isinstance(reasoning, dict) else None
         if reasoning_config:
             reasoning_effort = reasoning_config.get("effort")
+        if not reasoning_config:
+            derived = _reasoning_config_from_thinking(extra.get("thinking"))
+            if derived:
+                reasoning_config = derived
+                reasoning_effort = derived.get("effort")
 
         async def build(_token: str) -> Dict[str, Any]:
             instr, input_items, history_encrypted = ConsoleInputBuilder.from_responses_input(
