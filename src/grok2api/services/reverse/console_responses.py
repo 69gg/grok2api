@@ -126,8 +126,11 @@ class ConsoleResponsesReverse:
             try:
                 if stream:
                     async for line in response.aiter_lines():
-                        if line is not None:
-                            yield line
+                        if line is None:
+                            continue
+                        if isinstance(line, bytes):
+                            line = line.decode("utf-8", errors="replace")
+                        yield line
                 else:
                     text = await ConsoleResponsesReverse._read_error_body(response)
                     for line in text.splitlines():

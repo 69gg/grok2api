@@ -11,6 +11,7 @@ from grok2api.services.grok.services.console_input import (
     ConsoleInputBuilder,
     is_encrypted_reasoning,
 )
+from grok2api.services.grok.services.console_output_adapters import ConsoleChatStreamAdapter
 from grok2api.services.grok.services.console_stream_parser import (
     ConsoleEventType,
     ConsoleStreamParser,
@@ -97,3 +98,39 @@ def test_stream_parser_completed_carries_usage():
     )
     assert events[-1].type == ConsoleEventType.COMPLETED
     assert events[-1].data["usage"]["total_tokens"] == 3
+
+
+def test_stream_parser_accepts_bytes_sse_line():
+    parser = ConsoleStreamParser()
+    events = parser.ingest_line(
+        b'data: {"type":"response.output_text.delta","delta":"hi"}'
+    )
+    assert len(events) == 1
+    assert events[0].type == ConsoleEventType.TEXT_DELTA
+    assert events[0].data["delta"] == "hi"
+
+
+def test_stream_parser_accepts_non_sse_json_response():
+    parser = ConsoleStreamParser()
+    body = (
+        '{"object":"response","output":[{"type":"message","content":'
+        '[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}'
+    )
+    events = parser.ingest_line(body)
+    assert events[-1].type == ConsoleEventType.COMPLETED
+    assert events[-1].data["response"]["output"][0]["content"][0]["text"] == "OK"
+
+
+def test_chat_adapter_extracts_non_stream_response_text():
+    adapter = ConsoleChatStreamAdapter("grok-4.3")
+    parser = ConsoleStreamParser()
+    body = (
+        '{"object":"response","output":[{"type":"message","content":'
+        '[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}'
+    )
+    for event in parser.ingest_line(body):
+        adapter.ingest(event)
+    result = adapter.build_non_stream_response()
+    message = result["choices"][0]["message"]
+    assert message["content"] == "hello"
+    assert result["usage"]["total_tokens"] == 4

@@ -149,6 +149,39 @@ class ConsoleChatStreamAdapter:
             if usage_raw:
                 self.usage = from_upstream_responses_usage(usage_raw)
             self.finish_reason = event.data.get("finish_reason") or "stop"
+            response = event.data.get("response") or {}
+            for item in response.get("output") or []:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "reasoning":
+                    encrypted = item.get("encrypted_content")
+                    if encrypted:
+                        self.reasoning_parts.append(encrypted)
+                    summary = item.get("summary")
+                    if isinstance(summary, list):
+                        for part in summary:
+                            if isinstance(part, dict) and part.get("text"):
+                                self.reasoning_parts.append(str(part["text"]))
+                elif item.get("type") == "message":
+                    for block in item.get("content") or []:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "output_text":
+                            text = block.get("text") or ""
+                            if text:
+                                self.content_parts.append(text)
+                elif item.get("type") == "function_call":
+                    index = self._tool_index
+                    self._tool_index += 1
+                    self.tool_calls[index] = {
+                        "id": item.get("call_id") or item.get("id") or f"call_{index}",
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name") or "",
+                            "arguments": item.get("arguments") or "{}",
+                        },
+                    }
+                    self.finish_reason = "tool_calls"
         elif event.type == ConsoleEventType.RAW and event.data.get("raw"):
             raw = event.data["raw"]
             if isinstance(raw, dict) and raw.get("type", "").startswith("response."):
@@ -202,8 +235,24 @@ class ConsoleResponsesStreamAdapter:
         self.model_id = model_id
         self.completed_response: Optional[Dict[str, Any]] = None
 
-    def ingest_raw_line(self, line: str) -> Optional[str]:
+    def ingest_raw_line(self, line: str | bytes) -> Optional[str]:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="replace")
         stripped = line.strip()
+        if stripped.startswith("{"):
+            try:
+                data = orjson.loads(stripped)
+            except orjson.JSONDecodeError:
+                return line if line.endswith("\n") else line + "\n"
+            if isinstance(data, dict) and data.get("object") == "response":
+                data = {"type": "response.completed", "response": data}
+            if isinstance(data, dict):
+                response = data.get("response")
+                if isinstance(response, dict):
+                    response["model"] = self.model_id
+                if data.get("type") == "response.completed":
+                    self.completed_response = data
+                return f"data: {orjson.dumps(data).decode()}\n\n"
         if not stripped.startswith("data:"):
             return line if line.endswith("\n") else line + "\n"
         payload_text = stripped[5:].strip()

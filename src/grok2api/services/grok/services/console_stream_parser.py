@@ -26,17 +26,37 @@ class ConsoleEvent:
     data: Dict[str, Any] = field(default_factory=dict)
 
 
-def _parse_sse_payload(line: str) -> Optional[Dict[str, Any]]:
-    line = line.strip()
-    if not line.startswith("data:"):
+def _normalize_line(line: str | bytes) -> str:
+    if isinstance(line, bytes):
+        return line.decode("utf-8", errors="replace")
+    return line
+
+
+def _parse_sse_payload(line: str | bytes) -> Optional[Dict[str, Any]]:
+    text = _normalize_line(line).strip()
+    if not text:
         return None
-    payload = line[5:].strip()
-    if not payload or payload == "[DONE]":
-        return None
-    try:
-        return json.loads(payload)
-    except json.JSONDecodeError:
-        return None
+    if text.startswith("data:"):
+        payload = text[5:].strip()
+        if not payload or payload == "[DONE]":
+            return None
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("type") == "response.completed":
+            return data
+        if data.get("object") == "response" or "output" in data:
+            return {"type": "response.completed", "response": data}
+        return data
+    return None
 
 
 class ConsoleStreamParser:
@@ -47,14 +67,15 @@ class ConsoleStreamParser:
         self._tool_index_by_output: Dict[int, int] = {}
         self._has_tool_calls = False
 
-    def ingest_line(self, line: str) -> List[ConsoleEvent]:
+    def ingest_line(self, line: str | bytes) -> List[ConsoleEvent]:
         events: List[ConsoleEvent] = []
+        normalized = _normalize_line(line).strip()
         data = _parse_sse_payload(line)
         if data is None:
-            if line.strip().startswith("data:"):
+            if normalized.startswith("data:"):
                 return events
-            if line.strip():
-                events.append(ConsoleEvent(ConsoleEventType.RAW, {"line": line}))
+            if normalized:
+                events.append(ConsoleEvent(ConsoleEventType.RAW, {"line": normalized}))
             return events
 
         event_type = data.get("type") or ""
