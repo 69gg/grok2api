@@ -137,6 +137,29 @@ def _passthrough_replay_item(item: Dict[str, Any]) -> Dict[str, Any]:
     return cloned
 
 
+def _is_compaction_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    return str(item.get("type") or "").strip().lower() == "compaction"
+
+
+def drop_compaction_blobs_from_payload(payload: Dict[str, Any]) -> int:
+    """Remove compaction items from a Console Responses upstream payload."""
+    input_items = payload.get("input")
+    if not isinstance(input_items, list):
+        return 0
+    kept: List[Any] = []
+    removed = 0
+    for item in input_items:
+        if _is_compaction_item(item):
+            removed += 1
+            continue
+        kept.append(item)
+    if removed:
+        payload["input"] = kept
+    return removed
+
+
 def _replay_encrypted_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """Send back only fields required for opaque compaction blob replay."""
     enc = item.get("encrypted_content")
@@ -576,4 +599,4 @@ class ConsoleInputBuilder:
         return payload
 
 
-__all__ = ["ConsoleInputBuilder", "is_encrypted_reasoning"]
+__all__ = ["ConsoleInputBuilder", "drop_compaction_blobs_from_payload", "is_encrypted_reasoning"]

@@ -10,6 +10,7 @@ from grok2api.services.grok.services.console_capabilities import (
 )
 from grok2api.services.grok.services.console_input import (
     ConsoleInputBuilder,
+    drop_compaction_blobs_from_payload,
     is_encrypted_reasoning,
 )
 from grok2api.services.grok.services.console_output_adapters import ConsoleChatStreamAdapter
@@ -415,3 +416,33 @@ def test_responses_input_replay_user_message_with_input_image():
     blocks = items[0]["content"]
     assert blocks[1]["type"] == "input_image"
     assert blocks[1]["image_url"] == "https://example.com/x.png"
+
+
+def test_drop_compaction_blobs_from_payload():
+    blob = "C" * 120
+    payload = {
+        "model": "grok-4.3",
+        "input": [
+            {"type": "reasoning", "encrypted_content": "R" * 120},
+            {"type": "compaction", "encrypted_content": blob},
+            {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "compaction", "encrypted_content": blob},
+        ],
+    }
+    removed = drop_compaction_blobs_from_payload(payload)
+    assert removed == 2
+    assert len(payload["input"]) == 2
+    assert payload["input"][0]["type"] == "reasoning"
+    assert payload["input"][1]["role"] == "user"
+
+
+def test_is_compaction_blob_decode_error():
+    from grok2api.services.reverse.console_responses import _is_compaction_blob_decode_error
+
+    body = (
+        '{"code":"Client specified an invalid argument","error":'
+        '"Could not decode the compaction blob. Ensure it is unmodified from the compact response."}'
+    )
+    assert _is_compaction_blob_decode_error(400, body) is True
+    assert _is_compaction_blob_decode_error(401, body) is False
+    assert _is_compaction_blob_decode_error(400, '{"error":"other"}') is False
