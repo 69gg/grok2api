@@ -12,6 +12,7 @@ from grok2api.services.grok.services.console_capabilities import (
     ConsoleModelCapabilities,
     should_include_encrypted,
 )
+from grok2api.services.grok.utils.tool_call import normalize_function_tool
 from grok2api.services.reverse.console_constants import CONSOLE_ALLOWED_INCLUDE
 
 _ENCRYPTED_RE = re.compile(r"^[A-Za-z0-9+/=_-]{80,}$")

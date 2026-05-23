@@ -191,6 +191,21 @@ def test_chat_adapter_completed_function_call():
     assert message["tool_calls"][0]["function"]["name"] == "get_weather"
 
 
+def test_normalize_tools_accepts_responses_flat_function():
+    tools = ConsoleInputBuilder.normalize_tools(
+        [
+            {
+                "type": "function",
+                "name": "run_python",
+                "description": "Run code",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+    )
+    assert len(tools) == 1
+    assert tools[0]["name"] == "run_python"
+
+
 def test_chat_adapter_extracts_non_stream_response_text():
     adapter = ConsoleChatStreamAdapter("grok-4.3")
     parser = ConsoleStreamParser()
