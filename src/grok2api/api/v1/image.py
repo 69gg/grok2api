@@ -44,7 +44,7 @@ class ImageGenerationRequest(BaseModel):
     """图片生成请求 - OpenAI 兼容"""
 
     prompt: str = Field(..., description="图片描述")
-    model: Optional[str] = Field("grok-imagine-1.0", description="模型名称")
+    model: Optional[str] = Field("grok-imagine-image", description="模型名称")
     n: Optional[int] = Field(1, ge=1, le=10, description="生成数量 (1-10)")
     size: Optional[str] = Field(
         "1024x1024",
@@ -60,7 +60,7 @@ class ImageEditRequest(BaseModel):
     """图片编辑请求 - OpenAI 兼容"""
 
     prompt: str = Field(..., description="编辑描述")
-    model: Optional[str] = Field("grok-imagine-1.0-edit", description="模型名称")
+    model: Optional[str] = Field("grok-imagine-image-edit", description="模型名称")
     image: Optional[Union[str, List[str]]] = Field(None, description="待编辑图片文件")
     n: Optional[int] = Field(1, ge=1, le=10, description="生成数量 (1-10)")
     size: Optional[str] = Field(
@@ -128,9 +128,9 @@ def _validate_common_request(
 
 def validate_generation_request(request: ImageGenerationRequest):
     """验证图片生成请求参数"""
-    if request.model != "grok-imagine-1.0":
+    if request.model != "grok-imagine-image":
         raise ValidationException(
-            message="The model `grok-imagine-1.0` is required for image generation.",
+            message="The model `grok-imagine-image` is required for image generation.",
             param="model",
             code="model_not_supported",
         )
@@ -192,9 +192,9 @@ def resolve_aspect_ratio(size: str) -> str:
 
 def validate_edit_request(request: ImageEditRequest, images: List[UploadFile]):
     """验证图片编辑请求参数"""
-    if request.model != "grok-imagine-1.0-edit":
+    if request.model != "grok-imagine-image-edit":
         raise ValidationException(
-            message=("The model `grok-imagine-1.0-edit` is required for image edits."),
+            message=("The model `grok-imagine-image-edit` is required for image edits."),
             param="model",
             code="model_not_supported",
         )
@@ -315,7 +315,7 @@ async def create_image(request: ImageGenerationRequest):
 async def edit_image(
     prompt: str = Form(...),
     image: List[UploadFile] = File(...),
-    model: Optional[str] = Form("grok-imagine-1.0-edit"),
+    model: Optional[str] = Form("grok-imagine-image-edit"),
     n: int = Form(1),
     size: str = Form("1024x1024"),
     quality: str = Form("standard"),

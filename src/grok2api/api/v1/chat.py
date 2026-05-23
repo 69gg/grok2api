@@ -88,7 +88,7 @@ ALLOWED_IMAGE_SIZES = {
     "1024x1792",
     "1024x1024",
 }
-IMAGINE_FAST_MODEL_ID = "grok-imagine-1.0-fast"
+IMAGINE_FAST_MODEL_ID = "grok-imagine-image-pro"
 
 
 def _validate_media_input(value: str, field_name: str, param: str):
@@ -195,7 +195,7 @@ def _image_field(response_format: str) -> str:
 
 
 def _imagine_fast_server_image_config() -> ImageConfig:
-    """Load server-side image generation parameters for grok-imagine-1.0-fast."""
+    """Load server-side image generation parameters for grok-imagine-image-pro."""
     n = int(get_config("imagine_fast.n", 1) or 1)
     size = str(get_config("imagine_fast.size", "1024x1024") or "1024x1024")
     response_format = str(

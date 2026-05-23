@@ -162,7 +162,7 @@ async def function_imagine_ws(websocket: WebSocket):
         stop_event.clear()
 
     async def _run(prompt: str, aspect_ratio: str, nsfw: Optional[bool]):
-        model_id = "grok-imagine-1.0"
+        model_id = "grok-imagine-image"
         model_info = ModelService.get(model_id)
         if not model_info or not model_info.is_image:
             await _send(
@@ -374,7 +374,7 @@ async def function_imagine_sse(
 
     async def event_stream():
         try:
-            model_id = "grok-imagine-1.0"
+            model_id = "grok-imagine-image"
             model_info = ModelService.get(model_id)
             if not model_info or not model_info.is_image:
                 yield (

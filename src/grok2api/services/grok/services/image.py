@@ -31,8 +31,6 @@ from grok2api.services.reverse.ws_imagine import ImagineWebSocketReverse
 
 
 image_service = ImagineWebSocketReverse()
-_APP_CHAT_IMAGE_MODEL = "grok-4-1-thinking-1129"
-_APP_CHAT_IMAGE_MODE = "MODEL_MODE_FAST"
 _IMAGE_PROMPT_PREFIX = "Generate an image according to the following requirements:\n"
 
 
@@ -279,8 +277,8 @@ class ImageGenerationService:
         response = await GrokChatService().chat(
             token=token,
             message=prompt,
-            model=_APP_CHAT_IMAGE_MODEL,
-            mode=_APP_CHAT_IMAGE_MODE,
+            model=model_info.grok_model,
+            mode=model_info.model_mode,
             stream=True,
             tool_overrides={"imageGen": True},
             request_overrides=self._app_chat_request_overrides(n, enable_nsfw),
@@ -318,8 +316,8 @@ class ImageGenerationService:
             response = await GrokChatService().chat(
                 token=token,
                 message=prompt,
-                model=_APP_CHAT_IMAGE_MODEL,
-                mode=_APP_CHAT_IMAGE_MODE,
+                model=model_info.grok_model,
+                mode=model_info.model_mode,
                 stream=True,
                 tool_overrides={"imageGen": True},
                 request_overrides=self._app_chat_request_overrides(
@@ -834,7 +832,7 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
             if self.response_format == "url":
                 final_image_id = image_id
                 # Keep original imagine image name for imagine chat stream output.
-                if self.model != "grok-imagine-1.0-fast":
+                if self.model != "grok-imagine-image-pro":
                     final_image_id = f"{image_id}-final"
                 output = await self._save_blob(
                     final_image_id,

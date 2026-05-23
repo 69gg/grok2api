@@ -4,7 +4,7 @@ from pathlib import Path
 import tomllib
 
 from grok2api.services.grok.model import ModelService as LegacyModelService
-from grok2api.services.grok.services.model import ModelService
+from grok2api.services.grok.services.model import ModelService, SUPER_GROK_MODEL_IDS
 from grok2api.services.grok.utils.errors import no_token_error
 
 
@@ -41,34 +41,51 @@ def test_basic_pool_model_policy() -> None:
         if ModelService.pool_for_model(model.model_id) == "ssoBasic"
     }
     assert "grok-4.3-fast" in basic_models
-    assert "grok-imagine-1.0" in basic_models
     assert "grok-4.3" in basic_models
-    assert ModelService.pool_candidates_for_model("grok-4") == ["ssoSuper"]
-    assert ModelService.is_super_pool_only("grok-4") is True
+    assert "grok-imagine-image" not in basic_models
+    assert ModelService.pool_candidates_for_model("grok-4.20-auto") == ["ssoSuper"]
+    assert ModelService.is_super_pool_only("grok-4.20-auto") is True
     assert ModelService.is_super_pool_only("grok-4.3-fast") is False
     assert "ssoBasic" in ModelService.pool_candidates_for_model("grok-4.3-fast")
+
+
+def test_super_grok_model_catalog() -> None:
+    assert SUPER_GROK_MODEL_IDS == {
+        "grok-4.20-0309",
+        "grok-4.20-0309-reasoning",
+        "grok-4.20-0309-non-reasoning-super",
+        "grok-4.20-0309-super",
+        "grok-4.20-0309-reasoning-super",
+        "grok-4.20-auto",
+        "grok-4.20-expert",
+        "grok-4.3-beta",
+        "grok-imagine-image",
+        "grok-imagine-image-pro",
+        "grok-imagine-image-edit",
+        "grok-imagine-1.0-video",
+    }
 
 
 def test_model_list_hides_super_only_models_without_super_tokens() -> None:
     all_ids = {m.model_id for m in ModelService.list(has_super_tokens=True)}
     basic_ids = {m.model_id for m in ModelService.list(has_super_tokens=False)}
-    assert "grok-4" in all_ids
-    assert "grok-4-heavy" in all_ids
-    assert "grok-4" not in basic_ids
-    assert "grok-4-heavy" not in basic_ids
+    assert "grok-4.20-auto" in all_ids
+    assert "grok-imagine-image" in all_ids
+    assert "grok-4.20-auto" not in basic_ids
+    assert "grok-imagine-image" not in basic_ids
     assert "grok-4.3-fast" in basic_ids
     assert "grok-4.3" in basic_ids
 
 
-def test_image_models_use_grok_43_internally() -> None:
-    assert ModelService.get("grok-imagine-1.0").grok_model == "grok-4.3"
-    assert ModelService.get("grok-imagine-1.0-edit").grok_model == "grok-4.3"
-    assert LegacyModelService.get("grok-imagine-1.0").grok_model == "grok-4.3"
-    assert LegacyModelService.get("grok-imagine-1.0-edit").grok_model == "grok-4.3"
+def test_image_models_use_declared_upstream_names() -> None:
+    assert ModelService.get("grok-imagine-image").grok_model == "grok-imagine-image"
+    assert ModelService.get("grok-imagine-image-edit").grok_model == "grok-imagine-image-edit"
+    assert LegacyModelService.get("grok-imagine-image").grok_model == "grok-imagine-image"
+    assert LegacyModelService.get("grok-imagine-image-edit").grok_model == "grok-imagine-image-edit"
 
 
 def test_no_super_token_for_super_only_model_returns_model_not_found() -> None:
-    exc = no_token_error("grok-4")
+    exc = no_token_error("grok-4.20-auto")
     assert exc.status_code == 400
     assert exc.code == "model_not_found"
     assert exc.param == "model"

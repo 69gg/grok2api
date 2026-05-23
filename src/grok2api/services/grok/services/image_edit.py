@@ -37,10 +37,6 @@ from grok2api.services.grok.services.chat import GrokChatService
 from grok2api.services.grok.utils.stream import wrap_stream_with_usage
 from grok2api.services.token import EffortType
 
-_EDIT_UPSTREAM_MODEL = "grok-4"
-_EDIT_UPSTREAM_MODE = "MODEL_MODE_AUTO"
-
-
 def _compact_preview(value: Any, limit: int = 160) -> str:
     if isinstance(value, (dict, list)):
         try:
@@ -548,8 +544,8 @@ class ImageEditService:
                     response = await GrokChatService().chat(
                         token=current_token,
                         message=prompt,
-                        model=_EDIT_UPSTREAM_MODEL,
-                        mode=_EDIT_UPSTREAM_MODE,
+                        model=model_info.grok_model,
+                        mode=model_info.model_mode,
                         stream=True,
                         file_attachments=file_attachments,
                         tool_overrides=tool_overrides,
@@ -579,6 +575,9 @@ class ImageEditService:
                     response_format=response_format,
                     file_attachments=file_attachments,
                     tool_overrides=tool_overrides,
+                    grok_model=model_info.grok_model,
+                    model_mode=model_info.model_mode,
+                    model_id=model_info.model_id,
                 )
                 try:
                     effort = (
@@ -638,6 +637,9 @@ class ImageEditService:
         response_format: str,
         file_attachments: List[str],
         tool_overrides: dict,
+        grok_model: str,
+        model_mode: str,
+        model_id: str,
     ) -> List[str]:
         per_call = 2
         calls_needed = max(1, (n + per_call - 1) // per_call)
@@ -646,15 +648,15 @@ class ImageEditService:
             response = await GrokChatService().chat(
                 token=token,
                 message=prompt,
-                model=_EDIT_UPSTREAM_MODEL,
-                mode=_EDIT_UPSTREAM_MODE,
+                model=grok_model,
+                mode=model_mode,
                 stream=True,
                 file_attachments=file_attachments,
                 tool_overrides=tool_overrides,
                 request_overrides=self._build_request_overrides(per_call),
             )
             processor = ImageCollectProcessor(
-                "grok-imagine-1.0-edit", token, response_format=response_format
+                model_id, token, response_format=response_format
             )
             return await processor.process(response)
 
