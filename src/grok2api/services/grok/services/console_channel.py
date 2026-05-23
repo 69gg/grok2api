@@ -10,6 +10,7 @@ from curl_cffi.requests import AsyncSession
 
 from grok2api.core.config import get_config
 from grok2api.core.exceptions import UpstreamException, ValidationException
+from grok2api.core.logger import logger
 from grok2api.services.grok.services.console_capabilities import (
     filter_payload,
     get_console_capabilities,
@@ -24,10 +25,11 @@ from grok2api.services.grok.services.console_output_adapters import (
 from grok2api.services.grok.services.console_stream_parser import ConsoleStreamParser
 from grok2api.services.grok.services.model import Channel, ModelService
 from grok2api.services.grok.utils.errors import no_token_error
-from grok2api.services.grok.utils.retry import pick_token
+from grok2api.services.grok.utils.retry import pick_token, rate_limited
 from grok2api.services.reverse.console_payload import merge_console_payload, sanitize_console_upstream_payload
 from grok2api.services.reverse.console_responses import ConsoleResponsesReverse
 from grok2api.services.token import get_token_manager
+from grok2api.services.token.service import TokenService
 
 
 def _reasoning_config_from_thinking(thinking: Any) -> Optional[Dict[str, Any]]:
@@ -100,6 +102,24 @@ def _response_format_to_text_format(response_format: Any) -> Optional[Dict[str, 
 
 class ConsoleChannelService:
     @staticmethod
+    async def _handle_token_upstream_failure(
+        token_mgr: Any,
+        token: str,
+        exc: UpstreamException,
+    ) -> None:
+        status = (exc.details or {}).get("status")
+        if status == 401:
+            try:
+                await TokenService.record_fail(token, status, "console_auth_failed")
+            except Exception:
+                pass
+        elif rate_limited(exc):
+            try:
+                await token_mgr.mark_rate_limited(token)
+            except Exception:
+                pass
+
+    @staticmethod
     async def _stream_upstream(
         payload: Dict[str, Any],
         *,
@@ -128,7 +148,41 @@ class ConsoleChannelService:
         max_retries = int(get_config("retry.max_retry") or 3)
         last_error = None
 
-        for _ in range(max_retries):
+        if stream:
+
+            async def gen():
+                last_err: Optional[UpstreamException] = None
+                for attempt in range(max_retries):
+                    token = await pick_token(token_mgr, model_id, tried)
+                    if not token:
+                        break
+                    tried.add(token)
+                    try:
+                        payload = await build_payload_fn(token)
+                        async for line in ConsoleChannelService._stream_upstream(
+                            payload, token=token
+                        ):
+                            yield line
+                        return
+                    except UpstreamException as exc:
+                        last_err = exc
+                        await ConsoleChannelService._handle_token_upstream_failure(
+                            token_mgr, token, exc
+                        )
+                        status = (exc.details or {}).get("status")
+                        logger.warning(
+                            f"Console upstream failed for token {token[:10]}... "
+                            f"status={status}, trying next token "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+                        continue
+                if last_err:
+                    raise last_err
+                raise no_token_error(model_id)
+
+            return gen()
+
+        for attempt in range(max_retries):
             token = await pick_token(token_mgr, model_id, tried)
             if not token:
                 if last_error:
@@ -137,13 +191,6 @@ class ConsoleChannelService:
             tried.add(token)
             try:
                 payload = await build_payload_fn(token)
-                if stream:
-                    async def gen():
-                        async for line in ConsoleChannelService._stream_upstream(
-                            payload, token=token
-                        ):
-                            yield line
-                    return gen()
                 lines = []
                 async for line in ConsoleChannelService._stream_upstream(
                     payload, token=token
@@ -152,6 +199,15 @@ class ConsoleChannelService:
                 return lines
             except UpstreamException as exc:
                 last_error = exc
+                await ConsoleChannelService._handle_token_upstream_failure(
+                    token_mgr, token, exc
+                )
+                status = (exc.details or {}).get("status")
+                logger.warning(
+                    f"Console upstream failed for token {token[:10]}... "
+                    f"status={status}, trying next token "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
                 continue
         if last_error:
             raise last_error

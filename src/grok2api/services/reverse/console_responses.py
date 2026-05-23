@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from typing import Any, AsyncIterator, Dict, Optional
 from urllib.parse import urlparse
@@ -16,8 +17,7 @@ from grok2api.core.proxy_pool import get_current_proxy_from, rotate_proxy, shoul
 from grok2api.services.grok.services.console_input import drop_compaction_blobs_from_payload
 from grok2api.services.reverse.console_constants import CONSOLE_RESPONSES_API, CONSOLE_TIMEOUT
 from grok2api.services.reverse.utils.headers import build_console_headers
-from grok2api.services.reverse.utils.retry import extract_status_for_retry, retry_on_status
-from grok2api.services.token.service import TokenService
+from grok2api.services.reverse.utils.retry import RetryContext, extract_status_for_retry
 
 
 def _normalize_proxy(proxy_url: str) -> str:
@@ -127,30 +127,43 @@ class ConsoleResponsesReverse:
                     details={"status": response.status_code, "body": content[:2000]},
                 )
 
-        async def _on_retry(attempt: int, status_code: int, error: Exception, delay: float):
+        async def _on_transport_retry(
+            attempt: int, status_code: int, error: Exception, delay: float
+        ) -> None:
             if active_proxy_key and should_rotate_proxy(status_code):
                 rotate_proxy(active_proxy_key)
 
-        def extract_status(e: Exception) -> Optional[int]:
-            status = extract_status_for_retry(e)
-            if status == 429:
-                return None
-            return status
-
-        try:
-            response = await retry_on_status(
-                _do_request,
-                extract_status=extract_status,
-                on_retry=_on_retry,
+        ctx = RetryContext()
+        response = None
+        while ctx.attempt <= ctx.max_retry:
+            try:
+                response = await _do_request()
+                break
+            except UpstreamException:
+                raise
+            except Exception as exc:
+                status_code = extract_status_for_retry(exc)
+                if status_code is None:
+                    raise
+                ctx.record_error(status_code, exc)
+                if not ctx.should_retry(status_code, exc):
+                    raise
+                delay = ctx.calculate_delay(status_code)
+                if ctx.total_delay + delay > ctx.retry_budget:
+                    raise
+                ctx.record_delay(delay)
+                logger.warning(
+                    f"ConsoleResponsesReverse transport retry {ctx.attempt}/{ctx.max_retry} "
+                    f"for status {status_code}, waiting {delay:.2f}s"
+                )
+                await _on_transport_retry(ctx.attempt, status_code, exc, delay)
+                await asyncio.sleep(delay)
+                continue
+        if response is None:
+            raise UpstreamException(
+                message="ConsoleResponsesReverse: request failed after transport retries",
+                details={"status": ctx.last_status},
             )
-        except UpstreamException as exc:
-            status = (exc.details or {}).get("status")
-            if status == 401:
-                try:
-                    await TokenService.record_fail(token, status, "console_auth_failed")
-                except Exception:
-                    pass
-            raise
 
         async def stream_lines() -> AsyncIterator[str]:
             try:
