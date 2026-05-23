@@ -241,10 +241,11 @@ class ConsoleVoiceService:
             except Exception:
                 pass
         elif rate_limited(exc):
-            try:
-                await token_mgr.mark_rate_limited(token)
-            except Exception:
-                pass
+            # Console Playground 429 is endpoint throttling, not grok.com SSO quota exhaustion.
+            logger.info(
+                f"Console voice upstream 429 for token {token[:10]}...; "
+                "skipping SSO quota/cooling update"
+            )
 
     @staticmethod
     async def _execute_with_token(model_id: str, call):

@@ -136,10 +136,11 @@ class ConsoleChannelService:
             except Exception:
                 pass
         elif rate_limited(exc):
-            try:
-                await token_mgr.mark_rate_limited(token)
-            except Exception:
-                pass
+            # Console Playground 429 is endpoint throttling, not grok.com SSO quota exhaustion.
+            logger.info(
+                f"Console upstream 429 for token {token[:10]}...; "
+                "skipping SSO quota/cooling update"
+            )
 
     @staticmethod
     async def _stream_upstream(
