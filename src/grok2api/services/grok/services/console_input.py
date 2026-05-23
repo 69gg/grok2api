@@ -12,7 +12,7 @@ from grok2api.services.grok.services.console_capabilities import (
     ConsoleModelCapabilities,
     should_include_encrypted,
 )
-from grok2api.services.grok.utils.tool_call import normalize_function_tool
+from grok2api.services.reverse.console_constants import CONSOLE_ALLOWED_INCLUDE
 
 _ENCRYPTED_RE = re.compile(r"^[A-Za-z0-9+/=_-]{80,}$")
 
@@ -386,7 +386,10 @@ class ConsoleInputBuilder:
         if tools:
             payload["tools"] = tools
         if tool_choice is not None:
-            payload["tool_choice"] = tool_choice
+            normalized_choice = tool_choice
+            if normalized_choice == "required" and not tools:
+                normalized_choice = "auto"
+            payload["tool_choice"] = normalized_choice
         if temperature is not None:
             payload["temperature"] = temperature
         if top_p is not None:
@@ -420,7 +423,9 @@ class ConsoleInputBuilder:
         if include_encrypted and caps.supports_encrypted_reasoning:
             payload["include"] = ["reasoning.encrypted_content"]
         elif request_include:
-            payload["include"] = list(request_include)
+            allowed = [item for item in request_include if item in CONSOLE_ALLOWED_INCLUDE]
+            if allowed:
+                payload["include"] = allowed
 
         return payload
 

@@ -7,7 +7,7 @@ from typing import AsyncGenerator, AsyncIterable, Callable, Optional
 
 import orjson
 
-from grok2api.core.exceptions import AppException
+from grok2api.core.exceptions import AppException, UpstreamException
 from grok2api.core.logger import logger
 
 
@@ -44,7 +44,15 @@ def _anthropic_error_chunks(exc: Exception) -> list[str]:
 
 
 def _responses_error_chunks(exc: Exception) -> list[str]:
-    message = exc.message if isinstance(exc, AppException) else (str(exc) or "stream_error")
+    if isinstance(exc, UpstreamException):
+        message = exc.message
+        body = (exc.details or {}).get("body")
+        if body:
+            message = f"{message}: {body[:500]}"
+    elif isinstance(exc, AppException):
+        message = exc.message
+    else:
+        message = str(exc) or "stream_error"
     payload = {"type": "error", "error": {"message": message}}
     encoded = orjson.dumps(payload).decode()
     return [f"data: {encoded}\n\n"]
@@ -65,7 +73,7 @@ async def safe_sse_stream(
     except GeneratorExit:
         raise
     except Exception as exc:
-        logger.warning("SSE stream interrupted: %s: %s", type(exc).__name__, exc)
+        logger.warning(f"SSE stream interrupted: {type(exc).__name__}: {exc}")
         for part in emit_error(exc):
             yield part
 

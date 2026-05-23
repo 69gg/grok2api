@@ -159,14 +159,14 @@ def filter_payload(
                 if strict:
                     raise ValueError(f"reasoning.effort '{effort}' not supported for model")
                 reasoning.pop("effort", None)
-                logger.debug("Dropped unsupported reasoning.effort=%s", effort)
+                logger.debug(f"Dropped unsupported reasoning.effort={effort}")
 
     for field in ("frequency_penalty", "presence_penalty"):
         if field in result and not getattr(caps, f"supports_{field}"):
             if strict:
                 raise ValueError(f"{field} not supported for model")
             result.pop(field, None)
-            logger.debug("Dropped unsupported %s", field)
+            logger.debug(f"Dropped unsupported {field}")
 
     return result
 

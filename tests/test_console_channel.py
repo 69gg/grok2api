@@ -92,6 +92,22 @@ def test_grok43_summary_mode_skips_encrypted_include():
     )
 
 
+def test_build_payload_filters_invalid_include_and_tool_choice():
+    from grok2api.services.grok.services.console_capabilities import CAP_GROK_43
+
+    payload = ConsoleInputBuilder.build_payload(
+        console_model="grok-4.3",
+        caps=CAP_GROK_43,
+        input_items=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        stream=True,
+        tools=None,
+        tool_choice="required",
+        request_include=["foo", "reasoning.encrypted_content"],
+    )
+    assert payload.get("include") == ["reasoning.encrypted_content"]
+    assert payload.get("tool_choice") == "auto"
+
+
 def test_stream_parser_completed_carries_usage():
     parser = ConsoleStreamParser()
     events = parser.ingest_line(

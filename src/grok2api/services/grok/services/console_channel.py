@@ -261,7 +261,8 @@ class ConsoleChannelService:
             )
             text_format = None
             if isinstance(text, dict):
-                text_format = text.get("format")
+                fmt = text.get("format") if isinstance(text.get("format"), dict) else text
+                text_format = _response_format_to_text_format(fmt)
             payload = ConsoleInputBuilder.build_payload(
                 console_model=model_info.console_model or model,
                 caps=caps,
