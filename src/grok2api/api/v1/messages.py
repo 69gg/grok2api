@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from grok2api.core.auth import get_admin_api_keys, is_valid_admin_api_key
 from grok2api.core.config import config
+from grok2api.core.streaming import safe_anthropic_stream
 from grok2api.core.exceptions import (
     AppException,
     AuthenticationException,
@@ -919,7 +920,7 @@ async def create_message(request: Request, payload: AnthropicMessagesRequest):
             )
             if payload.stream:
                 return StreamingResponse(
-                    result,
+                    safe_anthropic_stream(result),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
@@ -939,11 +940,13 @@ async def create_message(request: Request, payload: AnthropicMessagesRequest):
 
         if payload.stream:
             return StreamingResponse(
-                _anthropic_stream_from_chat(
-                    result,
-                    model=payload.model,
-                    stop_sequences=payload.stop_sequences,
-                    include_thinking=include_thinking,
+                safe_anthropic_stream(
+                    _anthropic_stream_from_chat(
+                        result,
+                        model=payload.model,
+                        stop_sequences=payload.stop_sequences,
+                        include_thinking=include_thinking,
+                    )
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},

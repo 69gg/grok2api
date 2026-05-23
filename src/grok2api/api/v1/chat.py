@@ -24,6 +24,7 @@ from grok2api.services.grok.utils.errors import no_token_error
 from grok2api.services.token import get_token_manager
 from grok2api.core.config import get_config
 from grok2api.core.exceptions import ValidationException, AppException, ErrorType
+from grok2api.core.streaming import safe_openai_chat_stream
 
 
 class MessageItem(BaseModel):
@@ -204,33 +205,6 @@ def _imagine_fast_server_image_config() -> ImageConfig:
     return ImageConfig(n=n, size=size, response_format=response_format)
 
 
-async def _safe_sse_stream(stream: AsyncIterable[str]) -> AsyncGenerator[str, None]:
-    """Ensure streaming endpoints return SSE error payloads instead of transport-level 5xx breaks."""
-    try:
-        async for chunk in stream:
-            yield chunk
-    except AppException as e:
-        payload = {
-            "error": {
-                "message": e.message,
-                "type": e.error_type,
-                "code": e.code,
-            }
-        }
-        yield f"event: error\ndata: {orjson.dumps(payload).decode()}\n\n"
-        yield "data: [DONE]\n\n"
-    except Exception as e:
-        payload = {
-            "error": {
-                "message": str(e) or "stream_error",
-                "type": "server_error",
-                "code": "stream_error",
-            }
-        }
-        yield f"event: error\ndata: {orjson.dumps(payload).decode()}\n\n"
-        yield "data: [DONE]\n\n"
-
-
 def _streaming_error_response(exc: Exception) -> StreamingResponse:
     if isinstance(exc, AppException):
         payload = {
@@ -258,6 +232,7 @@ def _streaming_error_response(exc: Exception) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
 
 def _validate_image_config(image_conf: ImageConfig, *, stream: bool):
     n = image_conf.n or 1
@@ -761,7 +736,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
         if result.stream:
             return StreamingResponse(
-                _safe_sse_stream(result.data),
+                safe_openai_chat_stream(result.data),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
@@ -819,7 +794,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
         if result.stream:
             return StreamingResponse(
-                _safe_sse_stream(result.data),
+                safe_openai_chat_stream(result.data),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
@@ -888,7 +863,7 @@ async def chat_completions(request: ChatCompletionRequest):
         return JSONResponse(content=result)
     else:
         return StreamingResponse(
-            _safe_sse_stream(result),
+            safe_openai_chat_stream(result),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )

@@ -8,6 +8,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from grok2api.core.streaming import safe_responses_stream
 from grok2api.core.exceptions import ValidationException
 from grok2api.services.grok.services.console_channel import ConsoleChannelService
 from grok2api.services.grok.services.model import ModelService
@@ -100,7 +101,7 @@ async def create_response(request: ResponseCreateRequest):
 
     if request.stream:
         return StreamingResponse(
-            result,
+            safe_responses_stream(result),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
