@@ -37,6 +37,13 @@ class Channel(str, Enum):
     CONSOLE_VOICE = "console_voice"
 
 
+OWNER_SOURCE = "grok2api@69gg"
+
+
+def _owned_by(platform: str) -> str:
+    return f"{platform}<{OWNER_SOURCE}>"
+
+
 class ModelInfo(BaseModel):
     """模型信息"""
 
@@ -60,10 +67,10 @@ class ModelInfo(BaseModel):
     @property
     def owned_by(self) -> str:
         if self.channel == Channel.CONSOLE:
-            return "xai-console"
+            return _owned_by("xai-console")
         if self.channel == Channel.CONSOLE_VOICE:
-            return "xai-console-voice"
-        return "grok2api@chenyme"
+            return _owned_by("xai-console-voice")
+        return _owned_by("grok-app")
 
 
 def _console_model(
@@ -348,6 +355,7 @@ __all__ = [
     "CONSOLE_VOICE_STT_MODEL_IDS",
     "CONSOLE_VOICE_TTS_MODEL_IDS",
     "SUPER_GROK_MODEL_IDS",
+    "OWNER_SOURCE",
     "ModelInfo",
     "ModelService",
 ]

@@ -35,7 +35,7 @@ def test_console_models_registered_and_listed():
         assert ModelService.valid(model_id)
         info = ModelService.get(model_id)
         assert info is not None
-        assert info.owned_by == "xai-console"
+        assert info.owned_by == "xai-console<grok2api@69gg>"
 
 
 def test_from_upstream_responses_usage_maps_cached_and_reasoning():

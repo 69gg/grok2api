@@ -34,6 +34,11 @@ def test_cf_refresh_config_uses_local_solver_route() -> None:
     assert config_example["register"]["solver_url"] == "http://127.0.0.1:5072"
 
 
+def test_grok_app_owned_by_includes_platform() -> None:
+    assert ModelService.get("grok-4.3-fast").owned_by == "grok-app<grok2api@69gg>"
+    assert ModelService.get("grok-4.20-auto").owned_by == "grok-app<grok2api@69gg>"
+
+
 def test_basic_pool_model_policy() -> None:
     basic_models = {
         model.model_id

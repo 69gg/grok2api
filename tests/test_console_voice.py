@@ -31,7 +31,7 @@ def test_console_voice_models_registered():
         assert ModelService.valid(model_id)
         info = ModelService.get(model_id)
         assert info is not None
-        assert info.owned_by == "xai-console-voice"
+        assert info.owned_by == "xai-console-voice<grok2api@69gg>"
         assert ModelService.pool_for_model(model_id) == "ssoBasic"
 
 
