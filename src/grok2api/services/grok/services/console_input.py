@@ -385,11 +385,8 @@ class ConsoleInputBuilder:
             payload["instructions"] = instructions
         if tools:
             payload["tools"] = tools
-        if tool_choice is not None:
-            normalized_choice = tool_choice
-            if normalized_choice == "required" and not tools:
-                normalized_choice = "auto"
-            payload["tool_choice"] = normalized_choice
+            if tool_choice is not None:
+                payload["tool_choice"] = "auto" if tool_choice == "required" else tool_choice
         if temperature is not None:
             payload["temperature"] = temperature
         if top_p is not None:

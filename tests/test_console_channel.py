@@ -105,7 +105,8 @@ def test_build_payload_filters_invalid_include_and_tool_choice():
         request_include=["foo", "reasoning.encrypted_content"],
     )
     assert payload.get("include") == ["reasoning.encrypted_content"]
-    assert payload.get("tool_choice") == "auto"
+    assert "tool_choice" not in payload
+    assert "tools" not in payload
 
 
 def test_stream_parser_completed_carries_usage():
