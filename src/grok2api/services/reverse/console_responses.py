@@ -91,6 +91,11 @@ class ConsoleResponsesReverse:
             )
             if response.status_code != 200:
                 content = await ConsoleResponsesReverse._read_error_body(response)
+                logger.error(
+                    "ConsoleResponsesReverse: upstream %s body: %s",
+                    response.status_code,
+                    content[:500],
+                )
                 raise UpstreamException(
                     message=f"ConsoleResponsesReverse: request failed, {response.status_code}",
                     details={"status": response.status_code, "body": content[:2000]},

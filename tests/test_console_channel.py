@@ -74,7 +74,7 @@ def test_chat_messages_to_input_with_tool_and_encrypted_reasoning():
 def test_merge_tools_adds_search_tools_for_search_variant():
     tools = merge_tools([{"type": "function", "name": "foo", "parameters": {}}], console_search=True)
     types = {t["type"] for t in tools}
-    assert "web_search_preview" in types
+    assert "web_search" in types
     assert "x_search" in types
 
 

@@ -6,7 +6,7 @@ CONSOLE_DEFAULT_CLUSTER = "https://us-east-1.api.x.ai"
 CONSOLE_TIMEOUT = 120
 CONSOLE_ALLOW_PREVIOUS_RESPONSE_ID = False
 CONSOLE_STRICT_PARAM_VALIDATION = False
-CONSOLE_SEARCH_TOOLS = ("web_search_preview", "x_search")
+CONSOLE_SEARCH_TOOLS = ("web_search", "x_search")
 
 __all__ = [
     "CONSOLE_ALLOW_PREVIOUS_RESPONSE_ID",

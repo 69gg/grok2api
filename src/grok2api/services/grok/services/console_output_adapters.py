@@ -182,10 +182,6 @@ class ConsoleChatStreamAdapter:
                         },
                     }
                     self.finish_reason = "tool_calls"
-        elif event.type == ConsoleEventType.RAW and event.data.get("raw"):
-            raw = event.data["raw"]
-            if isinstance(raw, dict) and raw.get("type", "").startswith("response."):
-                out.append(f"data: {orjson.dumps(raw).decode()}\n\n")
 
         return out
 

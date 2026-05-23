@@ -30,6 +30,12 @@ from grok2api.services.reverse.console_responses import ConsoleResponsesReverse
 from grok2api.services.token import get_token_manager
 
 
+def _resolve_stream(stream: Optional[bool]) -> bool:
+    if stream is not None:
+        return bool(stream)
+    return bool(get_config("app.stream", True))
+
+
 def _resolve_model(model_id: str):
     model = ModelService.get(model_id)
     if not model or model.channel != Channel.CONSOLE:
@@ -131,7 +137,7 @@ class ConsoleChannelService:
         *,
         model: str,
         messages: List[Dict[str, Any]],
-        stream: bool = False,
+        stream: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -145,6 +151,7 @@ class ConsoleChannelService:
     ):
         model_info = _resolve_model(model)
         caps = model_info.capabilities or get_console_capabilities(model_info.console_model or model)
+        stream_flag = _resolve_stream(stream)
 
         async def build(_token: str) -> Dict[str, Any]:
             instructions, input_items, history_encrypted = ConsoleInputBuilder.from_chat_messages(
@@ -159,7 +166,7 @@ class ConsoleChannelService:
                 caps=caps,
                 input_items=input_items,
                 instructions=instructions,
-                stream=stream,
+                stream=stream_flag,
                 tools=merged_tools or None,
                 tool_choice=tool_choice,
                 temperature=temperature,
@@ -176,10 +183,10 @@ class ConsoleChannelService:
             return filter_payload(caps, payload)
 
         result = await ConsoleChannelService._execute_with_token(
-            model, build, stream=stream
+            model, build, stream=stream_flag
         )
 
-        if stream:
+        if stream_flag:
             async def chat_stream():
                 adapter = ConsoleChatStreamAdapter(model)
                 parser = ConsoleStreamParser()
@@ -225,6 +232,7 @@ class ConsoleChannelService:
 
         model_info = _resolve_model(model)
         caps = model_info.capabilities or get_console_capabilities(model_info.console_model or model)
+        stream_flag = _resolve_stream(stream)
         reasoning_effort = None
         if isinstance(reasoning, dict):
             reasoning_effort = reasoning.get("effort")
@@ -245,7 +253,7 @@ class ConsoleChannelService:
                 caps=caps,
                 input_items=input_items,
                 instructions=instr,
-                stream=stream,
+                stream=stream_flag,
                 tools=merged_tools or None,
                 tool_choice=tool_choice,
                 temperature=temperature,
@@ -266,10 +274,10 @@ class ConsoleChannelService:
             return filter_payload(caps, payload)
 
         result = await ConsoleChannelService._execute_with_token(
-            model, build, stream=stream
+            model, build, stream=stream_flag
         )
 
-        if stream:
+        if stream_flag:
             async def resp_stream():
                 adapter = ConsoleResponsesStreamAdapter(model)
                 async for line in result:
@@ -293,7 +301,7 @@ class ConsoleChannelService:
         model: str,
         messages: List[Dict[str, Any]],
         system: Optional[Any] = None,
-        stream: bool = False,
+        stream: Optional[bool] = None,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -303,6 +311,7 @@ class ConsoleChannelService:
     ):
         model_info = _resolve_model(model)
         caps = model_info.capabilities or get_console_capabilities(model_info.console_model or model)
+        stream_flag = _resolve_stream(stream)
 
         instr, input_items, history_encrypted = ConsoleInputBuilder.from_anthropic_raw_messages(
             messages
@@ -335,7 +344,7 @@ class ConsoleChannelService:
                 caps=caps,
                 input_items=input_items,
                 instructions=instr,
-                stream=stream,
+                stream=stream_flag,
                 tools=merged_tools or None,
                 tool_choice=tool_choice,
                 temperature=temperature,
@@ -347,9 +356,9 @@ class ConsoleChannelService:
             )
             return filter_payload(caps, payload)
 
-        result = await ConsoleChannelService._execute_with_token(model, build, stream=stream)
+        result = await ConsoleChannelService._execute_with_token(model, build, stream=stream_flag)
 
-        if stream:
+        if stream_flag:
             async def anthropic_stream():
                 from grok2api.api.v1.messages import _AnthropicStreamAdapter
 

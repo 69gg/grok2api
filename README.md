@@ -54,7 +54,7 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 1. Playground 上游默认 `store=false`，**不要依赖** `previous_response_id`；每次请求应携带 **完整对话 history**。
 2. Reasoning 模型会返回 `reasoning_content`（Chat）、`thinking` block（Anthropic）或 Responses `reasoning` item；其中 encrypted blob **不可解密**，但应 **原样保存并在下一轮原样回传**，以保留内部推理上下文。
 3. `grok-4.3` 默认返回 **明文 reasoning summary**（非 encrypted）；其余 reasoning 模型为 encrypted 透传。
-4. `-search` 变体会自动注入 `web_search_preview` 与 `x_search`，无需客户端手动添加搜索 tools。
+4. `-search` 变体会自动注入 `web_search` 与 `x_search`，无需客户端手动添加搜索 tools。
 
 ## 检查
 

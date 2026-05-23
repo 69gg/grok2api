@@ -336,8 +336,8 @@ class ConsoleInputBuilder:
             if not isinstance(tool, dict):
                 continue
             tool_type = tool.get("type")
-            if tool_type in {"web_search_preview", "x_search"}:
-                normalized.append({"type": tool_type})
+            if tool_type in {"web_search", "web_search_preview", "x_search"}:
+                normalized.append({"type": "web_search" if tool_type == "web_search_preview" else tool_type})
                 continue
             if tool_type == "function":
                 flat = normalize_function_tool(tool)
@@ -378,7 +378,7 @@ class ConsoleInputBuilder:
         payload: Dict[str, Any] = {
             "model": console_model,
             "input": input_items,
-            "stream": stream,
+            "stream": True if stream is None else bool(stream),
             "store": store,
         }
         if instructions:
