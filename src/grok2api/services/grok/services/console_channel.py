@@ -16,6 +16,7 @@ from grok2api.services.grok.services.console_capabilities import (
     merge_tools,
 )
 from grok2api.services.grok.services.console_input import ConsoleInputBuilder
+from grok2api.services.grok.services.console_replay import reject_incremental_previous_response
 from grok2api.services.grok.services.console_output_adapters import (
     ConsoleChatStreamAdapter,
     ConsoleResponsesStreamAdapter,
@@ -26,6 +27,7 @@ from grok2api.services.grok.services.model import Channel, ModelService
 from grok2api.services.grok.utils.errors import no_token_error
 from grok2api.services.grok.utils.retry import pick_token
 from grok2api.services.reverse.console_constants import CONSOLE_ALLOW_PREVIOUS_RESPONSE_ID
+from grok2api.services.reverse.console_payload import merge_console_payload, sanitize_console_upstream_payload
 from grok2api.services.reverse.console_responses import ConsoleResponsesReverse
 from grok2api.services.token import get_token_manager
 
@@ -194,7 +196,7 @@ class ConsoleChannelService:
                 history_has_encrypted=history_encrypted,
                 thinking_enabled=bool(reasoning_effort and reasoning_effort.lower() != "none"),
             )
-            return filter_payload(caps, payload)
+            return sanitize_console_upstream_payload(filter_payload(caps, payload))
 
         result = await ConsoleChannelService._execute_with_token(
             model, build, stream=stream_flag
@@ -241,6 +243,7 @@ class ConsoleChannelService:
         previous_response_id: Optional[str] = None,
         **extra: Any,
     ):
+        had_previous_response_id = bool(previous_response_id)
         if previous_response_id and not CONSOLE_ALLOW_PREVIOUS_RESPONSE_ID:
             previous_response_id = None
 
@@ -254,6 +257,10 @@ class ConsoleChannelService:
         async def build(_token: str) -> Dict[str, Any]:
             instr, input_items, history_encrypted = ConsoleInputBuilder.from_responses_input(
                 input_value, instructions=instructions
+            )
+            reject_incremental_previous_response(
+                had_previous_response_id=had_previous_response_id,
+                input_items=input_items,
             )
             merged_tools = merge_tools(
                 ConsoleInputBuilder.normalize_tools(tools),
@@ -285,8 +292,9 @@ class ConsoleChannelService:
             )
             if previous_response_id and CONSOLE_ALLOW_PREVIOUS_RESPONSE_ID:
                 payload["previous_response_id"] = previous_response_id
-            payload.update({k: v for k, v in extra.items() if v is not None})
-            return filter_payload(caps, payload)
+            return sanitize_console_upstream_payload(
+                filter_payload(caps, merge_console_payload(payload, extra))
+            )
 
         result = await ConsoleChannelService._execute_with_token(
             model, build, stream=stream_flag
@@ -371,7 +379,7 @@ class ConsoleChannelService:
                 history_has_encrypted=history_encrypted,
                 thinking_enabled=thinking_enabled,
             )
-            return filter_payload(caps, payload)
+            return sanitize_console_upstream_payload(filter_payload(caps, payload))
 
         result = await ConsoleChannelService._execute_with_token(model, build, stream=stream_flag)
 

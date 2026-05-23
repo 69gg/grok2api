@@ -13,6 +13,7 @@ from grok2api.core.exceptions import ValidationException
 from grok2api.services.grok.services.console_channel import ConsoleChannelService
 from grok2api.services.grok.services.model import ModelService
 from grok2api.services.grok.services.responses import ResponsesService
+from grok2api.services.reverse.console_payload import strip_console_client_extra
 
 
 router = APIRouter(tags=["Responses"])
@@ -52,11 +53,29 @@ async def create_response(request: ResponseCreateRequest):
     if isinstance(request.reasoning, dict):
         reasoning_effort = request.reasoning.get("effort") or request.reasoning.get("reasoning_effort")
 
-    extra_fields = request.model_dump(exclude={
-        "model", "input", "instructions", "stream", "max_output_tokens",
-        "temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls",
-        "reasoning", "metadata", "user", "store", "previous_response_id", "truncation",
-    }, exclude_none=True)
+    extra_fields = strip_console_client_extra(
+        request.model_dump(
+            exclude={
+                "model",
+                "input",
+                "instructions",
+                "stream",
+                "max_output_tokens",
+                "temperature",
+                "top_p",
+                "tools",
+                "tool_choice",
+                "parallel_tool_calls",
+                "reasoning",
+                "metadata",
+                "user",
+                "store",
+                "previous_response_id",
+                "truncation",
+            },
+            exclude_none=True,
+        )
+    )
 
     if ModelService.is_console(request.model):
         result = await ConsoleChannelService.responses(

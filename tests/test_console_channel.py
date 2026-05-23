@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from grok2api.core.exceptions import ValidationException
 from grok2api.services.grok.services.console_channel import _response_format_to_text_format
 from grok2api.services.grok.services.console_capabilities import (
     CAP_GROK_43,
@@ -13,12 +16,20 @@ from grok2api.services.grok.services.console_input import (
     is_encrypted_reasoning,
 )
 from grok2api.services.grok.services.console_output_adapters import ConsoleChatStreamAdapter
+from grok2api.services.grok.services.console_replay import (
+    is_incremental_responses_input,
+    reject_incremental_previous_response,
+)
 from grok2api.services.grok.services.console_stream_parser import (
     ConsoleEventType,
     ConsoleStreamParser,
 )
 from grok2api.services.grok.services.model import CONSOLE_MODEL_IDS, ModelService
 from grok2api.services.grok.utils.usage import from_upstream_responses_usage
+from grok2api.services.reverse.console_payload import (
+    merge_console_payload,
+    strip_console_client_extra,
+)
 
 
 def test_console_models_registered_and_listed():
@@ -193,3 +204,121 @@ def test_chat_adapter_extracts_non_stream_response_text():
     message = result["choices"][0]["message"]
     assert message["content"] == "hello"
     assert result["usage"]["total_tokens"] == 4
+
+
+def test_strip_console_client_extra_drops_incompatible_fields():
+    extra = {
+        "stream_options": {"include_usage": True},
+        "prompt_cache_key": "abc",
+        "thinking": {"type": "enabled"},
+        "output_config": {"effort": "high"},
+        "temperature": 0.5,
+    }
+    cleaned = strip_console_client_extra(extra)
+    assert cleaned == {"temperature": 0.5}
+
+
+def test_merge_console_payload_whitelists_upstream_keys():
+    payload = merge_console_payload(
+        {
+            "model": "grok-4.3",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "stream": True,
+            "store": False,
+        },
+        {"stream_options": {"include_usage": True}, "temperature": 0.2},
+    )
+    assert "stream_options" not in payload
+    assert payload["temperature"] == 0.2
+    assert payload["model"] == "grok-4.3"
+
+
+def test_chat_messages_convert_image_url_to_input_image():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png", "detail": "high"}},
+            ],
+        }
+    ]
+    _, items, _ = ConsoleInputBuilder.from_chat_messages(messages)
+    assert len(items) == 1
+    blocks = items[0]["content"]
+    assert blocks[0]["type"] == "input_text"
+    assert blocks[1]["type"] == "input_image"
+    assert blocks[1]["image_url"] == "https://example.com/a.png"
+    assert blocks[1]["detail"] == "high"
+
+
+def test_responses_input_replay_passthrough_reasoning_and_function_call():
+    blob = "B" * 120
+    input_items = [
+        {"type": "reasoning", "id": "rs_abc", "encrypted_content": blob, "summary": []},
+        {
+            "type": "function_call",
+            "id": "call_bad",
+            "call_id": "call_123",
+            "name": "search",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call_123", "output": "ok"},
+    ]
+    _, items, history_encrypted = ConsoleInputBuilder.from_responses_input(input_items)
+    assert history_encrypted is True
+    assert items[0]["type"] == "reasoning"
+    assert items[1]["call_id"] == "call_123"
+    assert "id" not in items[1]
+    assert items[2]["type"] == "function_call_output"
+
+
+def test_responses_input_replay_user_message_with_input_image():
+    input_items = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "look"},
+                {"type": "input_image", "image_url": "https://example.com/x.png"},
+            ],
+        }
+    ]
+    _, items, _ = ConsoleInputBuilder.from_responses_input(input_items)
+    blocks = items[0]["content"]
+    assert blocks[1]["type"] == "input_image"
+    assert blocks[1]["image_url"] == "https://example.com/x.png"
+
+
+def test_incremental_previous_response_id_is_detected():
+    items = [{"type": "function_call_output", "call_id": "call_1", "output": "sunny"}]
+    assert is_incremental_responses_input(items) is True
+
+
+def test_reject_incremental_previous_response_raises_for_undefined_fallback():
+    items = [{"type": "function_call_output", "call_id": "call_9", "output": "done"}]
+    with pytest.raises(ValidationException) as exc:
+        reject_incremental_previous_response(
+            had_previous_response_id=True,
+            input_items=items,
+        )
+    assert exc.value.param == "input"
+    assert "call_9" in str(exc.value.message)
+
+
+def test_full_stateless_replay_not_rejected_with_previous_response_id():
+    blob = "C" * 120
+    items = [
+        {"type": "reasoning", "encrypted_content": blob, "summary": []},
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
+    ]
+    reject_incremental_previous_response(
+        had_previous_response_id=True,
+        input_items=items,
+    )

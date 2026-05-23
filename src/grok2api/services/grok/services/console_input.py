@@ -43,6 +43,132 @@ def _output_text_content(text: str) -> List[Dict[str, Any]]:
     return [{"type": "output_text", "text": text}]
 
 
+def _normalize_image_block(block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    block_type = str(block.get("type") or "").strip().lower()
+    if block_type == "input_image":
+        image_url = block.get("image_url")
+        if isinstance(image_url, str) and image_url.strip():
+            return {
+                "type": "input_image",
+                "image_url": image_url.strip(),
+                "detail": str(block.get("detail") or "auto"),
+            }
+        if isinstance(image_url, dict) and image_url.get("url"):
+            return {
+                "type": "input_image",
+                "image_url": str(image_url.get("url")),
+                "detail": str(image_url.get("detail") or block.get("detail") or "auto"),
+            }
+        return None
+    if block_type == "image_url":
+        image_url = block.get("image_url")
+        url = ""
+        detail = "auto"
+        if isinstance(image_url, dict):
+            url = str(image_url.get("url") or "").strip()
+            detail = str(image_url.get("detail") or "auto")
+        elif isinstance(image_url, str):
+            url = image_url.strip()
+        if not url:
+            return None
+        return {"type": "input_image", "image_url": url, "detail": detail}
+    if block_type.endswith("_url"):
+        payload = block.get(block_type) or {}
+        if isinstance(payload, dict) and payload.get("url"):
+            return {
+                "type": "input_image",
+                "image_url": str(payload.get("url")),
+                "detail": str(payload.get("detail") or "auto"),
+            }
+    return block
+
+
+def _normalize_user_content_blocks(content: List[Any]) -> List[Dict[str, Any]]:
+    blocks: List[Dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, str):
+            if block:
+                blocks.append({"type": "input_text", "text": block})
+            continue
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type == "text":
+            blocks.append({"type": "input_text", "text": block.get("text") or ""})
+            continue
+        if block_type in {"input_text", "output_text"}:
+            blocks.append(block)
+            continue
+        normalized = _normalize_image_block(block)
+        if normalized is not None:
+            blocks.append(normalized)
+    return blocks
+
+
+def _normalize_function_call_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    arguments = item.get("arguments")
+    if not isinstance(arguments, str):
+        arguments = orjson.dumps(arguments or {}).decode()
+    call_id = item.get("call_id") or item.get("id") or _new_call_id()
+    item_id = str(item.get("id") or "").strip()
+    if item_id.startswith("call_") and not item.get("call_id"):
+        call_id = item_id
+    normalized: Dict[str, Any] = {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": item.get("name"),
+        "arguments": arguments,
+    }
+    if item_id.startswith("fc_"):
+        normalized["id"] = item_id
+    return normalized
+
+
+def _normalize_reasoning_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "reasoning",
+        "id": item.get("id") or _new_reasoning_id(),
+        "status": item.get("status") or "completed",
+        "encrypted_content": item.get("encrypted_content"),
+        "summary": item.get("summary") or [],
+    }
+
+
+def _normalize_replay_message_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    role = str(item.get("role") or "").strip().lower()
+    content = item.get("content")
+    if role == "user":
+        if isinstance(content, str):
+            return {"role": "user", "content": _text_content(content)}
+        if isinstance(content, list):
+            blocks = _normalize_user_content_blocks(content)
+            if blocks:
+                return {"role": "user", "content": blocks}
+        return None
+    if role == "assistant":
+        if isinstance(content, str):
+            return {
+                "type": "message",
+                "role": "assistant",
+                "content": _output_text_content(content),
+            }
+        if isinstance(content, list):
+            parts: List[Dict[str, Any]] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = str(part.get("type") or "").strip().lower()
+                if part_type in {"output_text", "text"}:
+                    text = part.get("text") or part.get("content") or ""
+                    if text:
+                        parts.append({"type": "output_text", "text": text})
+                elif part_type == "refusal":
+                    parts.append(part)
+            if parts:
+                return {"type": "message", "role": "assistant", "content": parts}
+    return None
+
+
 class ConsoleInputBuilder:
     """Convert heterogeneous client history into Responses input[]."""
 
@@ -81,28 +207,11 @@ class ConsoleInputBuilder:
                 enc = item.get("encrypted_content")
                 if enc:
                     history_encrypted = True
-                    items.append(
-                        {
-                            "type": "reasoning",
-                            "id": item.get("id") or _new_reasoning_id(),
-                            "status": item.get("status") or "completed",
-                            "encrypted_content": enc,
-                            "summary": item.get("summary") or [],
-                        }
-                    )
+                    items.append(_normalize_reasoning_item(item))
                 continue
 
             if item_type == "function_call":
-                items.append(
-                    {
-                        "type": "function_call",
-                        "call_id": item.get("call_id") or item.get("id") or _new_call_id(),
-                        "name": item.get("name"),
-                        "arguments": item.get("arguments")
-                        if isinstance(item.get("arguments"), str)
-                        else orjson.dumps(item.get("arguments") or {}).decode(),
-                    }
-                )
+                items.append(_normalize_function_call_item(item))
                 continue
 
             if item_type in {"function_call_output", "tool_call_output", "tool_output"}:
@@ -116,39 +225,9 @@ class ConsoleInputBuilder:
                 continue
 
             if item_type == "message" or role in {"user", "assistant"}:
-                content = item.get("content")
-                if role == "assistant" or item.get("role") == "assistant":
-                    if isinstance(content, str) and content:
-                        items.append(
-                            {
-                                "type": "message",
-                                "role": "assistant",
-                                "content": _output_text_content(content),
-                            }
-                        )
-                    elif isinstance(content, list):
-                        texts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") in {
-                                "output_text",
-                                "text",
-                            }:
-                                text = part.get("text") or part.get("content") or ""
-                                if text:
-                                    texts.append(text)
-                        if texts:
-                            items.append(
-                                {
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "content": _output_text_content("\n".join(texts)),
-                                }
-                            )
-                else:
-                    if isinstance(content, str):
-                        items.append({"role": "user", "content": _text_content(content)})
-                    elif isinstance(content, list):
-                        items.append({"role": "user", "content": content})
+                replay_item = _normalize_replay_message_item(item)
+                if replay_item:
+                    items.append(replay_item)
                 continue
 
             if role == "user":
@@ -156,7 +235,9 @@ class ConsoleInputBuilder:
                 if isinstance(content, str):
                     items.append({"role": "user", "content": _text_content(content)})
                 elif isinstance(content, list):
-                    items.append({"role": "user", "content": content})
+                    blocks = _normalize_user_content_blocks(content)
+                    if blocks:
+                        items.append({"role": "user", "content": blocks})
 
         merged_instructions = "\n\n".join(instructions_parts) if instructions_parts else None
         return merged_instructions, items, history_encrypted
@@ -182,15 +263,7 @@ class ConsoleInputBuilder:
                 if isinstance(content, str):
                     items.append({"role": "user", "content": _text_content(content)})
                 elif isinstance(content, list):
-                    blocks = []
-                    for block in content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text":
-                                blocks.append(
-                                    {"type": "input_text", "text": block.get("text") or ""}
-                                )
-                            else:
-                                blocks.append(block)
+                    blocks = _normalize_user_content_blocks(content)
                     items.append({"role": "user", "content": blocks or _text_content("")})
                 continue
 
@@ -216,12 +289,13 @@ class ConsoleInputBuilder:
                         continue
                     fn = tool_call.get("function") or {}
                     items.append(
-                        {
-                            "type": "function_call",
-                            "call_id": tool_call.get("id") or _new_call_id(),
-                            "name": fn.get("name"),
-                            "arguments": fn.get("arguments") or "{}",
-                        }
+                        _normalize_function_call_item(
+                            {
+                                "call_id": tool_call.get("id") or _new_call_id(),
+                                "name": fn.get("name"),
+                                "arguments": fn.get("arguments") or "{}",
+                            }
+                        )
                     )
 
                 content = message.get("content")
