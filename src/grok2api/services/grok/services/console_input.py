@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +17,9 @@ from grok2api.services.grok.utils.tool_call import normalize_function_tool
 from grok2api.services.reverse.console_constants import CONSOLE_ALLOWED_INCLUDE
 
 _ENCRYPTED_RE = re.compile(r"^[A-Za-z0-9+/=_-]{80,}$")
+
+# Server-only fields safe to drop when replaying output[] back to console.x.ai.
+_REPLAY_STRIP_KEYS = frozenset({"status"})
 
 
 def _new_reasoning_id() -> str:
@@ -125,6 +129,14 @@ def _normalize_function_call_item(item: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def _passthrough_replay_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Replay upstream output items without modifying encrypted blobs or server ids."""
+    cloned = copy.deepcopy(item)
+    for key in _REPLAY_STRIP_KEYS:
+        cloned.pop(key, None)
+    return cloned
+
+
 def _normalize_reasoning_item(item: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {
         "type": "reasoning",
@@ -226,27 +238,41 @@ class ConsoleInputBuilder:
                     instructions_parts.append(content.strip())
                 continue
 
-            if item_type == "reasoning" or (item_type is None and item.get("encrypted_content")):
+            if (
+                item_type in {"reasoning", "compaction"}
+                or (item_type is None and item.get("encrypted_content"))
+            ):
                 if item.get("encrypted_content"):
                     history_encrypted = True
-                items.append(_normalize_reasoning_item(item))
+                    items.append(_passthrough_replay_item(item))
+                else:
+                    items.append(_normalize_reasoning_item(item))
                 continue
 
             if item_type == "function_call":
-                items.append(_normalize_function_call_item(item))
+                if item.get("call_id"):
+                    items.append(_passthrough_replay_item(item))
+                else:
+                    items.append(_normalize_function_call_item(item))
                 continue
 
             if item_type in {"function_call_output", "tool_call_output", "tool_output"}:
-                items.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": item.get("call_id") or item.get("tool_call_id") or item.get("id"),
-                        "output": item.get("output") or item.get("content") or "",
-                    }
-                )
+                if item.get("call_id") or item.get("tool_call_id"):
+                    items.append(_passthrough_replay_item(item))
+                else:
+                    items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": item.get("id"),
+                            "output": item.get("output") or item.get("content") or "",
+                        }
+                    )
                 continue
 
             if item_type == "message" or role in {"user", "assistant"}:
+                if item_type == "message" and item.get("id"):
+                    items.append(_passthrough_replay_item(item))
+                    continue
                 replay_item = _normalize_replay_message_item(item)
                 if replay_item:
                     items.append(replay_item)
@@ -294,15 +320,16 @@ class ConsoleInputBuilder:
                 if isinstance(reasoning, str) and reasoning.strip():
                     if is_encrypted_reasoning(reasoning):
                         history_encrypted = True
-                        items.append(
-                            {
-                                "type": "reasoning",
-                                "id": _new_reasoning_id(),
-                                "status": "completed",
-                                "encrypted_content": reasoning.strip(),
-                                "summary": [],
-                            }
+                        reasoning_id = message.get("reasoning_id") or message.get(
+                            "reasoning_item_id"
                         )
+                        replay_item: Dict[str, Any] = {
+                            "type": "reasoning",
+                            "encrypted_content": reasoning,
+                        }
+                        if isinstance(reasoning_id, str) and reasoning_id.strip():
+                            replay_item["id"] = reasoning_id.strip()
+                        items.append(replay_item)
                     # plaintext summary stays in visible content path for grok-4.3
 
                 tool_calls = message.get("tool_calls") or []

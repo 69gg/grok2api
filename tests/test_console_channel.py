@@ -318,9 +318,30 @@ def test_responses_input_replay_passthrough_reasoning_and_function_call():
     _, items, history_encrypted = ConsoleInputBuilder.from_responses_input(input_items)
     assert history_encrypted is True
     assert items[0]["type"] == "reasoning"
+    assert items[0]["id"] == "rs_abc"
+    assert items[0]["encrypted_content"] == blob
+    assert items[0].get("status") is None
     assert items[1]["call_id"] == "call_123"
-    assert "id" not in items[1]
+    assert items[1]["id"] == "call_bad"
     assert items[2]["type"] == "function_call_output"
+
+
+def test_responses_input_replay_passthrough_compaction_item():
+    blob = "D" * 120
+    input_items = [
+        {
+            "type": "compaction",
+            "id": "cmp_abc",
+            "encrypted_content": blob,
+            "status": "completed",
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    _, items, history_encrypted = ConsoleInputBuilder.from_responses_input(input_items)
+    assert history_encrypted is True
+    assert items[0]["type"] == "compaction"
+    assert items[0]["encrypted_content"] == blob
+    assert items[0].get("status") is None
 
 
 def test_responses_input_replay_user_message_with_input_image():
