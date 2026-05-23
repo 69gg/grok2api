@@ -39,6 +39,7 @@ CONSOLE_STRIP_REQUEST_FIELDS: frozenset[str] = frozenset(
         "output_config",
         "metadata",
         "user",
+        "previous_response_id",
         "service_tier",
         "safety_identifier",
         "truncation",

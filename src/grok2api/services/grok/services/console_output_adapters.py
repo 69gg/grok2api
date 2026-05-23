@@ -13,7 +13,6 @@ from grok2api.services.grok.services.console_stream_parser import (
     ConsoleEvent,
     ConsoleEventType,
 )
-from grok2api.services.grok.services.console_replay_cache import remember_reasoning_blob
 from grok2api.services.grok.utils.response import make_response_id
 from grok2api.services.grok.utils.usage import from_upstream_responses_usage, to_responses_usage
 
@@ -267,25 +266,6 @@ def _reasoning_item_has_summary_text(item: Dict[str, Any]) -> bool:
     return False
 
 
-_DISPLAY_ONLY_KEY = "_grok2api_display_only"
-
-
-def _is_display_only_replay_item(item: Dict[str, Any]) -> bool:
-    if item.get(_DISPLAY_ONLY_KEY):
-        return True
-    item_id = str(item.get("id") or "").strip()
-    return item_id.startswith("rs_grok2api_")
-
-
-def _make_display_reasoning_item(text: str, *, output_index: int) -> Dict[str, Any]:
-    return {
-        "type": "reasoning",
-        "id": f"rs_grok2api_{output_index}",
-        _DISPLAY_ONLY_KEY: True,
-        "summary": [{"type": "summary_text", "text": text}],
-    }
-
-
 def _inject_reasoning_summary_text(item: Dict[str, Any], text: str) -> Dict[str, Any]:
     if not text or _reasoning_item_has_summary_text(item):
         return item
@@ -315,33 +295,19 @@ class ConsoleResponsesStreamAdapter:
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
         self.completed_response: Optional[Dict[str, Any]] = None
-        self._reasoning_summary_by_item_id: Dict[str, List[str]] = {}
         self._reasoning_summary_by_output_index: Dict[int, List[str]] = {}
 
     def _accumulate_reasoning_text(
         self,
         *,
-        item_id: Any = None,
         output_index: Any = None,
         text: str,
     ) -> None:
-        if not text:
+        if not text or not isinstance(output_index, int):
             return
-        if item_id is not None:
-            key = str(item_id).strip()
-            if key:
-                self._reasoning_summary_by_item_id.setdefault(key, []).append(text)
-        if isinstance(output_index, int):
-            self._reasoning_summary_by_output_index.setdefault(output_index, []).append(text)
+        self._reasoning_summary_by_output_index.setdefault(output_index, []).append(text)
 
-    def _summary_text_for_reasoning_item(
-        self,
-        item: Dict[str, Any],
-        output_index: Any = None,
-    ) -> str:
-        item_id = str(item.get("id") or "").strip()
-        if item_id and item_id in self._reasoning_summary_by_item_id:
-            return "".join(self._reasoning_summary_by_item_id[item_id])
+    def _summary_text_for_output_index(self, output_index: Any = None) -> str:
         if isinstance(output_index, int) and output_index in self._reasoning_summary_by_output_index:
             return "".join(self._reasoning_summary_by_output_index[output_index])
         return ""
@@ -355,18 +321,10 @@ class ConsoleResponsesStreamAdapter:
             if not isinstance(item, dict) or item.get("type") != "reasoning":
                 patched.append(item)
                 continue
-            remember_reasoning_blob(item)
             if item.get("encrypted_content"):
                 patched.append(item)
-                summary_text = self._summary_text_for_reasoning_item(item, index)
-                if not summary_text:
-                    summary_text = _extract_native_reasoning_text(item)
-                if summary_text:
-                    patched.append(
-                        _make_display_reasoning_item(summary_text, output_index=index)
-                    )
                 continue
-            summary_text = self._summary_text_for_reasoning_item(item, index)
+            summary_text = self._summary_text_for_output_index(index)
             if not summary_text:
                 summary_text = _extract_native_reasoning_text(item)
             if summary_text and not _reasoning_item_has_summary_text(item):
@@ -387,25 +345,19 @@ class ConsoleResponsesStreamAdapter:
         event_type = str(data.get("type") or "")
         if event_type in self._REASONING_DELTA_EVENTS:
             self._accumulate_reasoning_text(
-                item_id=data.get("item_id"),
                 output_index=data.get("output_index"),
                 text=str(data.get("delta") or ""),
             )
         elif event_type in self._REASONING_DONE_EVENTS:
             self._accumulate_reasoning_text(
-                item_id=data.get("item_id"),
                 output_index=data.get("output_index"),
                 text=str(data.get("text") or ""),
             )
         elif event_type == "response.output_item.done":
             item = data.get("item")
             if isinstance(item, dict) and item.get("type") == "reasoning":
-                remember_reasoning_blob(item)
                 if not item.get("encrypted_content"):
-                    summary_text = self._summary_text_for_reasoning_item(
-                        item,
-                        data.get("output_index"),
-                    )
+                    summary_text = self._summary_text_for_output_index(data.get("output_index"))
                     if summary_text:
                         data = dict(data)
                         data["item"] = _inject_reasoning_summary_text(item, summary_text)

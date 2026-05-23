@@ -13,17 +13,13 @@ from grok2api.services.grok.services.console_capabilities import (
     ConsoleModelCapabilities,
     should_include_encrypted,
 )
-from grok2api.services.grok.services.console_replay_cache import (
-    is_display_only_replay_item,
-    restore_reasoning_item,
-)
 from grok2api.services.grok.utils.tool_call import normalize_function_tool
 from grok2api.services.reverse.console_constants import CONSOLE_ALLOWED_INCLUDE
 
 _ENCRYPTED_RE = re.compile(r"^[A-Za-z0-9+/=_-]{80,}$")
 
 # Server-only fields safe to drop when replaying output[] back to console.x.ai.
-_REPLAY_STRIP_KEYS = frozenset({"status"})
+_REPLAY_STRIP_KEYS = frozenset({"status", "id"})
 
 
 def _new_reasoning_id() -> str:
@@ -142,23 +138,18 @@ def _passthrough_replay_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _replay_encrypted_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Send back only the opaque compaction blob fields x.ai accepts on replay."""
-    item = restore_reasoning_item(item)
+    """Send back only fields required for opaque compaction blob replay."""
     enc = item.get("encrypted_content")
     if not isinstance(enc, str) or not enc:
         return _passthrough_replay_item(item)
     item_type = str(item.get("type") or "reasoning").strip().lower()
     if item_type not in {"reasoning", "compaction"}:
         item_type = "reasoning"
-    replay: Dict[str, Any] = {
+    return {
         "type": item_type,
         "encrypted_content": enc,
         "status": "completed",
     }
-    item_id = item.get("id")
-    if item_id:
-        replay["id"] = item_id
-    return replay
 
 
 def _normalize_reasoning_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -217,8 +208,6 @@ def _normalize_replay_message_item(item: Dict[str, Any]) -> Optional[Dict[str, A
                     "role": "assistant",
                     "content": parts,
                 }
-                if item.get("id"):
-                    msg["id"] = item.get("id")
                 if item.get("status"):
                     msg["status"] = item.get("status")
                 phase = item.get("phase")
@@ -253,9 +242,6 @@ class ConsoleInputBuilder:
                     items.append({"role": "user", "content": _text_content(item)})
                 continue
 
-            if is_display_only_replay_item(item):
-                continue
-
             item_type = item.get("type")
             role = item.get("role")
 
@@ -277,29 +263,20 @@ class ConsoleInputBuilder:
                 continue
 
             if item_type == "function_call":
-                if item.get("call_id"):
-                    items.append(_passthrough_replay_item(item))
-                else:
-                    items.append(_normalize_function_call_item(item))
+                items.append(_normalize_function_call_item(item))
                 continue
 
             if item_type in {"function_call_output", "tool_call_output", "tool_output"}:
-                if item.get("call_id") or item.get("tool_call_id"):
-                    items.append(_passthrough_replay_item(item))
-                else:
-                    items.append(
-                        {
-                            "type": "function_call_output",
-                            "call_id": item.get("id"),
-                            "output": item.get("output") or item.get("content") or "",
-                        }
-                    )
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": item.get("call_id") or item.get("tool_call_id") or item.get("id"),
+                        "output": item.get("output") or item.get("content") or "",
+                    }
+                )
                 continue
 
             if item_type == "message" or role in {"user", "assistant"}:
-                if item_type == "message" and item.get("id"):
-                    items.append(_passthrough_replay_item(item))
-                    continue
                 replay_item = _normalize_replay_message_item(item)
                 if replay_item:
                     items.append(replay_item)

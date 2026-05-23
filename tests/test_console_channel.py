@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
-from grok2api.core.exceptions import ValidationException
 from grok2api.services.grok.services.console_channel import _response_format_to_text_format
 from grok2api.services.grok.services.console_capabilities import (
     CAP_GROK_43,
@@ -16,10 +13,6 @@ from grok2api.services.grok.services.console_input import (
     is_encrypted_reasoning,
 )
 from grok2api.services.grok.services.console_output_adapters import ConsoleChatStreamAdapter
-from grok2api.services.grok.services.console_replay import (
-    is_incremental_responses_input,
-    reject_incremental_previous_response,
-)
 from grok2api.services.grok.services.console_stream_parser import (
     ConsoleEventType,
     ConsoleStreamParser,
@@ -155,64 +148,15 @@ def test_responses_stream_adapter_injects_reasoning_summary_into_completed_outpu
 
     adapter = ConsoleResponsesStreamAdapter("grok-4.3")
     adapter.ingest_raw_line(
-        'data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"delta":"Let me think"}'
+        'data: {"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"Let me think"}'
     )
     completed = adapter.ingest_raw_line(
-        'data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"abc1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"}]}}'
+        'data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"reasoning","id":"rs_1"}]}}'
     )
     assert completed is not None
     assert adapter.completed_response is not None
-    response = adapter.completed_response["response"]
-    reasoning = response["output"][0]
-    assert "summary" not in reasoning
-    assert reasoning["encrypted_content"].startswith("abc")
-    assert response["output"][1]["summary"][0]["text"] == "Let me think"
-    assert response["output"][1]["id"].startswith("rs_grok2api_")
-
-
-def test_responses_input_skips_display_only_reasoning_on_replay():
-    blob = "E" * 120
-    input_items = [
-        {"type": "reasoning", "id": "rs_abc", "encrypted_content": blob},
-        {
-            "type": "reasoning",
-            "id": "rs_grok2api_0",
-            "_grok2api_display_only": True,
-            "summary": [{"type": "summary_text", "text": "visible cot"}],
-        },
-        {
-            "type": "function_call",
-            "call_id": "call_1",
-            "name": "send_message",
-            "arguments": "{}",
-        },
-        {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
-    ]
-    _, items, history_encrypted = ConsoleInputBuilder.from_responses_input(input_items)
-    assert history_encrypted is True
-    assert len(items) == 3
-    assert items[0]["encrypted_content"] == blob
-    assert all(item.get("id") != "rs_grok2api_0" for item in items)
-
-
-def test_replay_cache_restores_upstream_blob():
-    from grok2api.services.grok.services.console_replay_cache import (
-        clear_reasoning_blobs,
-        remember_reasoning_blob,
-        restore_reasoning_item,
-    )
-
-    clear_reasoning_blobs()
-    upstream = {
-        "type": "reasoning",
-        "id": "rs_cache",
-        "encrypted_content": "Z" * 120,
-    }
-    remember_reasoning_blob(upstream)
-    corrupted = dict(upstream)
-    corrupted["encrypted_content"] = ("Z" * 119) + "Y"
-    restored = restore_reasoning_item(corrupted)
-    assert restored["encrypted_content"] == upstream["encrypted_content"]
+    reasoning = adapter.completed_response["response"]["output"][0]
+    assert reasoning["summary"][0]["text"] == "Let me think"
 
 
 def test_responses_input_replay_preserves_summary_only_reasoning():
@@ -405,11 +349,11 @@ def test_responses_input_replay_strips_injected_summary_from_encrypted_reasoning
     assert history_encrypted is True
     assert items[0] == {
         "type": "reasoning",
-        "id": "rs_abc",
         "encrypted_content": blob,
         "status": "completed",
     }
     assert "summary" not in items[0]
+    assert "id" not in items[0]
 
 
 def test_responses_input_replay_passthrough_reasoning_and_function_call():
@@ -428,11 +372,11 @@ def test_responses_input_replay_passthrough_reasoning_and_function_call():
     _, items, history_encrypted = ConsoleInputBuilder.from_responses_input(input_items)
     assert history_encrypted is True
     assert items[0]["type"] == "reasoning"
-    assert items[0]["id"] == "rs_abc"
     assert items[0]["encrypted_content"] == blob
     assert "summary" not in items[0]
+    assert "id" not in items[0]
     assert items[1]["call_id"] == "call_123"
-    assert items[1]["id"] == "call_bad"
+    assert "id" not in items[1]
     assert items[2]["type"] == "function_call_output"
 
 
@@ -451,8 +395,8 @@ def test_responses_input_replay_passthrough_compaction_item():
     assert history_encrypted is True
     assert items[0]["type"] == "compaction"
     assert items[0]["encrypted_content"] == blob
-    assert items[0]["id"] == "cmp_abc"
     assert "summary" not in items[0]
+    assert "id" not in items[0]
     assert items[0].get("status") == "completed"
 
 
@@ -471,37 +415,3 @@ def test_responses_input_replay_user_message_with_input_image():
     blocks = items[0]["content"]
     assert blocks[1]["type"] == "input_image"
     assert blocks[1]["image_url"] == "https://example.com/x.png"
-
-
-def test_incremental_previous_response_id_is_detected():
-    items = [{"type": "function_call_output", "call_id": "call_1", "output": "sunny"}]
-    assert is_incremental_responses_input(items) is True
-
-
-def test_reject_incremental_previous_response_raises_for_undefined_fallback():
-    items = [{"type": "function_call_output", "call_id": "call_9", "output": "done"}]
-    with pytest.raises(ValidationException) as exc:
-        reject_incremental_previous_response(
-            had_previous_response_id=True,
-            input_items=items,
-        )
-    assert exc.value.param == "input"
-    assert "call_9" in str(exc.value.message)
-
-
-def test_full_stateless_replay_not_rejected_with_previous_response_id():
-    blob = "C" * 120
-    items = [
-        {"type": "reasoning", "encrypted_content": blob, "summary": []},
-        {
-            "type": "function_call",
-            "call_id": "call_1",
-            "name": "get_weather",
-            "arguments": "{}",
-        },
-        {"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
-    ]
-    reject_incremental_previous_response(
-        had_previous_response_id=True,
-        input_items=items,
-    )
