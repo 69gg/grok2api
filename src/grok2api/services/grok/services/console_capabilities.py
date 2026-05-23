@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from grok2api.core.logger import logger
+from grok2api.services.grok.utils.tool_call import build_tool_prompt
 from grok2api.services.reverse.console_constants import (
     CONSOLE_SEARCH_TOOLS,
     CONSOLE_STRICT_PARAM_VALIDATION,
@@ -64,6 +65,7 @@ CAP_420_REASONING = ConsoleModelCapabilities(
 CAP_MULTI_AGENT = ConsoleModelCapabilities(
     supports_reasoning_output=True,
     supports_encrypted_reasoning=True,
+    supports_function_calling=False,
     default_reasoning_mode="encrypted",
     max_output_tokens=1_000_000,
 )
@@ -99,6 +101,68 @@ def merge_tools(
             if tool["type"] not in existing:
                 merged.append(dict(tool))
     return merged
+
+
+def partition_console_tools(
+    tools: Optional[List[Dict[str, Any]]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    search_tools: List[Dict[str, Any]] = []
+    function_tools: List[Dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = tool.get("type")
+        if tool_type in CONSOLE_SEARCH_TOOLS:
+            search_tools.append(tool)
+        elif tool_type == "function":
+            function_tools.append(tool)
+    return search_tools, function_tools
+
+
+def prepare_console_tooling(
+    *,
+    caps: ConsoleModelCapabilities,
+    client_tools: Optional[List[Dict[str, Any]]],
+    console_search: bool,
+    tool_choice: Any,
+    parallel_tool_calls: Optional[bool],
+    instructions: Optional[str],
+) -> tuple[Optional[List[Dict[str, Any]]], Optional[str], Optional[List[Dict[str, Any]]], Any]:
+    """Prepare upstream tools/instructions for console requests.
+
+    Native FC models forward client tools (and optional search) upstream.
+
+    Prompt FC models (e.g. multi-agent) always inject function tools into
+    ``instructions``; ``console_search`` only adds web/x search tools to the
+    upstream payload — function ``tool_choice`` is never forwarded upstream.
+    """
+    normalized = list(client_tools or [])
+
+    if caps.supports_function_calling:
+        merged = merge_tools(normalized, console_search=console_search) or None
+        return merged, instructions, None, tool_choice
+
+    upstream_search: List[Dict[str, Any]] = []
+    if console_search:
+        upstream_search = default_search_tools()
+    else:
+        for tool in normalized:
+            if isinstance(tool, dict) and tool.get("type") in CONSOLE_SEARCH_TOOLS:
+                upstream_search.append({"type": str(tool["type"])})
+
+    upstream_tools = upstream_search or None
+    prompt_tools: Optional[List[Dict[str, Any]]] = None
+    merged_instructions = instructions
+
+    if normalized and tool_choice != "none":
+        tool_prompt = build_tool_prompt(normalized, tool_choice, parallel_tool_calls)
+        if tool_prompt:
+            prompt_tools = normalized
+            merged_instructions = (
+                f"{tool_prompt}\n\n{instructions}" if instructions else tool_prompt
+            )
+
+    return upstream_tools, merged_instructions, prompt_tools, None
 
 
 def should_include_encrypted(
@@ -168,6 +232,15 @@ def filter_payload(
             result.pop(field, None)
             logger.debug(f"Dropped unsupported {field}")
 
+    tools = result.get("tools")
+    if isinstance(tools, list) and not caps.supports_function_calling:
+        search_tools, _ = partition_console_tools(tools)
+        if search_tools:
+            result["tools"] = search_tools
+        else:
+            result.pop("tools", None)
+            result.pop("tool_choice", None)
+
     return result
 
 
@@ -178,5 +251,7 @@ __all__ = [
     "filter_payload",
     "get_console_capabilities",
     "merge_tools",
+    "partition_console_tools",
+    "prepare_console_tooling",
     "should_include_encrypted",
 ]

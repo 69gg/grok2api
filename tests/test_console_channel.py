@@ -5,7 +5,10 @@ from __future__ import annotations
 from grok2api.services.grok.services.console_channel import _response_format_to_text_format
 from grok2api.services.grok.services.console_capabilities import (
     CAP_GROK_43,
+    CAP_MULTI_AGENT,
+    filter_payload,
     merge_tools,
+    prepare_console_tooling,
     should_include_encrypted,
 )
 from grok2api.services.grok.services.console_input import (
@@ -15,6 +18,7 @@ from grok2api.services.grok.services.console_input import (
 )
 from grok2api.services.grok.services.console_output_adapters import ConsoleChatStreamAdapter
 from grok2api.services.grok.services.console_stream_parser import (
+    ConsoleEvent,
     ConsoleEventType,
     ConsoleStreamParser,
 )
@@ -445,3 +449,208 @@ def test_is_compaction_blob_decode_error():
     assert _is_compaction_blob_decode_error(400, body) is True
     assert _is_compaction_blob_decode_error(401, body) is False
     assert _is_compaction_blob_decode_error(400, '{"error":"other"}') is False
+
+
+def test_multi_agent_prepare_console_tooling_prompt_mode():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+    ]
+    upstream_tools, instructions, prompt_tools, upstream_tool_choice = prepare_console_tooling(
+        caps=CAP_MULTI_AGENT,
+        client_tools=tools,
+        console_search=False,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+        instructions="You are helpful.",
+    )
+    assert upstream_tools is None
+    assert upstream_tool_choice is None
+    assert prompt_tools == tools
+    assert instructions is not None
+    assert "Tool Calling Contract" in instructions
+    assert "get_weather" in instructions
+    assert "You are helpful." in instructions
+
+
+def test_multi_agent_search_uses_prompt_tools_and_search_params():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    upstream_tools, instructions, prompt_tools, upstream_tool_choice = prepare_console_tooling(
+        caps=CAP_MULTI_AGENT,
+        client_tools=tools,
+        console_search=True,
+        tool_choice="required",
+        parallel_tool_calls=True,
+        instructions=None,
+    )
+    assert prompt_tools == tools
+    assert upstream_tool_choice is None
+    assert upstream_tools is not None
+    assert {t["type"] for t in upstream_tools} == {"web_search", "x_search"}
+    assert "Tool Calling Contract" in (instructions or "")
+
+
+def test_multi_agent_search_without_client_tools():
+    upstream_tools, instructions, prompt_tools, upstream_tool_choice = prepare_console_tooling(
+        caps=CAP_MULTI_AGENT,
+        client_tools=None,
+        console_search=True,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+        instructions="base",
+    )
+    assert upstream_tools is not None
+    assert {t["type"] for t in upstream_tools} == {"web_search", "x_search"}
+    assert prompt_tools is None
+    assert upstream_tool_choice is None
+    assert instructions == "base"
+
+
+def test_multi_agent_prepare_console_tooling_no_tools():
+    upstream_tools, instructions, prompt_tools, upstream_tool_choice = prepare_console_tooling(
+        caps=CAP_MULTI_AGENT,
+        client_tools=None,
+        console_search=False,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+        instructions="base",
+    )
+    assert upstream_tools is None
+    assert prompt_tools is None
+    assert upstream_tool_choice is None
+    assert instructions == "base"
+
+
+def test_filter_payload_strips_function_tools_for_multi_agent():
+    payload = {
+        "model": "grok-4.20-multi-agent-0309",
+        "tools": [
+            {"type": "function", "name": "x", "parameters": {}},
+            {"type": "web_search"},
+        ],
+        "tool_choice": "auto",
+    }
+    filtered = filter_payload(CAP_MULTI_AGENT, payload)
+    assert filtered["tools"] == [{"type": "web_search"}]
+    assert filtered["tool_choice"] == "auto"
+
+
+def test_filter_payload_drops_tools_when_only_function_tools():
+    payload = {
+        "model": "grok-4.20-multi-agent-0309",
+        "tools": [{"type": "function", "name": "x", "parameters": {}}],
+        "tool_choice": "auto",
+    }
+    filtered = filter_payload(CAP_MULTI_AGENT, payload)
+    assert "tools" not in filtered
+    assert "tool_choice" not in filtered
+
+
+def test_grok_43_keeps_native_function_tools():
+    tools = [{"type": "function", "name": "x", "parameters": {}}]
+    upstream_tools, instructions, prompt_tools, upstream_tool_choice = prepare_console_tooling(
+        caps=CAP_GROK_43,
+        client_tools=tools,
+        console_search=False,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+        instructions=None,
+    )
+    assert upstream_tools == tools
+    assert prompt_tools is None
+    assert instructions is None
+    assert upstream_tool_choice == "auto"
+
+
+def test_multi_agent_search_does_not_forward_function_tool_choice():
+    from grok2api.services.grok.services.console_input import ConsoleInputBuilder
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    upstream_tools, instructions, prompt_tools, upstream_tool_choice = prepare_console_tooling(
+        caps=CAP_MULTI_AGENT,
+        client_tools=tools,
+        console_search=True,
+        tool_choice="required",
+        parallel_tool_calls=True,
+        instructions=None,
+    )
+    payload = ConsoleInputBuilder.build_payload(
+        console_model="grok-4.20-multi-agent-0309",
+        caps=CAP_MULTI_AGENT,
+        input_items=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        instructions=instructions,
+        tools=upstream_tools,
+        tool_choice=upstream_tool_choice if upstream_tools else None,
+        stream=True,
+    )
+    assert prompt_tools == tools
+    assert payload.get("tools") == [{"type": "web_search"}, {"type": "x_search"}]
+    assert "tool_choice" not in payload
+
+
+def test_chat_adapter_prompt_tool_call_stream():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+    ]
+    adapter = ConsoleChatStreamAdapter("grok-4.20-multi-agent-0309", prompt_tools=tools)
+    event = ConsoleEvent(
+        ConsoleEventType.TEXT_DELTA,
+        {"delta": '<call>\nget_weather\n{"city":"Paris"}\n</call>'},
+    )
+    adapter.ingest(event)
+    assert adapter.tool_calls
+    response = adapter.build_non_stream_response()
+    message = response["choices"][0]["message"]
+    assert message.get("tool_calls")
+    assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert response["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_chat_adapter_prompt_tool_call_non_stream():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "ping",
+                "description": "Ping",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    adapter = ConsoleChatStreamAdapter("grok-4.20-multi-agent-0309", prompt_tools=tools)
+    adapter.content_parts.append('<call>\nping\n{}\n</call>')
+    response = adapter.build_non_stream_response()
+    message = response["choices"][0]["message"]
+    assert message["tool_calls"][0]["function"]["name"] == "ping"
+    assert message.get("content") in (None, "")

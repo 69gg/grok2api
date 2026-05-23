@@ -42,12 +42,25 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 | `grok-build-0.1` / `grok-build-0.1-search` | build 模型 |
 | `grok-4.20-0309-non-reasoning` / `...-search` | 支持 frequency/presence penalty |
 | `grok-4.20-0309-reasoning` / `...-search` | 内置 reasoning + encrypted CoT |
-| `grok-4.20-multi-agent-0309` / `...-search` | multi-agent |
+| `grok-4.20-multi-agent-0309` / `...-search` | multi-agent；**不支持原生 function calling**，见下方 Tool Call 说明 |
 
 ### 与 grok.com 通道的区别
 
-- Console 模型走 **xAI Responses API 原生 tool call**，不使用 grok prompt 的 `<call>` 协议。
+- 除 `grok-4.20-multi-agent-0309` 外，Console 模型走 **xAI Responses API 原生 tool call**。
+- `grok-4.20-multi-agent-0309`（含 `-search` 变体）走 **prompt tool call**：客户端 function tools 写入 `instructions`（与 grok.com 相同的 `<call>` 协议），响应由网关解析为 OpenAI `tool_calls`；无 tools 时不注入 tool prompt。
+- `-search` 变体在 prompt tool call 之外，额外向上游注入 `web_search` / `x_search` 开启内置搜索；**不会**因此改用原生 function calling。
 - Token 用量来自上游 `response.completed.usage`，不是本地估算。
+
+### Tool Call（Console）
+
+| 模型 | function tools | 搜索 |
+|---|---|---|
+| `grok-4.3` 等（非 multi-agent） | 原生 Responses API `tools` + `tool_choice` | 仅 `-search` 变体自动注入 |
+| `grok-4.20-multi-agent-0309` | prompt → `instructions`（`<call>` 协议） | 无 |
+| `grok-4.20-multi-agent-0309-search` | 同上 prompt tool call | 额外注入 `web_search` / `x_search` |
+
+- multi-agent 多轮 tool loop：历史中的 `tool` / `tool_calls` 消息会转换为 prompt 可读文本后再 replay。
+- multi-agent prompt 模式下，客户端 function 的 `tool_choice` **不会**转发到上游（避免与仅含 search tools 的 payload 冲突）。
 
 ### 客户端多轮对话约定（对齐 OpenAI Responses API）
 

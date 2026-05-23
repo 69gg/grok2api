@@ -14,6 +14,7 @@ from grok2api.services.grok.services.console_stream_parser import (
     ConsoleEventType,
 )
 from grok2api.services.grok.utils.response import make_response_id
+from grok2api.services.grok.utils.tool_call import ToolCallStreamParser, parse_tool_calls
 from grok2api.services.grok.utils.usage import from_upstream_responses_usage, to_responses_usage
 
 
@@ -41,7 +42,13 @@ def _sse_chat_chunk(
 
 
 class ConsoleChatStreamAdapter:
-    def __init__(self, model: str) -> None:
+    def __init__(
+        self,
+        model: str,
+        *,
+        prompt_tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
+    ) -> None:
         self.model = model
         self.response_id = make_response_id()
         self.started = False
@@ -51,6 +58,52 @@ class ConsoleChatStreamAdapter:
         self._tool_index = 0
         self.finish_reason: Optional[str] = None
         self.usage: Optional[Dict[str, Any]] = None
+        self._prompt_tools = prompt_tools
+        self._tool_stream_enabled = bool(prompt_tools) and tool_choice != "none"
+        self._prompt_parser = (
+            ToolCallStreamParser(prompt_tools) if self._tool_stream_enabled else None
+        )
+        self._prompt_tool_calls_seen = False
+        self._prompt_content_emitted = False
+
+    def _handle_prompt_tool_stream(self, chunk: str) -> List[tuple[str, Any]]:
+        if not chunk:
+            return []
+        if not self._tool_stream_enabled or not self._prompt_parser:
+            return [("text", chunk)]
+
+        events: List[tuple[str, Any]] = []
+        allow_calls = not self._prompt_content_emitted and not self._prompt_tool_calls_seen
+        for kind, payload in self._prompt_parser.feed(chunk, allow_calls=allow_calls):
+            if kind == "tool":
+                events.append(("tool", payload))
+                self._prompt_tool_calls_seen = True
+            else:
+                if self._prompt_tool_calls_seen and isinstance(payload, str) and payload.strip():
+                    continue
+                if isinstance(payload, str) and payload.strip():
+                    self._prompt_content_emitted = True
+                events.append((kind, payload))
+        return events
+
+    def _emit_prompt_tool_call(self, tool_call: Dict[str, Any]) -> List[str]:
+        index = self._tool_index
+        self._tool_index += 1
+        indexed = {
+            "index": index,
+            "id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": dict(tool_call.get("function") or {}),
+        }
+        self.tool_calls[index] = indexed
+        self.finish_reason = "tool_calls"
+        return [
+            _sse_chat_chunk(
+                self.response_id,
+                self.model,
+                delta={"tool_calls": [indexed]},
+            )
+        ]
 
     def _ensure_role(self) -> List[str]:
         if self.started:
@@ -91,14 +144,28 @@ class ConsoleChatStreamAdapter:
                 )
         elif event.type == ConsoleEventType.TEXT_DELTA:
             delta = event.data.get("delta") or ""
-            self.content_parts.append(delta)
-            out.append(
-                _sse_chat_chunk(
-                    self.response_id,
-                    self.model,
-                    delta={"content": delta},
+            if self._prompt_parser:
+                for kind, payload in self._handle_prompt_tool_stream(delta):
+                    if kind == "tool":
+                        out.extend(self._emit_prompt_tool_call(payload))
+                    elif kind == "text" and payload:
+                        self.content_parts.append(payload)
+                        out.append(
+                            _sse_chat_chunk(
+                                self.response_id,
+                                self.model,
+                                delta={"content": payload},
+                            )
+                        )
+            else:
+                self.content_parts.append(delta)
+                out.append(
+                    _sse_chat_chunk(
+                        self.response_id,
+                        self.model,
+                        delta={"content": delta},
+                    )
                 )
-            )
         elif event.type == ConsoleEventType.TOOL_CALL_START:
             index = int(event.data.get("index") or 0)
             self.tool_calls[index] = {
@@ -189,6 +256,21 @@ class ConsoleChatStreamAdapter:
 
     def finalize(self) -> List[str]:
         out: List[str] = []
+        if self._prompt_parser:
+            for kind, payload in self._prompt_parser.flush():
+                if kind == "tool":
+                    out.extend(self._emit_prompt_tool_call(payload))
+                elif kind == "text" and payload:
+                    self.content_parts.append(payload)
+                    out.append(
+                        _sse_chat_chunk(
+                            self.response_id,
+                            self.model,
+                            delta={"content": payload},
+                        )
+                    )
+        if self.tool_calls and self.finish_reason != "tool_calls":
+            self.finish_reason = "tool_calls"
         out.append(
             _sse_chat_chunk(
                 self.response_id,
@@ -201,6 +283,20 @@ class ConsoleChatStreamAdapter:
         return out
 
     def build_non_stream_response(self) -> Dict[str, Any]:
+        if self._prompt_tools and not self.tool_calls:
+            content = "".join(self.content_parts) or None
+            if content:
+                text, parsed = parse_tool_calls(content, self._prompt_tools)
+                if parsed:
+                    self.content_parts = [text] if text else []
+                    for i, tool_call in enumerate(parsed):
+                        self.tool_calls[i] = {
+                            "index": i,
+                            "id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                            "type": "function",
+                            "function": dict(tool_call.get("function") or {}),
+                        }
+                    self.finish_reason = "tool_calls"
         message: Dict[str, Any] = {
             "role": "assistant",
             "content": "".join(self.content_parts) or None,
