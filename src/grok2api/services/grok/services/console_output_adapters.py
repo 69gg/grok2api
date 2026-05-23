@@ -47,6 +47,7 @@ class ConsoleChatStreamAdapter:
         self.reasoning_parts: List[str] = []
         self.content_parts: List[str] = []
         self.tool_calls: Dict[int, Dict[str, Any]] = {}
+        self._tool_index = 0
         self.finish_reason: Optional[str] = None
         self.usage: Optional[Dict[str, Any]] = None
 

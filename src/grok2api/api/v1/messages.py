@@ -899,6 +899,12 @@ async def create_message(request: Request, payload: AnthropicMessagesRequest):
 
         if ModelService.is_console(payload.model):
             raw_messages = [msg.model_dump() for msg in payload.messages]
+            thinking_cfg: Optional[Dict[str, Any]] = None
+            if payload.thinking is not None:
+                if isinstance(payload.thinking, dict):
+                    thinking_cfg = payload.thinking
+                elif hasattr(payload.thinking, "model_dump"):
+                    thinking_cfg = payload.thinking.model_dump()
             result = await ConsoleChannelService.messages(
                 model=payload.model,
                 messages=raw_messages,
@@ -909,7 +915,7 @@ async def create_message(request: Request, payload: AnthropicMessagesRequest):
                 top_p=payload.top_p,
                 tools=tools or None,
                 tool_choice=tool_choice,
-                thinking=payload.thinking.model_dump() if payload.thinking else None,
+                thinking=thinking_cfg,
             )
             if payload.stream:
                 return StreamingResponse(

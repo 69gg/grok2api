@@ -48,28 +48,42 @@ def _resolve_model(model_id: str):
 
 
 def _response_format_to_text_format(response_format: Any) -> Optional[Dict[str, Any]]:
+    """Map OpenAI response_format to console Responses API text.format."""
     if response_format is None:
         return None
     if isinstance(response_format, str):
         if response_format == "json_object":
             return {"type": "json_object"}
         return {"type": "text"}
-    if isinstance(response_format, dict):
-        rf_type = response_format.get("type")
-        if rf_type == "json_schema":
-            schema = response_format.get("json_schema") or response_format.get("schema") or {}
-            if isinstance(schema, dict) and "schema" in schema:
-                schema = schema["schema"]
+    if not isinstance(response_format, dict):
+        return {"type": "text"}
+
+    rf_type = response_format.get("type")
+    if rf_type == "json_schema":
+        # Responses API uses flat fields under text.format (not Chat's nested json_schema).
+        if isinstance(response_format.get("schema"), dict):
             return {
                 "type": "json_schema",
-                "json_schema": {
-                    "name": response_format.get("name") or "response",
-                    "schema": schema,
-                    "strict": response_format.get("strict", True),
-                },
+                "name": response_format.get("name") or "response",
+                "schema": response_format["schema"],
+                "strict": bool(response_format.get("strict", True)),
             }
-        if rf_type == "json_object":
-            return {"type": "json_object"}
+        wrapper = response_format.get("json_schema") or {}
+        if isinstance(wrapper, dict):
+            return {
+                "type": "json_schema",
+                "name": wrapper.get("name") or response_format.get("name") or "response",
+                "schema": wrapper.get("schema") or {},
+                "strict": bool(wrapper.get("strict", response_format.get("strict", True))),
+            }
+        return {
+            "type": "json_schema",
+            "name": response_format.get("name") or "response",
+            "schema": {},
+            "strict": bool(response_format.get("strict", True)),
+        }
+    if rf_type == "json_object":
+        return {"type": "json_object"}
     return {"type": "text"}
 
 
@@ -330,9 +344,11 @@ class ConsoleChannelService:
 
         thinking_enabled = False
         reasoning_effort = None
-        if isinstance(thinking, dict) and thinking.get("enabled"):
-            thinking_enabled = True
-            reasoning_effort = thinking.get("effort") or "low"
+        if isinstance(thinking, dict):
+            thinking_type = str(thinking.get("type") or "").strip().lower()
+            if thinking.get("enabled") or thinking_type in {"enabled", "on", "true"}:
+                thinking_enabled = True
+                reasoning_effort = thinking.get("effort") or "low"
 
         async def build(_token: str) -> Dict[str, Any]:
             merged_tools = merge_tools(

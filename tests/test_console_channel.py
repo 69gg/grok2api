@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from grok2api.services.grok.services.console_channel import _response_format_to_text_format
 from grok2api.services.grok.services.console_capabilities import (
     CAP_GROK_43,
     merge_tools,
@@ -119,6 +120,47 @@ def test_stream_parser_accepts_non_sse_json_response():
     events = parser.ingest_line(body)
     assert events[-1].type == ConsoleEventType.COMPLETED
     assert events[-1].data["response"]["output"][0]["content"][0]["text"] == "OK"
+
+
+def test_response_format_to_text_format_uses_responses_api_flat_json_schema():
+    chat_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "answer_obj",
+            "schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
+    }
+    text_format = _response_format_to_text_format(chat_format)
+    assert text_format == {
+        "type": "json_schema",
+        "name": "answer_obj",
+        "schema": chat_format["json_schema"]["schema"],
+        "strict": True,
+    }
+    assert "json_schema" not in text_format
+
+
+def test_chat_adapter_completed_function_call():
+    adapter = ConsoleChatStreamAdapter("grok-4.3")
+    parser = ConsoleStreamParser()
+    body = (
+        '{"object":"response","output":[{"type":"function_call","call_id":"call_abc",'
+        '"name":"get_weather","arguments":"{\\"city\\":\\"Tokyo\\"}"}],'
+        '"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}'
+    )
+    for event in parser.ingest_line(body):
+        adapter.ingest(event)
+    result = adapter.build_non_stream_response()
+    message = result["choices"][0]["message"]
+    assert result["choices"][0]["finish_reason"] == "tool_calls"
+    assert len(message["tool_calls"]) == 1
+    assert message["tool_calls"][0]["function"]["name"] == "get_weather"
 
 
 def test_chat_adapter_extracts_non_stream_response_text():
