@@ -80,6 +80,17 @@ def test_build_stt_fields_order_and_flags():
     assert names == ["language", "format", "diarize", "keyterm", "keyterm"]
 
 
+def test_build_stt_fields_defaults_language_when_formatted():
+    fields = build_stt_fields(formatted=True)
+    assert fields[0] == ("language", "en")
+    assert ("format", "true") in fields
+
+
+def test_build_stt_fields_skips_language_when_unformatted():
+    fields = build_stt_fields(formatted=False)
+    assert not any(name == "language" for name, _ in fields)
+
+
 def test_words_to_srt_and_vtt():
     words = [
         {"text": "Hello", "start": 0.0, "end": 0.5},

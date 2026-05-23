@@ -115,8 +115,11 @@ def build_stt_fields(
     keyterms: Optional[List[str]] = None,
 ) -> List[Tuple[str, str]]:
     fields: List[Tuple[str, str]] = []
-    if language:
-        fields.append(("language", language))
+    lang = (language or "").strip()
+    if formatted and not lang:
+        lang = "en"
+    if lang:
+        fields.append(("language", lang))
     if formatted:
         fields.append(("format", "true"))
     if diarize is not None:
