@@ -32,6 +32,55 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 - `ssoSuper`：保持旧项目模型能力。
 - 图片生成/编辑内部使用 `grok-4.3`。
 
+## 图片输入（Vision）
+
+聊天场景下的「看图对话」与「文生图/图生图」是不同能力，请勿混用 model_id。
+
+### 能力概览
+
+| 通道 / 端点 | 图片输入 | 说明 |
+|---|---|---|
+| Console 模型 + `/v1/chat/completions` | ✅ | OpenAI `image_url` → 上游 `input_image`（URL 直传，不上传） |
+| Console 模型 + `/v1/responses` | ✅ | `input_image` 或 message 内嵌图片 block；多轮 replay 支持 |
+| Console 模型 + `/v1/messages` | ❌ | Anthropic 路径暂不支持 user `image` block |
+| grok.com 模型 + `/v1/chat/completions` | ✅ | 图片先上传 Grok assets，再走 `fileAttachments` |
+| grok.com 模型 + `/v1/responses` | ✅ | 内部转换为 Chat 消息后走同一上传链路 |
+| `grok-imagine-*` | — | 文生图 / 图生图专用，不是通用 vision chat |
+| `/v1/videos/*` | — | 可将图片作为视频 reference，不是聊天 vision |
+
+### 请求格式
+
+Chat Completions 用户消息示例：
+
+```json
+{
+  "role": "user",
+  "content": [
+    {"type": "text", "text": "描述这张图"},
+    {"type": "image_url", "image_url": {"url": "https://example.com/a.png", "detail": "high"}}
+  ]
+}
+```
+
+Responses API 可直接传 `input_image`：
+
+```json
+{
+  "role": "user",
+  "content": [
+    {"type": "input_text", "text": "描述这张图"},
+    {"type": "input_image", "image_url": "https://example.com/a.png"}
+  ]
+}
+```
+
+### 输入限制
+
+- `image_url.url` 支持 **HTTPS/HTTP URL** 或 **`data:<mime>;base64,...` data URI**。
+- **裸 base64 字符串会被拒绝**，必须带 `data:` 前缀。
+- Console 通道不做本地上传，URL 原样转发 upstream；公网 HTTPS 最稳妥。
+- grok.com 通道（如 `grok-4.3-fast`）会下载 URL / 解析 data URI 后上传，需 SSO 号具备 upload 能力。
+
 ## Console Chat Playground 模型
 
 通过 `console.x.ai` SSO 逆向的 Playground 免费高级模型。在 `GET /v1/models` 中 `owned_by` 为 `xai-console`。
@@ -61,6 +110,14 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 
 - multi-agent 多轮 tool loop：历史中的 `tool` / `tool_calls` 消息会转换为 prompt 可读文本后再 replay。
 - multi-agent prompt 模式下，客户端 function 的 `tool_choice` **不会**转发到上游（避免与仅含 search tools 的 payload 冲突）。
+
+### 图片输入（Console）
+
+Playground 五个模型均支持 Image input。网关行为见上文 **图片输入（Vision）** 章节；Console 侧要点：
+
+- **`/v1/chat/completions`**：`image_url` 自动映射为 Responses `input_image`（含 `detail`）。
+- **`/v1/responses`**：原生 `input_image` item 直接 replay。
+- **`/v1/messages`**：暂不支持；需改用 Chat Completions 或 Responses。
 
 ### 客户端多轮对话约定（对齐 OpenAI Responses API）
 
