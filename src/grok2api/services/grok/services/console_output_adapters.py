@@ -226,6 +226,26 @@ class ConsoleChatStreamAdapter:
         }
 
 
+def _extract_native_reasoning_text(item: Dict[str, Any]) -> str:
+    chunks: List[str] = []
+    for field in ("summary", "content"):
+        parts = item.get(field)
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                if isinstance(part, str) and part.strip():
+                    chunks.append(part.strip())
+                continue
+            part_type = str(part.get("type") or "").strip().lower()
+            text = str(part.get("text") or part.get("content") or "").strip()
+            if not text:
+                continue
+            if part_type in {"", "summary_text", "reasoning_text", "text", "summary"}:
+                chunks.append(text)
+    return "\n".join(chunks)
+
+
 def _reasoning_item_has_summary_text(item: Dict[str, Any]) -> bool:
     summary = item.get("summary")
     if not isinstance(summary, list):
@@ -314,9 +334,12 @@ class ConsoleResponsesStreamAdapter:
                 patched.append(item)
                 continue
             summary_text = self._summary_text_for_reasoning_item(item, index)
-            patched.append(
-                _inject_reasoning_summary_text(item, summary_text) if summary_text else item
-            )
+            if not summary_text:
+                summary_text = _extract_native_reasoning_text(item)
+            if summary_text and not _reasoning_item_has_summary_text(item):
+                patched.append(_inject_reasoning_summary_text(item, summary_text))
+            else:
+                patched.append(item)
         return patched
 
     def _patch_response_reasoning(self, response: Dict[str, Any]) -> Dict[str, Any]:

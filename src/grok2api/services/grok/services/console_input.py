@@ -137,6 +137,24 @@ def _passthrough_replay_item(item: Dict[str, Any]) -> Dict[str, Any]:
     return cloned
 
 
+def _replay_encrypted_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Send back only the opaque compaction blob fields x.ai accepts on replay."""
+    enc = item.get("encrypted_content")
+    if not enc:
+        return _passthrough_replay_item(item)
+    item_type = str(item.get("type") or "reasoning").strip().lower()
+    if item_type not in {"reasoning", "compaction"}:
+        item_type = "reasoning"
+    replay: Dict[str, Any] = {
+        "type": item_type,
+        "encrypted_content": enc,
+    }
+    item_id = item.get("id")
+    if item_id:
+        replay["id"] = item_id
+    return replay
+
+
 def _normalize_reasoning_item(item: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {
         "type": "reasoning",
@@ -244,7 +262,7 @@ class ConsoleInputBuilder:
             ):
                 if item.get("encrypted_content"):
                     history_encrypted = True
-                    items.append(_passthrough_replay_item(item))
+                    items.append(_replay_encrypted_item(item))
                 else:
                     items.append(_normalize_reasoning_item(item))
                 continue

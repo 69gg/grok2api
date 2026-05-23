@@ -336,6 +336,30 @@ def test_chat_messages_convert_image_url_to_input_image():
     assert blocks[1]["detail"] == "high"
 
 
+def test_responses_input_replay_strips_injected_summary_from_encrypted_reasoning():
+    blob = "B" * 120
+    input_items = [
+        {
+            "type": "reasoning",
+            "id": "rs_abc",
+            "encrypted_content": blob,
+            "summary": [{"type": "summary_text", "text": "visible cot"}],
+        },
+        {
+            "type": "function_call",
+            "id": "call_bad",
+            "call_id": "call_123",
+            "name": "search",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call_123", "output": "ok"},
+    ]
+    _, items, history_encrypted = ConsoleInputBuilder.from_responses_input(input_items)
+    assert history_encrypted is True
+    assert items[0] == {"type": "reasoning", "id": "rs_abc", "encrypted_content": blob}
+    assert "summary" not in items[0]
+
+
 def test_responses_input_replay_passthrough_reasoning_and_function_call():
     blob = "B" * 120
     input_items = [
@@ -354,7 +378,7 @@ def test_responses_input_replay_passthrough_reasoning_and_function_call():
     assert items[0]["type"] == "reasoning"
     assert items[0]["id"] == "rs_abc"
     assert items[0]["encrypted_content"] == blob
-    assert items[0].get("status") is None
+    assert "summary" not in items[0]
     assert items[1]["call_id"] == "call_123"
     assert items[1]["id"] == "call_bad"
     assert items[2]["type"] == "function_call_output"
@@ -375,6 +399,8 @@ def test_responses_input_replay_passthrough_compaction_item():
     assert history_encrypted is True
     assert items[0]["type"] == "compaction"
     assert items[0]["encrypted_content"] == blob
+    assert items[0]["id"] == "cmp_abc"
+    assert "summary" not in items[0]
     assert items[0].get("status") is None
 
 
