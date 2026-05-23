@@ -34,6 +34,7 @@ class Cost(str, Enum):
 class Channel(str, Enum):
     GROK = "grok"
     CONSOLE = "console"
+    CONSOLE_VOICE = "console_voice"
 
 
 class ModelInfo(BaseModel):
@@ -60,6 +61,8 @@ class ModelInfo(BaseModel):
     def owned_by(self) -> str:
         if self.channel == Channel.CONSOLE:
             return "xai-console"
+        if self.channel == Channel.CONSOLE_VOICE:
+            return "xai-console-voice"
         return "grok2api@chenyme"
 
 
@@ -117,6 +120,42 @@ _CONSOLE_MODELS = [
 CONSOLE_MODEL_IDS = {m.model_id for m in _CONSOLE_MODELS}
 
 
+def _console_voice_model(
+    model_id: str,
+    *,
+    display_name: Optional[str] = None,
+    description: str = "",
+) -> ModelInfo:
+    return ModelInfo(
+        model_id=model_id,
+        grok_model=model_id,
+        model_mode="CONSOLE_VOICE",
+        tier=Tier.BASIC,
+        cost=Cost.LOW,
+        display_name=display_name or model_id.upper(),
+        description=description,
+        channel=Channel.CONSOLE_VOICE,
+    )
+
+
+_CONSOLE_VOICE_MODELS = [
+    _console_voice_model(
+        "grok-tts-1",
+        display_name="Grok TTS",
+        description="Console Voice Playground text-to-speech",
+    ),
+    _console_voice_model(
+        "grok-stt-1",
+        display_name="Grok STT",
+        description="Console Voice Playground speech-to-text",
+    ),
+]
+
+CONSOLE_VOICE_MODEL_IDS = {m.model_id for m in _CONSOLE_VOICE_MODELS}
+CONSOLE_VOICE_TTS_MODEL_IDS = {"grok-tts-1"}
+CONSOLE_VOICE_STT_MODEL_IDS = {"grok-stt-1"}
+
+
 class ModelService:
     """模型管理服务"""
 
@@ -125,6 +164,7 @@ class ModelService:
         "grok-imagine-1.0",
         "grok-imagine-1.0-edit",
         *CONSOLE_MODEL_IDS,
+        *CONSOLE_VOICE_MODEL_IDS,
     }
 
     MODELS = [
@@ -321,6 +361,7 @@ class ModelService:
             is_video=True,
         ),
         *_CONSOLE_MODELS,
+        *_CONSOLE_VOICE_MODELS,
     ]
 
     _map = {m.model_id: m for m in MODELS}
@@ -346,7 +387,12 @@ class ModelService:
     @classmethod
     def is_console(cls, model_id: str) -> bool:
         model = cls.get(model_id)
-        return bool(model and model.channel == Channel.CONSOLE)
+        return bool(model and model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE})
+
+    @classmethod
+    def is_console_voice(cls, model_id: str) -> bool:
+        model = cls.get(model_id)
+        return bool(model and model.channel == Channel.CONSOLE_VOICE)
 
     @classmethod
     def valid(cls, model_id: str) -> bool:
@@ -365,7 +411,7 @@ class ModelService:
     def pool_for_model(cls, model_id: str) -> str:
         """根据模型选择 Token 池"""
         model = cls.get(model_id)
-        if model and model.channel == Channel.CONSOLE:
+        if model and model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE}:
             return "ssoBasic"
         if model and model.model_id not in cls.BASIC_MODEL_IDS:
             return "ssoSuper"
@@ -377,11 +423,22 @@ class ModelService:
         model = cls.get(model_id)
         if not model:
             return ["ssoSuper"]
-        if model.channel == Channel.CONSOLE or model.model_id in cls.BASIC_MODEL_IDS:
+        if (
+            model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE}
+            or model.model_id in cls.BASIC_MODEL_IDS
+        ):
             return ["ssoBasic", "ssoSuper"]
         if model.tier == Tier.SUPER or model.model_id not in cls.BASIC_MODEL_IDS:
             return ["ssoSuper"]
         return ["ssoSuper"]
 
 
-__all__ = ["Channel", "CONSOLE_MODEL_IDS", "ModelInfo", "ModelService"]
+__all__ = [
+    "Channel",
+    "CONSOLE_MODEL_IDS",
+    "CONSOLE_VOICE_MODEL_IDS",
+    "CONSOLE_VOICE_STT_MODEL_IDS",
+    "CONSOLE_VOICE_TTS_MODEL_IDS",
+    "ModelInfo",
+    "ModelService",
+]

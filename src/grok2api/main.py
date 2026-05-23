@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from grok2api.api.v1.admin import router as admin_router
+from grok2api.api.v1.audio import router as audio_router
 from grok2api.api.v1.chat import router as chat_router
 from grok2api.api.v1.files import router as files_router
 from grok2api.api.v1.function import router as function_router
@@ -106,6 +107,7 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     app.include_router(chat_router, prefix="/v1", dependencies=[Depends(verify_api_key)])
+    app.include_router(audio_router, prefix="/v1", dependencies=[Depends(verify_api_key)])
     app.include_router(image_router, prefix="/v1", dependencies=[Depends(verify_api_key)])
     app.include_router(models_router, prefix="/v1", dependencies=[Depends(verify_api_key)])
     app.include_router(responses_router, prefix="/v1", dependencies=[Depends(verify_api_key)])

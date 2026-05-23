@@ -421,9 +421,64 @@ def build_console_headers(
     return headers
 
 
+def build_console_voice_headers(
+    cookie_token: str,
+    *,
+    mode: str = "json",
+    cluster: Optional[str] = None,
+) -> Dict[str, str]:
+    """Build headers for console.x.ai Voice REST APIs (TTS/STT).
+
+    mode:
+      - json: POST /v1/tts with JSON body
+      - multipart: POST /v1/stt (no Content-Type; client sets boundary)
+      - binary: GET or binary Accept for audio responses
+    """
+    user_agent = _sanitize_header_value(
+        get_config("proxy.user_agent"), field_name="proxy.user_agent"
+    )
+    base_url = CONSOLE_BASE_URL.rstrip("/")
+    referer = f"{base_url}/"
+    cluster_url = cluster or CONSOLE_DEFAULT_CLUSTER
+
+    accept = "*/*"
+    if mode == "json":
+        accept = "application/json, */*"
+    elif mode == "binary":
+        accept = "*/*"
+
+    headers = {
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept": accept,
+        "Authorization": "Bearer anonymous",
+        "Origin": base_url,
+        "Referer": _sanitize_header_value(referer, field_name="referer"),
+        "User-Agent": user_agent,
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Dest": "empty",
+        "x-cluster": _sanitize_header_value(cluster_url, field_name="x-cluster"),
+        "x-statsig-id": StatsigGenerator.gen_id(),
+        "x-xai-request-id": str(uuid.uuid4()),
+        "Cookie": build_console_sso_cookie(cookie_token),
+    }
+
+    resolved_browser = resolve_proxy_browser(get_config("proxy.browser"), user_agent)
+    client_hints = _build_client_hints(resolved_browser, user_agent)
+    if client_hints:
+        headers.update(client_hints)
+
+    if mode == "json":
+        headers["Content-Type"] = "application/json"
+
+    return headers
+
+
 __all__ = [
     "build_console_headers",
     "build_console_sso_cookie",
+    "build_console_voice_headers",
     "build_headers",
     "build_sso_cookie",
     "build_ws_headers",

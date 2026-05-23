@@ -28,7 +28,7 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 
 ## 模型池规则
 
-- `ssoBasic`：支持 `grok-4.3-fast`、`grok-imagine-1.0`、`grok-imagine-1.0-edit`，以及全部 **Console Chat Playground** 模型（见下）。
+- `ssoBasic`：支持 `grok-4.3-fast`、`grok-imagine-1.0`、`grok-imagine-1.0-edit`，以及全部 **Console Chat Playground** 与 **Console Voice（TTS/STT）** 模型（见下）。
 - `ssoSuper`：保持旧项目模型能力。
 - 图片生成/编辑内部使用 `grok-4.3`。
 
@@ -131,6 +131,53 @@ Playground 五个模型均支持 Image input。网关行为见上文 **图片输
 5. `grok-4.3` 返回 **明文 summary**（`summary_text` / 流式 `response.reasoning_summary_text.delta`）；build/4.20 等以 **encrypted 透传** 为主。
 6. Assistant message 的 `phase`（`commentary` / `final_answer`）在 replay 时会原样保留。
 7. `-search` 变体会自动注入 `web_search` 与 `x_search`，无需客户端手动添加搜索 tools。
+
+## Console Voice（TTS/STT）
+
+通过 `console.x.ai` SSO 逆向的 Voice Playground REST API，对外暴露 OpenAI 兼容音频端点。在 `GET /v1/models` 中 `owned_by` 为 `xai-console-voice`。
+
+| model_id | 用途 |
+|---|---|
+| `grok-tts-1` | 文字转语音（`/v1/audio/speech`） |
+| `grok-stt-1` | 语音转文字（`/v1/audio/transcriptions`） |
+
+### 端点
+
+| 端点 | 说明 |
+|---|---|
+| `POST /v1/audio/speech` | OpenAI TTS 兼容；JSON body，`input`→上游 `text`，`voice`→`voice_id` |
+| `POST /v1/audio/transcriptions` | OpenAI STT 兼容；multipart，`file` 必填 |
+| `GET /v1/audio/voices` | 上游音色列表（`eve` / `ara` / `rex` / `sal` / `leo` 等） |
+
+### 音色与格式
+
+- **内置音色**：`eve`、`ara`、`rex`、`sal`、`leo`（大小写不敏感）。
+- **OpenAI 别名**：`alloy→ara`、`echo→rex`、`fable→sal`、`onyx→leo`、`nova→eve`、`shimmer→sal`。
+- **TTS `response_format`**：`mp3`（默认）、`wav`、`pcm`、`opus`（映射为 mp3）。
+- **STT `response_format`**：`json`（默认）、`text`、`verbose_json`、`srt`、`vtt`（后两者需上游返回 `words` 时间戳，否则降级为纯文本）。
+
+### 与 OpenAI 的差异（v1）
+
+- 无 `POST /v1/audio/translations`、无流式 TTS/STT WebSocket。
+- `instructions`（TTS）、`prompt` / `temperature`（STT）字段会被忽略。
+- 依赖 **`ssoBasic`** 池与 **`proxy.cf_clearance`**（与 Console Chat 相同）。
+
+### 示例
+
+```bash
+# TTS
+curl -sS -X POST http://127.0.0.1:8000/v1/audio/speech \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"grok-tts-1","input":"Hello from Grok TTS.","voice":"eve","response_format":"mp3"}' \
+  --output speech.mp3
+
+# STT
+curl -sS -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer $API_KEY" \
+  -F model=grok-stt-1 \
+  -F file=@sample.wav
+```
 
 ## 检查
 
