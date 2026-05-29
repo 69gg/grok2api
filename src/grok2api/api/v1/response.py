@@ -1,5 +1,12 @@
 """
-Responses API 路由 (OpenAI compatible).
+Responses API 路由 (OpenAI / xAI compatible).
+
+自动路由：
+- Console 模型 → console.x.ai `/v1/responses`（SSE 原样透传），失败时按序重试：
+  1. Grok 原样 input 透传
+  2. 剔除 input 中 encrypted/compaction CoT 后再请求
+  3. OpenAI Responses 形态规范化 input 后再请求（含保留加密与剔除加密两轮）
+- 其它模型 → Grok App Responses 合成层
 """
 
 from typing import Any, Dict, List, Optional, Union

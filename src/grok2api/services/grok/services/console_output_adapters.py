@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -48,11 +47,14 @@ class ConsoleChatStreamAdapter:
         *,
         prompt_tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Any = None,
+        emit_plaintext_reasoning: bool = True,
     ) -> None:
         self.model = model
         self.response_id = make_response_id()
         self.started = False
+        self.emit_plaintext_reasoning = emit_plaintext_reasoning
         self.reasoning_parts: List[str] = []
+        self._encrypted_reasoning: Optional[str] = None
         self.content_parts: List[str] = []
         self.tool_calls: Dict[int, Dict[str, Any]] = {}
         self._tool_index = 0
@@ -117,24 +119,35 @@ class ConsoleChatStreamAdapter:
             )
         ]
 
+    def _remember_encrypted_reasoning(self, enc: str) -> bool:
+        if not isinstance(enc, str) or not enc:
+            return False
+        if self._encrypted_reasoning is None:
+            self._encrypted_reasoning = enc
+            return True
+        return False
+
     def ingest(self, event: ConsoleEvent) -> List[str]:
         out: List[str] = []
         out.extend(self._ensure_role())
 
         if event.type == ConsoleEventType.REASONING_SUMMARY_DELTA:
-            delta = event.data.get("delta") or ""
-            self.reasoning_parts.append(delta)
-            out.append(
-                _sse_chat_chunk(
-                    self.response_id,
-                    self.model,
-                    delta={"reasoning_content": delta},
+            if (
+                self.emit_plaintext_reasoning
+                and self._encrypted_reasoning is None
+            ):
+                delta = event.data.get("delta") or ""
+                self.reasoning_parts.append(delta)
+                out.append(
+                    _sse_chat_chunk(
+                        self.response_id,
+                        self.model,
+                        delta={"reasoning_content": delta},
+                    )
                 )
-            )
         elif event.type == ConsoleEventType.REASONING_DONE:
             enc = event.data.get("encrypted_content") or ""
-            if enc:
-                self.reasoning_parts.append(enc)
+            if enc and self._remember_encrypted_reasoning(enc):
                 out.append(
                     _sse_chat_chunk(
                         self.response_id,
@@ -225,12 +238,13 @@ class ConsoleChatStreamAdapter:
                 if item.get("type") == "reasoning":
                     encrypted = item.get("encrypted_content")
                     if encrypted:
-                        self.reasoning_parts.append(encrypted)
-                    summary = item.get("summary")
-                    if isinstance(summary, list):
-                        for part in summary:
-                            if isinstance(part, dict) and part.get("text"):
-                                self.reasoning_parts.append(str(part["text"]))
+                        self._remember_encrypted_reasoning(encrypted)
+                    elif self.emit_plaintext_reasoning:
+                        summary = item.get("summary")
+                        if isinstance(summary, list):
+                            for part in summary:
+                                if isinstance(part, dict) and part.get("text"):
+                                    self.reasoning_parts.append(str(part["text"]))
                 elif item.get("type") == "message":
                     for block in item.get("content") or []:
                         if not isinstance(block, dict):
@@ -301,7 +315,9 @@ class ConsoleChatStreamAdapter:
             "role": "assistant",
             "content": "".join(self.content_parts) or None,
         }
-        if self.reasoning_parts:
+        if self._encrypted_reasoning is not None:
+            message["reasoning_content"] = self._encrypted_reasoning
+        elif self.reasoning_parts:
             message["reasoning_content"] = "".join(self.reasoning_parts)
         tool_list = [self.tool_calls[i] for i in sorted(self.tool_calls)]
         if tool_list:
@@ -322,158 +338,27 @@ class ConsoleChatStreamAdapter:
         }
 
 
-def _extract_native_reasoning_text(item: Dict[str, Any]) -> str:
-    chunks: List[str] = []
-    for field in ("summary", "content"):
-        parts = item.get(field)
-        if not isinstance(parts, list):
-            continue
-        for part in parts:
-            if not isinstance(part, dict):
-                if isinstance(part, str) and part.strip():
-                    chunks.append(part.strip())
-                continue
-            part_type = str(part.get("type") or "").strip().lower()
-            text = str(part.get("text") or part.get("content") or "").strip()
-            if not text:
-                continue
-            if part_type in {"", "summary_text", "reasoning_text", "text", "summary"}:
-                chunks.append(text)
-    return "\n".join(chunks)
-
-
-def _reasoning_item_has_summary_text(item: Dict[str, Any]) -> bool:
-    summary = item.get("summary")
-    if not isinstance(summary, list):
-        return False
-    for part in summary:
-        if not isinstance(part, dict):
-            continue
-        if part.get("type") == "summary_text" and str(part.get("text") or "").strip():
-            return True
-    content = item.get("content")
-    if not isinstance(content, list):
-        return False
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        if part.get("type") == "reasoning_text" and str(part.get("text") or "").strip():
-            return True
-    return False
-
-
-def _inject_reasoning_summary_text(item: Dict[str, Any], text: str) -> Dict[str, Any]:
-    if not text or _reasoning_item_has_summary_text(item):
-        return item
-    if item.get("encrypted_content"):
-        return item
-    patched = copy.deepcopy(item)
-    patched["summary"] = [{"type": "summary_text", "text": text}]
-    return patched
-
-
-class ConsoleResponsesStreamAdapter:
-    """Passthrough upstream SSE while ensuring reasoning summary reaches clients."""
-
-    _REASONING_DELTA_EVENTS = frozenset(
-        {
-            "response.reasoning_summary_text.delta",
-            "response.reasoning_text.delta",
-        }
-    )
-    _REASONING_DONE_EVENTS = frozenset(
-        {
-            "response.reasoning_summary_text.done",
-            "response.reasoning_text.done",
-        }
-    )
+class ConsoleResponsesPassthroughAdapter:
+    """Forward upstream Responses SSE/JSON; only rewrite the exposed model alias."""
 
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
         self.completed_response: Optional[Dict[str, Any]] = None
-        self._reasoning_summary_by_output_index: Dict[int, List[str]] = {}
 
-    def _accumulate_reasoning_text(
-        self,
-        *,
-        output_index: Any = None,
-        text: str,
-    ) -> None:
-        if not text or not isinstance(output_index, int):
-            return
-        self._reasoning_summary_by_output_index.setdefault(output_index, []).append(text)
-
-    def _summary_text_for_output_index(self, output_index: Any = None) -> str:
-        if isinstance(output_index, int) and output_index in self._reasoning_summary_by_output_index:
-            return "".join(self._reasoning_summary_by_output_index[output_index])
-        return ""
-
-    def _patch_reasoning_items_in_output(
-        self,
-        output: List[Any],
-    ) -> List[Any]:
-        patched: List[Any] = []
-        for index, item in enumerate(output):
-            if not isinstance(item, dict) or item.get("type") != "reasoning":
-                patched.append(item)
-                continue
-            if item.get("encrypted_content"):
-                patched.append(item)
-                continue
-            summary_text = self._summary_text_for_output_index(index)
-            if not summary_text:
-                summary_text = _extract_native_reasoning_text(item)
-            if summary_text and not _reasoning_item_has_summary_text(item):
-                patched.append(_inject_reasoning_summary_text(item, summary_text))
-            else:
-                patched.append(item)
-        return patched
-
-    def _patch_response_reasoning(self, response: Dict[str, Any]) -> Dict[str, Any]:
-        output = response.get("output")
-        if not isinstance(output, list):
-            return response
-        patched = dict(response)
-        patched["output"] = self._patch_reasoning_items_in_output(output)
-        return patched
-
-    def _process_event(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        event_type = str(data.get("type") or "")
-        if event_type in self._REASONING_DELTA_EVENTS:
-            self._accumulate_reasoning_text(
-                output_index=data.get("output_index"),
-                text=str(data.get("delta") or ""),
-            )
-        elif event_type in self._REASONING_DONE_EVENTS:
-            self._accumulate_reasoning_text(
-                output_index=data.get("output_index"),
-                text=str(data.get("text") or ""),
-            )
-        elif event_type == "response.output_item.done":
-            item = data.get("item")
-            if isinstance(item, dict) and item.get("type") == "reasoning":
-                if not item.get("encrypted_content"):
-                    summary_text = self._summary_text_for_output_index(data.get("output_index"))
-                    if summary_text:
-                        data = dict(data)
-                        data["item"] = _inject_reasoning_summary_text(item, summary_text)
-        elif event_type == "response.completed":
-            response = data.get("response")
-            if isinstance(response, dict):
-                data = dict(data)
-                patched = self._patch_response_reasoning(response)
-                patched["model"] = self.model_id
-                data["response"] = patched
-            self.completed_response = data
-            return data
-
+    def _apply_model_alias(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(data)
         response = data.get("response")
         if isinstance(response, dict):
-            data = dict(data)
             data["response"] = dict(response)
             data["response"]["model"] = self.model_id
-            return data
+        elif data.get("object") == "response":
+            data["model"] = self.model_id
         return data
+
+    def _finalize(self, data: Dict[str, Any]) -> str:
+        if data.get("type") == "response.completed":
+            self.completed_response = data
+        return f"data: {orjson.dumps(data).decode()}\n\n"
 
     def ingest_raw_line(self, line: str | bytes) -> Optional[str]:
         if isinstance(line, bytes):
@@ -487,8 +372,7 @@ class ConsoleResponsesStreamAdapter:
             if isinstance(data, dict) and data.get("object") == "response":
                 data = {"type": "response.completed", "response": data}
             if isinstance(data, dict):
-                data = self._process_event(data)
-                return f"data: {orjson.dumps(data).decode()}\n\n"
+                return self._finalize(self._apply_model_alias(data))
         if not stripped.startswith("data:"):
             return line if line.endswith("\n") else line + "\n"
         payload_text = stripped[5:].strip()
@@ -499,8 +383,12 @@ class ConsoleResponsesStreamAdapter:
         except orjson.JSONDecodeError:
             return line if line.endswith("\n") else line + "\n"
         if isinstance(data, dict):
-            data = self._process_event(data)
-        return f"data: {orjson.dumps(data).decode()}\n\n"
+            return self._finalize(self._apply_model_alias(data))
+        return line if line.endswith("\n") else line + "\n"
+
+
+# Back-compat alias
+ConsoleResponsesStreamAdapter = ConsoleResponsesPassthroughAdapter
 
 
 def anthropic_usage_from_chat(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
@@ -513,6 +401,7 @@ def anthropic_usage_from_chat(usage: Optional[Dict[str, Any]]) -> Dict[str, int]
 
 __all__ = [
     "ConsoleChatStreamAdapter",
+    "ConsoleResponsesPassthroughAdapter",
     "ConsoleResponsesStreamAdapter",
     "anthropic_usage_from_chat",
     "to_responses_usage",

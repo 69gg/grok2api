@@ -576,10 +576,12 @@ class AnthropicStreamAdapter:
         model: str,
         stop_sequences: Optional[List[str]],
         include_thinking: bool,
+        preserve_thinking_text: bool = False,
     ):
         self.model = model
         self.stop_sequences = stop_sequences
         self.include_thinking = include_thinking
+        self.preserve_thinking_text = preserve_thinking_text
         self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
         self.message_started = False
         self.output_blocks: List[Dict[str, Any]] = []
@@ -681,7 +683,12 @@ class AnthropicStreamAdapter:
         events = self._ensure_text_block("thinking")
         self.current_text += delta
         self.reasoning_chars += len(delta)
-        self.output_blocks[self.current_block_index]["thinking"] = _format_thinking_text(self.current_text)
+        snapshot = (
+            self.current_text
+            if self.preserve_thinking_text
+            else _format_thinking_text(self.current_text)
+        )
+        self.output_blocks[self.current_block_index]["thinking"] = snapshot
         events.append(
             self._event(
                 "content_block_delta",

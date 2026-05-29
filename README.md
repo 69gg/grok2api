@@ -146,16 +146,20 @@ Playground 五个模型均支持 Image input。网关行为见上文 **图片输
 - **`/v1/responses`**：原生 `input_image` item 直接 replay。
 - **`/v1/messages`**：暂不支持；需改用 Chat Completions 或 Responses。
 
-### 客户端多轮对话约定（对齐 OpenAI Responses API）
+### 客户端多轮对话约定（对齐 xAI / OpenAI Responses API）
 
 1. Playground 上游默认 `store=false`，**不要依赖** `previous_response_id`；无状态多轮应携带 **完整 `input[]` history**（reasoning / function_call / function_call_output / message items）。
-2. **Reasoning 标准字段**（见 [OpenAI Reasoning 指南](https://developers.openai.com/api/docs/guides/reasoning)）：
-   - **`/v1/responses`**：`output[]` 中 `{type:"reasoning", summary?, content?, encrypted_content?}` item；**不是** `reasoning_content`
-   - **`/v1/chat/completions`**：网关兼容层映射为 `message.reasoning_content` / `delta.reasoning_content`（便于旧客户端；OpenAI 官方仍推荐 Responses）
-   - **`/v1/messages`**：映射为 `{type:"thinking", thinking:"..."}` block
-3. 无状态续轮：请求带 `include: ["reasoning.encrypted_content"]`，并将上一轮 **完整 reasoning item**（含 `encrypted_content`）原样放入 `input[]`。
-4. Summary：grok-4.3 等模型在 `reasoning.effort != none` 时默认请求 `reasoning.summary: "auto"`（与 OpenAI 一致，需显式开启才返回 summary）。
-5. `grok-4.3` 返回 **明文 summary**（`summary_text` / 流式 `response.reasoning_summary_text.delta`）；build/4.20 等以 **encrypted 透传** 为主。
+2. **接口与 CoT 形态**（Console 模型）：
+   - **`POST /v1/responses`**（仅 Console 模型）：上游 SSE/JSON 原样转发；**失败回退**（仍打 console.x.ai）：
+     1. Grok 原样 `input[]` 透传
+     2. 剔除 `encrypted_content` / compaction 后再试
+     3. OpenAI Responses 形态规范化 `input[]` 后再试（保留加密 → 剔除加密）
+   - **`POST /v1/chat/completions`**：兼容层——**encrypted 模型**优先 `delta.reasoning_content` = 上游 `encrypted_content` 原字节；**grok-4.3** 使用 `reasoning_summary_text.delta` 映射为 summary 流。
+   - **`POST /v1/messages`**（Anthropic）：与 Chat 相同策略（`thinking` / `thinking_delta`）。
+3. **Reasoning 标准字段**（Responses）：
+   - `output[]` 中 `{type:"reasoning", summary?, encrypted_content?}`；encrypted 续轮 item 建议 `summary: []` + `encrypted_content`（与 xAI 文档示例一致）。
+4. 无状态续轮：请求带 `include: ["reasoning.encrypted_content"]`，将上一轮 reasoning item（含 `encrypted_content`）放入 `input[]`；也可用 `*response.output` 整体 replay。
+5. **grok-4.3**：`reasoning.effort != none` 时请求 `reasoning.summary: "auto"`，输出可见 summary；**build / 4.20 / multi-agent** 等以 encrypted 为主，网关不在 Chat 里拼接 summary+encrypted。
 6. Assistant message 的 `phase`（`commentary` / `final_answer`）在 replay 时会原样保留。
 7. `-search` 变体会自动注入 `web_search` 与 `x_search`，无需客户端手动添加搜索 tools。
 

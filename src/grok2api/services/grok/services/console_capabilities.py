@@ -202,6 +202,69 @@ def prepare_console_tooling(
     return upstream_tools, merged_instructions, prompt_tools, None
 
 
+def detect_console_responses_client_mode(
+    caps: ConsoleModelCapabilities,
+    *,
+    input_value: Any = None,
+    request_include: Optional[List[str]] = None,
+    reasoning: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Classify client request shape: xAI/Grok-native first, else OpenAI-compatible normalization.
+
+    Returns ``xai_native`` or ``openai_compat``.
+    """
+    from grok2api.services.grok.services.console_input import ConsoleInputBuilder
+
+    if ConsoleInputBuilder.input_has_encrypted_reasoning(input_value):
+        return "xai_native"
+    if request_include and "reasoning.encrypted_content" in request_include:
+        return "xai_native"
+    if ConsoleInputBuilder.input_has_responses_structured_items(input_value):
+        return "xai_native"
+    if isinstance(reasoning, dict) and reasoning.get("summary") is not None:
+        return "xai_native"
+    if caps.default_reasoning_mode == "encrypted":
+        return "xai_native"
+    return "openai_compat"
+
+
+def should_passthrough_responses_input(
+    caps: ConsoleModelCapabilities,
+    *,
+    history_has_encrypted: bool = False,
+    request_include: Optional[List[str]] = None,
+    input_value: Any = None,
+    reasoning: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when input[] should be replayed without normalization (xAI-native path)."""
+    if history_has_encrypted:
+        return True
+    return (
+        detect_console_responses_client_mode(
+            caps,
+            input_value=input_value,
+            request_include=request_include,
+            reasoning=reasoning,
+        )
+        == "xai_native"
+    )
+
+
+def should_emit_plaintext_reasoning_summary(
+    caps: ConsoleModelCapabilities,
+    *,
+    reasoning_effort: Optional[str] = None,
+    history_has_encrypted: bool = False,
+) -> bool:
+    """Whether console output should include visible reasoning summary text."""
+    if history_has_encrypted:
+        return False
+    if caps.default_reasoning_mode != "summary":
+        return False
+    effort = str(reasoning_effort or "").strip().lower()
+    return effort not in ("none", "")
+
+
 def should_include_encrypted(
     caps: ConsoleModelCapabilities,
     *,
@@ -300,4 +363,7 @@ __all__ = [
     "partition_console_tools",
     "prepare_console_tooling",
     "should_include_encrypted",
+    "should_emit_plaintext_reasoning_summary",
+    "should_passthrough_responses_input",
+    "detect_console_responses_client_mode",
 ]

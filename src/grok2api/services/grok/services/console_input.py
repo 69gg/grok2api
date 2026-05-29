@@ -138,6 +138,11 @@ def _passthrough_replay_item(item: Dict[str, Any]) -> Dict[str, Any]:
     return cloned
 
 
+def _passthrough_native_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """xAI-native replay: keep client output item fields unchanged."""
+    return copy.deepcopy(item)
+
+
 def _is_compaction_item(item: Any) -> bool:
     if not isinstance(item, dict):
         return False
@@ -171,22 +176,30 @@ def drop_compaction_blobs_from_payload(payload: Dict[str, Any]) -> int:
 
 
 def _replay_encrypted_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Send back only fields required for opaque compaction blob replay."""
+    """Replay opaque reasoning/compaction blobs (xAI official shape)."""
     enc = item.get("encrypted_content")
     if not isinstance(enc, str) or not enc:
         return _passthrough_replay_item(item)
     item_type = str(item.get("type") or "reasoning").strip().lower()
     if item_type not in {"reasoning", "compaction"}:
         item_type = "reasoning"
-    return {
+    replay: Dict[str, Any] = {
         "type": item_type,
         "encrypted_content": enc,
-        "status": "completed",
+        "status": item.get("status") or "completed",
+        "summary": [],
     }
+    item_id = item.get("id")
+    if isinstance(item_id, str) and item_id.strip():
+        replay["id"] = item_id.strip()
+    return replay
 
 
 def _normalize_reasoning_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    normalized: Dict[str, Any] = {
+    enc = item.get("encrypted_content")
+    if isinstance(enc, str) and enc:
+        return _replay_encrypted_item(item)
+    normalized = {
         "type": "reasoning",
         "id": item.get("id") or _new_reasoning_id(),
     }
@@ -199,9 +212,6 @@ def _normalize_reasoning_item(item: Dict[str, Any]) -> Dict[str, Any]:
     content = item.get("content")
     if isinstance(content, list) and content:
         normalized["content"] = content
-    enc = item.get("encrypted_content")
-    if enc:
-        normalized["encrypted_content"] = enc
     return normalized
 
 
@@ -253,11 +263,60 @@ def _normalize_replay_message_item(item: Dict[str, Any]) -> Optional[Dict[str, A
 class ConsoleInputBuilder:
     """Convert heterogeneous client history into Responses input[]."""
 
+    _RESPONSES_STRUCTURED_ITEM_TYPES = frozenset(
+        {
+            "reasoning",
+            "compaction",
+            "function_call",
+            "function_call_output",
+            "tool_call_output",
+            "tool_output",
+            "message",
+            "web_search_call",
+            "x_search_call",
+            "code_interpreter_call",
+            "file_search_call",
+        }
+    )
+
+    @staticmethod
+    def input_has_encrypted_reasoning(input_value: Any) -> bool:
+        if input_value is None:
+            return False
+        raw_items = input_value if isinstance(input_value, list) else [input_value]
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if (
+                item_type in {"reasoning", "compaction"}
+                or (item_type is None and item.get("encrypted_content"))
+            ) and item.get("encrypted_content"):
+                return True
+        return False
+
+    @staticmethod
+    def input_has_responses_structured_items(input_value: Any) -> bool:
+        """True when input[] uses xAI/OpenAI Responses output item shapes (type: ...)."""
+        if input_value is None:
+            return False
+        raw_items = input_value if isinstance(input_value, list) else [input_value]
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip().lower()
+            if item_type in ConsoleInputBuilder._RESPONSES_STRUCTURED_ITEM_TYPES:
+                return True
+            if item.get("encrypted_content"):
+                return True
+        return False
+
     @staticmethod
     def from_responses_input(
         input_value: Any,
         *,
         instructions: Optional[str] = None,
+        passthrough_items: bool = False,
     ) -> Tuple[Optional[str], List[Dict[str, Any]], bool]:
         instructions_parts: List[str] = []
         if instructions:
@@ -291,6 +350,8 @@ class ConsoleInputBuilder:
                 if item.get("encrypted_content"):
                     history_encrypted = True
                     items.append(_replay_encrypted_item(item))
+                elif passthrough_items:
+                    items.append(_passthrough_native_item(item))
                 else:
                     items.append(_normalize_reasoning_item(item))
                 continue
@@ -354,20 +415,36 @@ class ConsoleInputBuilder:
 
             if role == "assistant":
                 reasoning = message.get("reasoning_content")
-                if isinstance(reasoning, str) and reasoning.strip():
+                if isinstance(reasoning, str) and reasoning:
                     if is_encrypted_reasoning(reasoning):
                         history_encrypted = True
                         reasoning_id = message.get("reasoning_id") or message.get(
                             "reasoning_item_id"
                         )
-                        replay_item: Dict[str, Any] = {
+                        replay_src: Dict[str, Any] = {
                             "type": "reasoning",
                             "encrypted_content": reasoning,
                         }
                         if isinstance(reasoning_id, str) and reasoning_id.strip():
-                            replay_item["id"] = reasoning_id.strip()
-                        items.append(replay_item)
-                    # plaintext summary stays in visible content path for grok-4.3
+                            replay_src["id"] = reasoning_id.strip()
+                        items.append(_replay_encrypted_item(replay_src))
+                    else:
+                        reasoning_id = message.get("reasoning_id") or message.get(
+                            "reasoning_item_id"
+                        )
+                        summary_item: Dict[str, Any] = {
+                            "type": "reasoning",
+                            "id": (
+                                reasoning_id.strip()
+                                if isinstance(reasoning_id, str) and reasoning_id.strip()
+                                else _new_reasoning_id()
+                            ),
+                            "status": "completed",
+                            "summary": [
+                                {"type": "summary_text", "text": reasoning},
+                            ],
+                        }
+                        items.append(summary_item)
 
                 tool_calls = message.get("tool_calls") or []
                 for tool_call in tool_calls:
@@ -394,9 +471,6 @@ class ConsoleInputBuilder:
                         if isinstance(block, dict) and block.get("type") == "text":
                             parts.append(block.get("text") or "")
                     text = "\n".join(p for p in parts if p)
-                if isinstance(reasoning, str) and reasoning.strip() and not is_encrypted_reasoning(reasoning):
-                    prefix = reasoning.strip()
-                    text = f"{prefix}\n\n{text}" if text else prefix
                 if text or not tool_calls:
                     items.append(
                         {

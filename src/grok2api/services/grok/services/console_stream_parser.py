@@ -79,7 +79,10 @@ class ConsoleStreamParser:
             return events
 
         event_type = data.get("type") or ""
-        if event_type == "response.reasoning_summary_text.delta":
+        if event_type in {
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        }:
             delta = data.get("delta") or ""
             if delta:
                 events.append(

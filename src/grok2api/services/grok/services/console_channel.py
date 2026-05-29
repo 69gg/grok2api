@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
+
+from grok2api.services.grok.services.console_input import (
+    ConsoleInputBuilder,
+    drop_compaction_blobs_from_payload,
+)
 
 import orjson
 from curl_cffi.requests import AsyncSession
@@ -17,11 +22,11 @@ from grok2api.services.grok.services.console_capabilities import (
     merge_tools,
     normalize_reasoning_effort,
     prepare_console_tooling,
+    should_emit_plaintext_reasoning_summary,
 )
-from grok2api.services.grok.services.console_input import ConsoleInputBuilder
 from grok2api.services.grok.services.console_output_adapters import (
     ConsoleChatStreamAdapter,
-    ConsoleResponsesStreamAdapter,
+    ConsoleResponsesPassthroughAdapter,
     anthropic_usage_from_chat,
 )
 from grok2api.services.grok.services.console_stream_parser import ConsoleStreamParser
@@ -33,6 +38,14 @@ from grok2api.services.reverse.console_payload import merge_console_payload, san
 from grok2api.services.reverse.console_responses import ConsoleResponsesReverse
 from grok2api.services.token import get_token_manager
 from grok2api.services.token.service import TokenService
+
+# Console /v1/responses upstream attempts (same console.x.ai endpoint, different input shaping).
+CONSOLE_RESPONSES_FALLBACK_STRATEGIES: Tuple[Tuple[str, bool, bool], ...] = (
+    ("grok_passthrough", True, False),
+    ("grok_passthrough_strip_encrypted", True, True),
+    ("openai_compat", False, False),
+    ("openai_compat_strip_encrypted", False, True),
+)
 
 
 def _reasoning_config_from_thinking(thinking: Any) -> Optional[Dict[str, Any]]:
@@ -297,6 +310,12 @@ class ConsoleChannelService:
             )
             return sanitize_console_upstream_payload(filter_payload(caps, payload))
 
+        emit_plaintext_reasoning = should_emit_plaintext_reasoning_summary(
+            caps,
+            reasoning_effort=reasoning_effort,
+            history_has_encrypted=history_encrypted,
+        )
+
         result = await ConsoleChannelService._execute_with_token(
             model, build, stream=stream_flag
         )
@@ -304,7 +323,10 @@ class ConsoleChannelService:
         if stream_flag:
             async def chat_stream():
                 adapter = ConsoleChatStreamAdapter(
-                    model, prompt_tools=prompt_tools, tool_choice=tool_choice
+                    model,
+                    prompt_tools=prompt_tools,
+                    tool_choice=tool_choice,
+                    emit_plaintext_reasoning=emit_plaintext_reasoning,
                 )
                 parser = ConsoleStreamParser()
                 async for line in result:
@@ -317,7 +339,10 @@ class ConsoleChannelService:
 
         parser = ConsoleStreamParser()
         adapter = ConsoleChatStreamAdapter(
-            model, prompt_tools=prompt_tools, tool_choice=tool_choice
+            model,
+            prompt_tools=prompt_tools,
+            tool_choice=tool_choice,
+            emit_plaintext_reasoning=emit_plaintext_reasoning,
         )
         for line in result:
             for event in parser.ingest_line(line):
@@ -325,7 +350,41 @@ class ConsoleChannelService:
         return adapter.build_non_stream_response()
 
     @staticmethod
-    async def responses(
+    async def _execute_responses_with_fallback(
+        model: str,
+        *,
+        stream: bool,
+        build_for_strategy: Callable[[bool, bool], Callable[[str], Awaitable[Dict[str, Any]]]],
+        strategies: Tuple[Tuple[str, bool, bool], ...] = CONSOLE_RESPONSES_FALLBACK_STRATEGIES,
+    ):
+        last_error: Optional[UpstreamException] = None
+        for strategy_name, passthrough_items, strip_encrypted in strategies:
+            try:
+                logger.info(
+                    "Console responses: model={}, strategy={}, passthrough_items={}, strip_encrypted={}",
+                    model,
+                    strategy_name,
+                    passthrough_items,
+                    strip_encrypted,
+                )
+                build_fn = build_for_strategy(passthrough_items, strip_encrypted)
+                return await ConsoleChannelService._execute_with_token(
+                    model, build_fn, stream=stream
+                )
+            except UpstreamException as exc:
+                last_error = exc
+                status = (exc.details or {}).get("status")
+                logger.warning(
+                    "Console responses strategy {} failed (status={}), trying next",
+                    strategy_name,
+                    status,
+                )
+        if last_error:
+            raise last_error
+        raise no_token_error(model)
+
+    @staticmethod
+    async def _responses_impl(
         *,
         model: str,
         input_value: Any,
@@ -343,6 +402,7 @@ class ConsoleChannelService:
         presence_penalty: Optional[float] = None,
         include: Optional[List[str]] = None,
         store: Optional[bool] = False,
+        passthrough_input: Optional[bool] = None,
         **extra: Any,
     ):
         model_info = _resolve_model(model)
@@ -363,61 +423,88 @@ class ConsoleChannelService:
         elif reasoning_effort:
             reasoning_config = {"effort": reasoning_effort}
 
-        async def build(_token: str) -> Dict[str, Any]:
-            instr, input_items, history_encrypted = ConsoleInputBuilder.from_responses_input(
-                input_value, instructions=instructions
-            )
-            upstream_tools, instr, _prompt_tools, upstream_tool_choice = _resolve_console_tooling(
-                caps=caps,
-                tools=tools,
-                console_search=bool(model_info.console_search),
-                tool_choice=tool_choice,
-                parallel_tool_calls=parallel_tool_calls,
-                instructions=instr,
-            )
-            text_format = None
-            if isinstance(text, dict):
-                fmt = text.get("format") if isinstance(text.get("format"), dict) else text
-                text_format = _response_format_to_text_format(fmt)
-            payload = ConsoleInputBuilder.build_payload(
-                console_model=model_info.console_model or model,
-                caps=caps,
-                input_items=input_items,
-                instructions=instr,
-                stream=stream_flag,
-                tools=upstream_tools,
-                tool_choice=upstream_tool_choice if upstream_tools else None,
-                temperature=temperature,
-                top_p=top_p,
-                max_output_tokens=max_output_tokens,
-                reasoning_effort=reasoning_effort,
-                reasoning_config=reasoning_config,
-                text_format=text_format,
-                frequency_penalty=frequency_penalty,
-                presence_penalty=presence_penalty,
-                parallel_tool_calls=parallel_tool_calls,
-                request_include=include,
-                history_has_encrypted=history_encrypted,
-                store=bool(store),
-            )
-            return sanitize_console_upstream_payload(
-                filter_payload(caps, merge_console_payload(payload, extra))
-            )
+        text_format = None
+        if isinstance(text, dict):
+            fmt = text.get("format") if isinstance(text.get("format"), dict) else text
+            text_format = _response_format_to_text_format(fmt)
 
-        result = await ConsoleChannelService._execute_with_token(
-            model, build, stream=stream_flag
+        if passthrough_input is True:
+            strategies = CONSOLE_RESPONSES_FALLBACK_STRATEGIES[:2]
+        elif passthrough_input is False:
+            strategies = CONSOLE_RESPONSES_FALLBACK_STRATEGIES[2:]
+        else:
+            strategies = CONSOLE_RESPONSES_FALLBACK_STRATEGIES
+
+        def build_for_strategy(
+            passthrough_items: bool,
+            strip_encrypted: bool,
+        ) -> Callable[[str], Awaitable[Dict[str, Any]]]:
+            async def build(_token: str) -> Dict[str, Any]:
+                instr, input_items, history_encrypted = ConsoleInputBuilder.from_responses_input(
+                    input_value,
+                    instructions=instructions,
+                    passthrough_items=passthrough_items,
+                )
+                upstream_tools, instr, _, upstream_tool_choice = _resolve_console_tooling(
+                    caps=caps,
+                    tools=tools,
+                    console_search=bool(model_info.console_search),
+                    tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
+                    instructions=instr,
+                )
+                payload = ConsoleInputBuilder.build_payload(
+                    console_model=model_info.console_model or model,
+                    caps=caps,
+                    input_items=input_items,
+                    instructions=instr,
+                    stream=stream_flag,
+                    tools=upstream_tools,
+                    tool_choice=upstream_tool_choice if upstream_tools else None,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_output_tokens=max_output_tokens,
+                    reasoning_effort=reasoning_effort,
+                    reasoning_config=reasoning_config,
+                    text_format=text_format,
+                    frequency_penalty=frequency_penalty,
+                    presence_penalty=presence_penalty,
+                    parallel_tool_calls=parallel_tool_calls,
+                    request_include=include,
+                    history_has_encrypted=history_encrypted,
+                    store=bool(store),
+                )
+                merged = sanitize_console_upstream_payload(
+                    filter_payload(caps, merge_console_payload(payload, extra))
+                )
+                if strip_encrypted:
+                    removed = drop_compaction_blobs_from_payload(merged)
+                    if removed:
+                        logger.warning(
+                            "Console responses: strategy stripped {} encrypted/compaction item(s) from input",
+                            removed,
+                        )
+                return merged
+
+            return build
+
+        result = await ConsoleChannelService._execute_responses_with_fallback(
+            model,
+            stream=stream_flag,
+            build_for_strategy=build_for_strategy,
+            strategies=strategies,
         )
 
         if stream_flag:
             async def resp_stream():
-                adapter = ConsoleResponsesStreamAdapter(model)
+                adapter = ConsoleResponsesPassthroughAdapter(model)
                 async for line in result:
                     out = adapter.ingest_raw_line(line)
                     if out:
                         yield out
             return resp_stream()
 
-        adapter = ConsoleResponsesStreamAdapter(model)
+        adapter = ConsoleResponsesPassthroughAdapter(model)
         for line in result:
             adapter.ingest_raw_line(line)
         if adapter.completed_response:
@@ -425,6 +512,50 @@ class ConsoleChannelService:
             response["model"] = model
             return response
         return {"id": f"resp_{uuid.uuid4().hex[:24]}", "object": "response", "model": model, "output": []}
+
+    @staticmethod
+    async def responses(
+        *,
+        model: str,
+        input_value: Any,
+        instructions: Optional[str] = None,
+        stream: bool = False,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: Optional[bool] = True,
+        reasoning: Optional[Dict[str, Any]] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
+        text: Optional[Dict[str, Any]] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        include: Optional[List[str]] = None,
+        store: Optional[bool] = False,
+        passthrough_input: Optional[bool] = None,
+        **extra: Any,
+    ):
+        """Console Responses: grok passthrough → strip encrypted retry → openai-compat retry."""
+        return await ConsoleChannelService._responses_impl(
+            model=model,
+            input_value=input_value,
+            instructions=instructions,
+            stream=stream,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            reasoning=reasoning,
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=max_output_tokens,
+            text=text,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            include=include,
+            store=store,
+            passthrough_input=passthrough_input,
+            **extra,
+        )
 
     @staticmethod
     async def messages(
@@ -500,21 +631,29 @@ class ConsoleChannelService:
             )
             return sanitize_console_upstream_payload(filter_payload(caps, payload))
 
+        emit_plaintext_reasoning = should_emit_plaintext_reasoning_summary(
+            caps,
+            reasoning_effort=reasoning_effort if thinking_enabled else None,
+            history_has_encrypted=history_encrypted,
+        )
+
         result = await ConsoleChannelService._execute_with_token(model, build, stream=stream_flag)
 
         if stream_flag:
             async def anthropic_stream():
-                from grok2api.api.v1.messages import _AnthropicStreamAdapter
+                from grok2api.api.v1.messages import AnthropicStreamAdapter
 
-                message_id = f"msg_{uuid.uuid4().hex[:24]}"
-                adapter = _AnthropicStreamAdapter(
+                adapter = AnthropicStreamAdapter(
                     model=model,
-                    message_id=message_id,
                     include_thinking=thinking_enabled,
                     stop_sequences=[],
+                    preserve_thinking_text=True,
                 )
                 chat_adapter = ConsoleChatStreamAdapter(
-                    model, prompt_tools=prompt_tools, tool_choice=tool_choice
+                    model,
+                    prompt_tools=prompt_tools,
+                    tool_choice=tool_choice,
+                    emit_plaintext_reasoning=emit_plaintext_reasoning,
                 )
                 parser = ConsoleStreamParser()
                 async for line in result:
@@ -554,7 +693,10 @@ class ConsoleChannelService:
 
         parser = ConsoleStreamParser()
         chat_adapter = ConsoleChatStreamAdapter(
-            model, prompt_tools=prompt_tools, tool_choice=tool_choice
+            model,
+            prompt_tools=prompt_tools,
+            tool_choice=tool_choice,
+            emit_plaintext_reasoning=emit_plaintext_reasoning,
         )
         for line in result:
             for event in parser.ingest_line(line):

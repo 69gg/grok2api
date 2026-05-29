@@ -6,11 +6,17 @@ from grok2api.services.grok.services.console_channel import _response_format_to_
 from grok2api.services.grok.services.console_capabilities import (
     CAP_GROK_43,
     CAP_MULTI_AGENT,
+    CAP_420_REASONING,
     filter_payload,
     merge_tools,
     normalize_reasoning_effort,
     prepare_console_tooling,
     should_include_encrypted,
+    should_passthrough_responses_input,
+    detect_console_responses_client_mode,
+)
+from grok2api.services.grok.services.console_channel import (
+    CONSOLE_RESPONSES_FALLBACK_STRATEGIES,
 )
 from grok2api.services.grok.services.console_input import (
     ConsoleInputBuilder,
@@ -56,6 +62,42 @@ def test_from_upstream_responses_usage_maps_cached_and_reasoning():
     assert usage["completion_tokens_details"]["reasoning_tokens"] == 1463
 
 
+def test_responses_input_passthrough_items_keeps_reasoning_shape():
+    input_items = [
+        {
+            "type": "reasoning",
+            "id": "rs_keep",
+            "status": "in_progress",
+            "summary": [{"type": "summary_text", "text": "visible"}],
+        },
+    ]
+    _, items, history_encrypted = ConsoleInputBuilder.from_responses_input(
+        input_items,
+        passthrough_items=True,
+    )
+    assert history_encrypted is False
+    assert items[0]["id"] == "rs_keep"
+    assert items[0]["summary"][0]["text"] == "visible"
+    assert items[0]["status"] == "in_progress"
+
+
+def test_chat_messages_plaintext_reasoning_becomes_summary_item():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "step one",
+        },
+        {"role": "user", "content": "next"},
+    ]
+    _, items, history_encrypted = ConsoleInputBuilder.from_chat_messages(messages)
+    assert history_encrypted is False
+    assert items[0]["type"] == "reasoning"
+    assert items[0]["summary"][0]["text"] == "step one"
+    assert items[1]["type"] == "message"
+    assert items[1]["content"][0]["text"] == "answer"
+
+
 def test_chat_messages_to_input_with_tool_and_encrypted_reasoning():
     blob = "A" * 120
     assert is_encrypted_reasoning(blob)
@@ -87,6 +129,70 @@ def test_merge_tools_adds_search_tools_for_search_variant():
     types = {t["type"] for t in tools}
     assert "web_search" in types
     assert "x_search" in types
+
+
+def test_console_responses_fallback_strategy_order():
+    names = [row[0] for row in CONSOLE_RESPONSES_FALLBACK_STRATEGIES]
+    assert names == [
+        "grok_passthrough",
+        "grok_passthrough_strip_encrypted",
+        "openai_compat",
+        "openai_compat_strip_encrypted",
+    ]
+
+
+def test_detect_console_responses_client_mode_grok_first():
+    assert (
+        detect_console_responses_client_mode(
+            CAP_420_REASONING,
+            input_value=[{"role": "user", "content": "hi"}],
+        )
+        == "xai_native"
+    )
+    assert (
+        detect_console_responses_client_mode(
+            CAP_GROK_43,
+            input_value=[{"type": "reasoning", "encrypted_content": "E" * 120}],
+        )
+        == "xai_native"
+    )
+    assert (
+        detect_console_responses_client_mode(
+            CAP_GROK_43,
+            request_include=["reasoning.encrypted_content"],
+            input_value=[{"role": "user", "content": "hi"}],
+        )
+        == "xai_native"
+    )
+    assert (
+        detect_console_responses_client_mode(
+            CAP_GROK_43,
+            input_value=[
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "search",
+                    "arguments": "{}",
+                }
+            ],
+        )
+        == "xai_native"
+    )
+    assert (
+        detect_console_responses_client_mode(
+            CAP_GROK_43,
+            input_value=[{"role": "user", "content": "hello"}],
+            reasoning={"effort": "high"},
+        )
+        == "openai_compat"
+    )
+    assert (
+        detect_console_responses_client_mode(
+            CAP_GROK_43,
+            reasoning={"effort": "high", "summary": "auto"},
+        )
+        == "xai_native"
+    )
 
 
 def test_grok43_summary_mode_skips_encrypted_include():
@@ -147,22 +253,81 @@ def test_build_payload_infers_reasoning_when_client_requests_encrypted_only():
     assert payload["include"] == ["reasoning.encrypted_content"]
 
 
-def test_responses_stream_adapter_injects_reasoning_summary_into_completed_output():
+def test_responses_passthrough_forwards_summary_delta_without_injection():
     from grok2api.services.grok.services.console_output_adapters import (
-        ConsoleResponsesStreamAdapter,
+        ConsoleResponsesPassthroughAdapter,
     )
 
-    adapter = ConsoleResponsesStreamAdapter("grok-4.3")
-    adapter.ingest_raw_line(
+    adapter = ConsoleResponsesPassthroughAdapter("grok-4.3")
+    delta_line = adapter.ingest_raw_line(
         'data: {"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"Let me think"}'
     )
+    assert delta_line is not None
+    assert "Let me think" in delta_line
     completed = adapter.ingest_raw_line(
         'data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"reasoning","id":"rs_1"}]}}'
     )
     assert completed is not None
-    assert adapter.completed_response is not None
+    output = adapter.completed_response["response"]["output"]
+    assert not output or "summary" not in (output[0] if output else {})
+
+
+def test_chat_adapter_encrypted_reasoning_byte_exact_no_summary():
+    blob = "E" * 120
+    adapter = ConsoleChatStreamAdapter("grok-build-0.1", emit_plaintext_reasoning=False)
+    summary_chunks = adapter.ingest(
+        ConsoleEvent(ConsoleEventType.REASONING_SUMMARY_DELTA, {"delta": "visible"})
+    )
+    assert all("reasoning_content" not in chunk for chunk in summary_chunks)
+    adapter.ingest(ConsoleEvent(ConsoleEventType.REASONING_DONE, {"encrypted_content": blob}))
+    adapter.ingest(
+        ConsoleEvent(
+            ConsoleEventType.COMPLETED,
+            {
+                "response": {
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "encrypted_content": blob,
+                            "summary": [{"type": "summary_text", "text": "leak"}],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    message = adapter.build_non_stream_response()["choices"][0]["message"]
+    assert message["reasoning_content"] == blob
+
+
+def test_responses_passthrough_preserves_upstream_encrypted_output():
+    import orjson
+
+    from grok2api.services.grok.services.console_output_adapters import (
+        ConsoleResponsesPassthroughAdapter,
+    )
+
+    blob = "F" * 120
+    adapter = ConsoleResponsesPassthroughAdapter("grok-build-0.1")
+    payload = {
+        "type": "response.completed",
+        "response": {
+            "id": "resp_enc",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": blob,
+                    "summary": [{"type": "summary_text", "text": "hide"}],
+                }
+            ],
+        },
+    }
+    completed = adapter.ingest_raw_line(f"data: {orjson.dumps(payload).decode()}")
+    assert completed is not None
     reasoning = adapter.completed_response["response"]["output"][0]
-    assert reasoning["summary"][0]["text"] == "Let me think"
+    assert reasoning["encrypted_content"] == blob
+    assert reasoning["summary"][0]["text"] == "hide"
 
 
 def test_responses_input_replay_preserves_summary_only_reasoning():
@@ -357,9 +522,9 @@ def test_responses_input_replay_strips_injected_summary_from_encrypted_reasoning
         "type": "reasoning",
         "encrypted_content": blob,
         "status": "completed",
+        "summary": [],
+        "id": "rs_abc",
     }
-    assert "summary" not in items[0]
-    assert "id" not in items[0]
 
 
 def test_responses_input_replay_passthrough_reasoning_and_function_call():
@@ -379,8 +544,8 @@ def test_responses_input_replay_passthrough_reasoning_and_function_call():
     assert history_encrypted is True
     assert items[0]["type"] == "reasoning"
     assert items[0]["encrypted_content"] == blob
-    assert "summary" not in items[0]
-    assert "id" not in items[0]
+    assert items[0]["summary"] == []
+    assert items[0]["id"] == "rs_abc"
     assert items[1]["call_id"] == "call_123"
     assert "id" not in items[1]
     assert items[2]["type"] == "function_call_output"
@@ -401,8 +566,8 @@ def test_responses_input_replay_passthrough_compaction_item():
     assert history_encrypted is True
     assert items[0]["type"] == "compaction"
     assert items[0]["encrypted_content"] == blob
-    assert "summary" not in items[0]
-    assert "id" not in items[0]
+    assert items[0]["summary"] == []
+    assert items[0]["id"] == "cmp_abc"
     assert items[0].get("status") == "completed"
 
 
