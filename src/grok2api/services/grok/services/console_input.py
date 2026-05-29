@@ -11,6 +11,7 @@ import orjson
 
 from grok2api.services.grok.services.console_capabilities import (
     ConsoleModelCapabilities,
+    normalize_reasoning_effort,
     should_include_encrypted,
 )
 from grok2api.services.grok.utils.tool_call import normalize_function_tool
@@ -567,11 +568,13 @@ class ConsoleInputBuilder:
             for key, value in reasoning_config.items():
                 if value is not None:
                     reasoning[key] = value
-        effort = reasoning.get("effort") or reasoning_effort
-        if caps.supports_reasoning_effort and effort is not None and "effort" not in reasoning:
+        effort = normalize_reasoning_effort(reasoning.get("effort") or reasoning_effort)
+        if effort is not None:
             reasoning["effort"] = effort
+        elif "effort" in reasoning:
+            reasoning.pop("effort", None)
         if caps.supports_reasoning_summary and "summary" not in reasoning:
-            effort_text = str(reasoning.get("effort") or reasoning_effort or "").lower()
+            effort_text = str(reasoning.get("effort") or effort or "").lower()
             if effort_text not in ("none", ""):
                 reasoning["summary"] = "auto"
         if (
@@ -581,7 +584,8 @@ class ConsoleInputBuilder:
             and "reasoning.encrypted_content" in request_include
             and caps.supports_reasoning_effort
         ):
-            reasoning = {"effort": str(reasoning_effort or "medium").lower()}
+            inferred = normalize_reasoning_effort(reasoning_effort) or "medium"
+            reasoning = {"effort": inferred}
             if caps.supports_reasoning_summary and reasoning.get("effort") not in ("none", ""):
                 reasoning["summary"] = "auto"
         if reasoning:
@@ -594,7 +598,7 @@ class ConsoleInputBuilder:
             )
         include_encrypted = should_include_encrypted(
             caps,
-            reasoning_effort=str(reasoning.get("effort") or reasoning_effort or ""),
+            reasoning_effort=str(reasoning.get("effort") or effort or ""),
             thinking_enabled=thinking_enabled,
             request_include=request_include,
             history_has_encrypted=history_has_encrypted,

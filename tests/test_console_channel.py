@@ -8,6 +8,7 @@ from grok2api.services.grok.services.console_capabilities import (
     CAP_MULTI_AGENT,
     filter_payload,
     merge_tools,
+    normalize_reasoning_effort,
     prepare_console_tooling,
     should_include_encrypted,
 )
@@ -559,6 +560,101 @@ def test_filter_payload_drops_tools_when_only_function_tools():
     filtered = filter_payload(CAP_MULTI_AGENT, payload)
     assert "tools" not in filtered
     assert "tool_choice" not in filtered
+
+
+def test_multi_agent_build_payload_forwards_agent_effort():
+    payload = ConsoleInputBuilder.build_payload(
+        console_model="grok-4.20-multi-agent-0309",
+        caps=CAP_MULTI_AGENT,
+        input_items=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        stream=False,
+        reasoning_effort="high",
+        reasoning_config={"effort": "high"},
+    )
+    assert payload["reasoning"] == {"effort": "high"}
+    assert "summary" not in payload["reasoning"]
+
+
+def test_multi_agent_filter_payload_keeps_effort():
+    payload = {
+        "model": "grok-4.20-multi-agent-0309",
+        "reasoning": {"effort": "xhigh"},
+    }
+    filtered = filter_payload(CAP_MULTI_AGENT, payload)
+    assert filtered["reasoning"] == {"effort": "xhigh"}
+
+
+def test_grok43_filter_allows_xhigh_effort():
+    payload = {"model": "grok-4.3", "reasoning": {"effort": "xhigh", "summary": "auto"}}
+    filtered = filter_payload(CAP_GROK_43, payload)
+    assert filtered["reasoning"]["effort"] == "xhigh"
+
+
+def test_normalize_reasoning_effort_maps_aliases():
+    assert normalize_reasoning_effort("max") == "xhigh"
+    assert normalize_reasoning_effort("MAX") == "xhigh"
+    assert normalize_reasoning_effort("minimal") == "low"
+    assert normalize_reasoning_effort("MINIMAL") == "low"
+    assert normalize_reasoning_effort("high") == "high"
+
+
+def test_multi_agent_count_for_effort():
+    from grok2api.services.grok.services.console_capabilities import multi_agent_count_for_effort
+
+    assert multi_agent_count_for_effort(None) is None
+    assert multi_agent_count_for_effort("none") is None
+    assert multi_agent_count_for_effort("low") == 4
+    assert multi_agent_count_for_effort("minimal") == 4
+    assert multi_agent_count_for_effort("medium") == 8
+    assert multi_agent_count_for_effort("high") == 12
+    assert multi_agent_count_for_effort("max") == 16
+    assert multi_agent_count_for_effort("xhigh") == 16
+
+
+def test_grok43_filter_maps_minimal_to_low():
+    payload = {"model": "grok-4.3", "reasoning": {"effort": "minimal", "summary": "auto"}}
+    filtered = filter_payload(CAP_GROK_43, payload)
+    assert filtered["reasoning"]["effort"] == "low"
+
+
+def test_multi_agent_build_payload_normalizes_minimal():
+    payload = ConsoleInputBuilder.build_payload(
+        console_model="grok-4.20-multi-agent-0309",
+        caps=CAP_MULTI_AGENT,
+        input_items=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        stream=False,
+        reasoning_effort="minimal",
+        reasoning_config={"effort": "minimal"},
+    )
+    filtered = filter_payload(CAP_MULTI_AGENT, payload)
+    assert filtered["reasoning"] == {"effort": "low"}
+
+
+def test_multi_agent_filter_payload_maps_max_to_xhigh():
+    payload = {"model": "grok-4.20-multi-agent-0309", "reasoning": {"effort": "max"}}
+    filtered = filter_payload(CAP_MULTI_AGENT, payload)
+    assert filtered["reasoning"] == {"effort": "xhigh"}
+
+
+def test_grok43_filter_maps_max_to_xhigh():
+    payload = {"model": "grok-4.3", "reasoning": {"effort": "max", "summary": "auto"}}
+    filtered = filter_payload(CAP_GROK_43, payload)
+    assert filtered["reasoning"]["effort"] == "xhigh"
+
+
+def test_build_and_non_reasoning_models_strip_effort():
+    from grok2api.services.grok.services.console_capabilities import CAP_420_NON_REASONING
+
+    payload = ConsoleInputBuilder.build_payload(
+        console_model="grok-4.20-0309-non-reasoning",
+        caps=CAP_420_NON_REASONING,
+        input_items=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        stream=False,
+        reasoning_effort="high",
+        reasoning_config={"effort": "high"},
+    )
+    filtered = filter_payload(CAP_420_NON_REASONING, payload)
+    assert "reasoning" not in filtered
 
 
 def test_grok_43_keeps_native_function_tools():

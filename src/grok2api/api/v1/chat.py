@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 import orjson
 
 from grok2api.services.grok.services.chat import ChatService
+from grok2api.services.grok.services.console_capabilities import normalize_reasoning_effort
 from grok2api.services.grok.services.console_channel import ConsoleChannelService
 from grok2api.services.grok.services.image import ImageGenerationService
 from grok2api.services.grok.services.image_edit import ImageEditService
@@ -61,7 +62,7 @@ class ChatCompletionRequest(BaseModel):
     model: str = Field(..., description="模型名称")
     messages: List[MessageItem] = Field(..., description="消息数组")
     stream: Optional[bool] = Field(None, description="是否流式输出")
-    reasoning_effort: Optional[str] = Field(None, description="推理强度: none/minimal/low/medium/high/xhigh")
+    reasoning_effort: Optional[str] = Field(None, description="推理强度: none/minimal/low/medium/high/xhigh/max")
     temperature: Optional[float] = Field(0.8, description="采样温度: 0-2")
     top_p: Optional[float] = Field(0.95, description="nucleus 采样: 0-1")
     # 视频生成配置
@@ -486,7 +487,7 @@ def validate_request(request: ChatCompletionRequest):
                 code="invalid_stream",
             )
 
-    allowed_efforts = {"none", "minimal", "low", "medium", "high", "xhigh"}
+    allowed_efforts = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
     if request.reasoning_effort is not None:
         if not isinstance(request.reasoning_effort, str) or (
             request.reasoning_effort not in allowed_efforts
@@ -496,6 +497,7 @@ def validate_request(request: ChatCompletionRequest):
                 param="reasoning_effort",
                 code="invalid_reasoning_effort",
             )
+        request.reasoning_effort = normalize_reasoning_effort(request.reasoning_effort)
 
     if request.temperature is None:
         request.temperature = 0.8

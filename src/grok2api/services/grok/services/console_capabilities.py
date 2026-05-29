@@ -28,6 +28,8 @@ class ConsoleModelCapabilities:
     default_reasoning_mode: str = "none"  # summary | encrypted | none
     max_output_tokens: int = 1_000_000
     reasoning_effort_options: tuple[str, ...] = ("none", "low", "medium", "high")
+    # "depth" = reasoning token budget (grok-4.3); "agent_count" = multi-agent collaborators
+    reasoning_effort_semantics: str = "depth"
 
 
 CAP_GROK_43 = ConsoleModelCapabilities(
@@ -37,7 +39,8 @@ CAP_GROK_43 = ConsoleModelCapabilities(
     supports_encrypted_reasoning=True,
     default_reasoning_mode="summary",
     max_output_tokens=1_000_000,
-    reasoning_effort_options=("none", "low", "medium", "high"),
+    reasoning_effort_options=("none", "low", "medium", "high", "xhigh"),
+    reasoning_effort_semantics="depth",
 )
 
 CAP_BUILD = ConsoleModelCapabilities(
@@ -64,10 +67,13 @@ CAP_420_REASONING = ConsoleModelCapabilities(
 
 CAP_MULTI_AGENT = ConsoleModelCapabilities(
     supports_reasoning_output=True,
+    supports_reasoning_effort=True,
     supports_encrypted_reasoning=True,
     supports_function_calling=False,
     default_reasoning_mode="encrypted",
     max_output_tokens=1_000_000,
+    reasoning_effort_options=("none", "low", "medium", "high", "xhigh"),
+    reasoning_effort_semantics="agent_count",
 )
 
 CONSOLE_CAPABILITIES: Dict[str, ConsoleModelCapabilities] = {
@@ -77,6 +83,37 @@ CONSOLE_CAPABILITIES: Dict[str, ConsoleModelCapabilities] = {
     "grok-4.20-0309-reasoning": CAP_420_REASONING,
     "grok-4.20-multi-agent-0309": CAP_MULTI_AGENT,
 }
+
+# Client-side aliases normalized before upstream.
+REASONING_EFFORT_ALIASES: Dict[str, str] = {
+    "minimal": "low",
+    "max": "xhigh",
+}
+
+# Playground multi-agent: reasoning.effort -> collaborating agent count.
+MULTI_AGENT_EFFORT_AGENT_COUNTS: Dict[str, Optional[int]] = {
+    "none": None,
+    "low": 4,
+    "medium": 8,
+    "high": 12,
+    "xhigh": 16,
+}
+
+
+def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
+    if effort is None:
+        return None
+    text = str(effort).strip().lower()
+    if not text:
+        return None
+    return REASONING_EFFORT_ALIASES.get(text, text)
+
+
+def multi_agent_count_for_effort(effort: Optional[str]) -> Optional[int]:
+    normalized = normalize_reasoning_effort(effort)
+    if not normalized or normalized == "none":
+        return None
+    return MULTI_AGENT_EFFORT_AGENT_COUNTS.get(normalized)
 
 
 def get_console_capabilities(console_model: str) -> ConsoleModelCapabilities:
@@ -217,13 +254,18 @@ def filter_payload(
             else:
                 result["reasoning"] = reasoning
         elif reasoning.get("effort") is not None:
-            effort = str(reasoning.get("effort")).lower()
+            effort = normalize_reasoning_effort(str(reasoning.get("effort")))
+            if effort is not None:
+                reasoning["effort"] = effort
             allowed = set(caps.reasoning_effort_options)
             if effort not in allowed:
                 if strict:
                     raise ValueError(f"reasoning.effort '{effort}' not supported for model")
                 reasoning.pop("effort", None)
                 logger.debug(f"Dropped unsupported reasoning.effort={effort}")
+            result["reasoning"] = reasoning
+        else:
+            result["reasoning"] = reasoning
 
     for field in ("frequency_penalty", "presence_penalty"):
         if field in result and not getattr(caps, f"supports_{field}"):
@@ -247,10 +289,14 @@ def filter_payload(
 __all__ = [
     "ConsoleModelCapabilities",
     "CONSOLE_CAPABILITIES",
+    "MULTI_AGENT_EFFORT_AGENT_COUNTS",
+    "REASONING_EFFORT_ALIASES",
     "default_search_tools",
     "filter_payload",
     "get_console_capabilities",
     "merge_tools",
+    "multi_agent_count_for_effort",
+    "normalize_reasoning_effort",
     "partition_console_tools",
     "prepare_console_tooling",
     "should_include_encrypted",

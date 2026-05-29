@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from grok2api.core.auth import verify_function_key
 from grok2api.core.logger import logger
+from grok2api.services.grok.services.console_capabilities import normalize_reasoning_effort
 from grok2api.services.grok.services.video import VideoService
 from grok2api.services.grok.services.model import ModelService
 
@@ -172,12 +173,13 @@ async def function_video_start(data: VideoStartRequest):
 
     reasoning_effort = (data.reasoning_effort or "").strip() or None
     if reasoning_effort:
-        allowed = {"none", "minimal", "low", "medium", "high", "xhigh"}
+        allowed = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
         if reasoning_effort not in allowed:
             raise HTTPException(
                 status_code=400,
                 detail=f"reasoning_effort must be one of {sorted(allowed)}",
             )
+        reasoning_effort = normalize_reasoning_effort(reasoning_effort)
 
     task_id = await _new_session(
         prompt,

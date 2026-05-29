@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from grok2api.core.streaming import safe_responses_stream
 from grok2api.core.exceptions import ValidationException
+from grok2api.services.grok.services.console_capabilities import normalize_reasoning_effort
 from grok2api.services.grok.services.console_channel import ConsoleChannelService
 from grok2api.services.grok.services.model import ModelService
 from grok2api.services.grok.services.responses import ResponsesService
@@ -50,32 +51,41 @@ async def create_response(request: ResponseCreateRequest):
         raise ValidationException(message="input is required", param="input", code="invalid_request_error")
 
     reasoning_effort = None
-    if isinstance(request.reasoning, dict):
-        reasoning_effort = request.reasoning.get("effort") or request.reasoning.get("reasoning_effort")
-
-    extra_fields = strip_console_client_extra(
-        request.model_dump(
-            exclude={
-                "model",
-                "input",
-                "instructions",
-                "stream",
-                "max_output_tokens",
-                "temperature",
-                "top_p",
-                "tools",
-                "tool_choice",
-                "parallel_tool_calls",
-                "reasoning",
-                "metadata",
-                "user",
-                "store",
-                "previous_response_id",
-                "truncation",
-            },
-            exclude_none=True,
-        )
+    reasoning = request.reasoning
+    if isinstance(reasoning, dict):
+        reasoning_effort = reasoning.get("effort") or reasoning.get("reasoning_effort")
+    raw_extra = request.model_dump(
+        exclude={
+            "model",
+            "input",
+            "instructions",
+            "stream",
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "reasoning",
+            "metadata",
+            "user",
+            "store",
+            "previous_response_id",
+            "truncation",
+        },
+        exclude_none=True,
     )
+    if reasoning_effort is None and raw_extra.get("reasoning_effort"):
+        reasoning_effort = raw_extra.get("reasoning_effort")
+    if reasoning_effort and not isinstance(reasoning, dict):
+        reasoning = {"effort": reasoning_effort}
+    elif reasoning_effort and isinstance(reasoning, dict) and reasoning.get("effort") is None:
+        reasoning = {**reasoning, "effort": reasoning_effort}
+    reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        reasoning = {**reasoning, "effort": normalize_reasoning_effort(reasoning.get("effort"))}
+
+    extra_fields = strip_console_client_extra(raw_extra)
 
     if ModelService.is_console(request.model):
         result = await ConsoleChannelService.responses(
@@ -88,7 +98,7 @@ async def create_response(request: ResponseCreateRequest):
             tools=request.tools,
             tool_choice=request.tool_choice,
             parallel_tool_calls=request.parallel_tool_calls,
-            reasoning=request.reasoning,
+            reasoning=reasoning,
             max_output_tokens=request.max_output_tokens,
             include=extra_fields.pop("include", None),
             text=extra_fields.pop("text", None),

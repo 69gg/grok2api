@@ -15,6 +15,7 @@ from grok2api.services.grok.services.console_capabilities import (
     filter_payload,
     get_console_capabilities,
     merge_tools,
+    normalize_reasoning_effort,
     prepare_console_tooling,
 )
 from grok2api.services.grok.services.console_input import ConsoleInputBuilder
@@ -42,7 +43,7 @@ def _reasoning_config_from_thinking(thinking: Any) -> Optional[Dict[str, Any]]:
     if not (thinking.get("enabled") or thinking_type in {"enabled", "on", "true"}):
         return None
     effort = str(thinking.get("effort") or "medium").strip().lower() or "medium"
-    return {"effort": effort}
+    return {"effort": normalize_reasoning_effort(effort) or effort}
 
 
 def _resolve_stream(stream: Optional[bool]) -> bool:
@@ -272,6 +273,7 @@ class ConsoleChannelService:
             instructions=instructions,
         )
 
+        reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         async def build(_token: str) -> Dict[str, Any]:
             payload = ConsoleInputBuilder.build_payload(
                 console_model=model_info.console_model or model,
@@ -355,6 +357,11 @@ class ConsoleChannelService:
             if derived:
                 reasoning_config = derived
                 reasoning_effort = derived.get("effort")
+        reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+        if reasoning_effort and isinstance(reasoning_config, dict):
+            reasoning_config = {**reasoning_config, "effort": reasoning_effort}
+        elif reasoning_effort:
+            reasoning_config = {"effort": reasoning_effort}
 
         async def build(_token: str) -> Dict[str, Any]:
             instr, input_items, history_encrypted = ConsoleInputBuilder.from_responses_input(
@@ -462,6 +469,8 @@ class ConsoleChannelService:
             if thinking.get("enabled") or thinking_type in {"enabled", "on", "true"}:
                 thinking_enabled = True
                 reasoning_effort = thinking.get("effort") or "low"
+
+        reasoning_effort = normalize_reasoning_effort(reasoning_effort)
 
         upstream_tools, instr, prompt_tools, upstream_tool_choice = _resolve_console_tooling(
             caps=caps,

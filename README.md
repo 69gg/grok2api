@@ -93,6 +93,33 @@ Responses API 可直接传 `input_image`：
 | `grok-4.20-0309-reasoning` / `...-search` | 内置 reasoning + encrypted CoT |
 | `grok-4.20-multi-agent-0309` / `...-search` | multi-agent；**不支持原生 function calling**，见下方 Tool Call 说明 |
 
+### Reasoning / Agent Effort（Console）
+
+`reasoning.effort`（Chat Completions 对应 `reasoning_effort`）在不同模型上语义不同：
+
+| 模型 | 支持 effort | 可选值 | 语义 |
+|---|---|---|---|
+| `grok-4.3` | 是 | `none` / `minimal`* / `low` / `medium` / `high` / `xhigh` / `max`* | 推理深度；`none` 关闭 reasoning summary |
+| `grok-4.20-multi-agent-0309` | 是 | 同上 | **协作 agent 数**，见下表 |
+| `grok-build-0.1` | 否 | — | 内置 encrypted reasoning，不接受 `reasoning.effort` |
+| `grok-4.20-0309-non-reasoning` | 否 | — | 无 reasoning |
+| `grok-4.20-0309-reasoning` | 否 | — | 内置 encrypted reasoning，不接受 `reasoning.effort` |
+
+\* 网关别名：`minimal`→`low`，`max`→`xhigh`（所有模型通用）。
+
+**multi-agent effort → agent 数：**
+
+| effort（规范化后） | agent 数 |
+|---|---|
+| `none` / 未指定 | 默认 |
+| `low` | 4 |
+| `medium` | 8 |
+| `high` | 12 |
+| `xhigh` | 16 |
+
+- multi-agent 不会自动加 `reasoning.summary`；grok-4.3 在 `effort != none` 时默认 `summary: "auto"`。
+- 不支持的模型若客户端传入 `reasoning.effort`，网关会在转发前剥离该字段。
+
 ### 与 grok.com 通道的区别
 
 - 除 `grok-4.20-multi-agent-0309` 外，Console 模型走 **xAI Responses API 原生 tool call**。
