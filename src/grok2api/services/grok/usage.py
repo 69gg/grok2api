@@ -16,6 +16,7 @@ from grok2api.core.exceptions import UpstreamException, AppException
 from grok2api.services.grok.statsig import StatsigService
 from grok2api.services.grok.fingerprint import get_impersonate, get_user_agent, is_firefox_ua
 from grok2api.services.grok.retry import retry_on_status
+from grok2api.services.reverse.utils.retry import extract_status_for_retry
 
 
 LIMITS_API = "https://grok.com/rest/rate-limits"
@@ -103,10 +104,7 @@ class UsageService:
         """
         async with _get_usage_semaphore():
             # 定义状态码提取器
-            def extract_status(e: Exception) -> int | None:
-                if isinstance(e, UpstreamException) and e.details:
-                    return e.details.get("status")
-                return None
+            extract_status = extract_status_for_retry
             
             # 定义实际的请求函数
             async def do_request():
@@ -146,7 +144,7 @@ class UsageService:
                     logger.error(f"Usage error: {e}")
                     raise UpstreamException(
                         message=f"Usage service error: {str(e)}",
-                        details={"error": str(e)}
+                        details={"error": str(e), "status": 502},
                     )
             
             # 带重试的执行

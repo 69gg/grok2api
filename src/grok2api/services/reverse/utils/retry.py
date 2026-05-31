@@ -5,6 +5,7 @@ Reverse retry utilities.
 import asyncio
 import inspect
 import random
+import re
 from typing import Callable, Any, Optional
 
 from curl_cffi import CurlError
@@ -19,6 +20,11 @@ from grok2api.core.logger import logger
 from grok2api.core.config import get_config
 from grok2api.core.exceptions import UpstreamException
 
+try:
+    from curl_cffi.requests.errors import RequestsError
+except ImportError:  # pragma: no cover
+    RequestsError = ()  # type: ignore
+
 
 _TRANSPORT_RETRY_STATUS = 502
 _TRANSPORT_RETRY_ERRORS = (
@@ -27,7 +33,22 @@ _TRANSPORT_RETRY_ERRORS = (
     DNSError,
     ProxyError,
     SSLError,
+    RequestsError,
 )
+
+_NETWORK_ERROR_MARKERS = (
+    "failed to perform",
+    "connection closed abruptly",
+    "connection reset",
+    "connection aborted",
+    "recv failure",
+    "broken pipe",
+    "unexpected_eof",
+    "eof occurred",
+    "temporarily unavailable",
+)
+_CURL_TRANSIENT_CODES = frozenset({"7", "28", "35", "52", "55", "56", "92"})
+_CURL_ERROR_RE = re.compile(r"curl:\s*\((\d+)\)", re.IGNORECASE)
 
 
 def is_cloudflare_challenge(error: Exception) -> bool:
@@ -56,6 +77,34 @@ def is_cloudflare_challenge(error: Exception) -> bool:
     return False
 
 
+def _error_text(error: Exception) -> str:
+    parts = [str(error)]
+    if isinstance(error, UpstreamException):
+        details = error.details or {}
+        for key in ("error", "body", "message"):
+            value = details.get(key)
+            if value:
+                parts.append(str(value))
+    return " ".join(parts).lower()
+
+
+def is_transient_network_error(error: Exception) -> bool:
+    """Detect curl/transport failures that are safe to retry."""
+    if isinstance(error, _TRANSPORT_RETRY_ERRORS):
+        return True
+
+    text = _error_text(error)
+    if any(marker in text for marker in _NETWORK_ERROR_MARKERS):
+        return True
+    if "http/2" in text or "curl: (92)" in text:
+        return True
+
+    for match in _CURL_ERROR_RE.finditer(text):
+        if match.group(1) in _CURL_TRANSIENT_CODES:
+            return True
+    return False
+
+
 class RetryContext:
     """Retry context."""
 
@@ -80,9 +129,11 @@ class RetryContext:
         """Check if should retry."""
         if self.attempt >= self.max_retry:
             return False
-        if status_code not in self.retry_codes:
-            return False
         if self.total_delay >= self.retry_budget:
+            return False
+        if error and is_transient_network_error(error):
+            return True
+        if status_code not in self.retry_codes:
             return False
         
         # --- 准确判定逻辑开始 ---
@@ -177,12 +228,12 @@ def extract_retry_after(error: Exception) -> Optional[float]:
 
 def extract_status_for_retry(error: Exception) -> Optional[int]:
     """Extract a retry status code from application or transport errors."""
+    if is_transient_network_error(error):
+        return _TRANSPORT_RETRY_STATUS
     if isinstance(error, UpstreamException):
         if error.details and "status" in error.details:
             return error.details["status"]
         return getattr(error, "status_code", None)
-    if isinstance(error, _TRANSPORT_RETRY_ERRORS):
-        return _TRANSPORT_RETRY_STATUS
     return None
 
 
@@ -293,5 +344,6 @@ __all__ = [
     "extract_retry_after",
     "extract_status_for_retry",
     "is_cloudflare_challenge",
+    "is_transient_network_error",
     "retry_on_status",
 ]

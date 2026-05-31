@@ -14,6 +14,10 @@ from typing import Any, Callable, List, Optional
 from grok2api.core.config import get_config
 from grok2api.core.exceptions import UpstreamException
 from grok2api.core.logger import logger
+from grok2api.services.reverse.utils.retry import (
+    extract_status_for_retry,
+    is_transient_network_error,
+)
 
 
 class RetryConfig:
@@ -27,7 +31,7 @@ class RetryConfig:
     @staticmethod
     def get_retry_codes() -> List[int]:
         """获取可重试的状态码"""
-        return get_config("grok.retry_status_codes", [401, 429, 403])
+        return get_config("grok.retry_status_codes", [401, 429, 403, 502])
 
 
 class RetryContext:
@@ -40,8 +44,12 @@ class RetryContext:
         self.last_error = None
         self.last_status = None
 
-    def should_retry(self, status_code: int) -> bool:
-        return self.attempt < self.max_retry and status_code in self.retry_codes
+    def should_retry(self, status_code: int, error: Exception = None) -> bool:
+        if self.attempt >= self.max_retry:
+            return False
+        if error and is_transient_network_error(error):
+            return True
+        return status_code in self.retry_codes
 
     def record_error(self, status_code: int, error: Exception):
         self.last_status = status_code
@@ -60,10 +68,7 @@ async def retry_on_status(
     ctx = RetryContext()
 
     if extract_status is None:
-        def extract_status(e: Exception) -> Optional[int]:
-            if isinstance(e, UpstreamException):
-                return e.details.get("status") if e.details else None
-            return None
+        extract_status = extract_status_for_retry
 
     while ctx.attempt <= ctx.max_retry:
         try:
@@ -78,7 +83,7 @@ async def retry_on_status(
                 raise
 
             ctx.record_error(status_code, e)
-            if ctx.should_retry(status_code):
+            if ctx.should_retry(status_code, e):
                 delay = 0.5 * (ctx.attempt + 1)
                 logger.warning(
                     f"Retry {ctx.attempt}/{ctx.max_retry} for status {status_code}, waiting {delay}s"

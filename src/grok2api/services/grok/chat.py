@@ -25,6 +25,7 @@ from grok2api.services.grok.model import ModelService
 from grok2api.services.grok.assets import UploadService
 from grok2api.services.grok.processor import StreamProcessor, CollectProcessor
 from grok2api.services.grok.retry import retry_on_status
+from grok2api.services.reverse.utils.retry import extract_status_for_retry
 from grok2api.services.grok.fingerprint import get_impersonate, get_user_agent, is_firefox_ua
 from grok2api.services.token import get_token_manager
 from grok2api.services.request_stats import request_stats
@@ -315,11 +316,7 @@ class GrokChatService:
         proxies = get_proxies_dict()
         timeout = get_config("grok.timeout", TIMEOUT)
         
-        # 状态码提取器
-        def extract_status(e: Exception) -> int | None:
-            if isinstance(e, UpstreamException) and e.details:
-                return e.details.get("status")
-            return None
+        extract_status = extract_status_for_retry
         
         # 建立连接函数
         async def establish_connection():
@@ -371,7 +368,7 @@ class GrokChatService:
                     pass
                 raise UpstreamException(
                     message=f"Chat connection failed: {str(e)}",
-                    details={"error": str(e)}
+                    details={"error": str(e), "status": 502},
                 )
         
         # 建立连接

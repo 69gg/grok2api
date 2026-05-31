@@ -6,6 +6,7 @@ from typing import Optional, Set
 
 from grok2api.core.exceptions import UpstreamException
 from grok2api.services.grok.services.model import ModelService
+from grok2api.services.reverse.utils.retry import is_transient_network_error
 
 
 async def pick_token(
@@ -48,6 +49,8 @@ def rate_limited(error: Exception) -> bool:
 
 def transient_upstream(error: Exception) -> bool:
     """Whether error is likely transient and safe to retry with another token."""
+    if is_transient_network_error(error):
+        return True
     if not isinstance(error, UpstreamException):
         return False
     details = error.details or {}

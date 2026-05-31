@@ -23,6 +23,7 @@ from grok2api.services.grok.services.model import ModelService
 from grok2api.services.grok.utils.upload import UploadService
 from grok2api.services.grok.utils import process as proc_base
 from grok2api.services.grok.utils.retry import pick_token, rate_limited, transient_upstream
+from grok2api.services.reverse.utils.retry import is_transient_network_error
 from grok2api.services.grok.utils.errors import no_token_error
 from grok2api.services.reverse.app_chat import AppChatReverse
 from grok2api.services.reverse.utils.session import ResettableSession
@@ -505,6 +506,14 @@ class ChatService:
 
             except UpstreamException as e:
                 last_error = e
+
+                if is_transient_network_error(e):
+                    logger.warning(
+                        f"Transient network error for token {token[:10]}..., "
+                        f"retrying request (attempt {attempt + 1}/{max_token_retries}): {e}"
+                    )
+                    tried_tokens.discard(token)
+                    continue
 
                 if rate_limited(e):
                     # 配额不足，标记 token 为 cooling 并换 token 重试
