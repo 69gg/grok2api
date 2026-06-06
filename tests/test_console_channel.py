@@ -1192,3 +1192,70 @@ def test_responses_prompt_tool_call_stream_passes_normal_text():
     assert '"type":"response.output_item.added"' in passed
     assert '"delta":"Hello"' in passed
     assert '"type":"function_call"' not in passed
+
+
+def test_responses_prompt_tool_call_log_omits_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from grok2api.services.grok.services import console_output_adapters as adapters_module
+
+    records: list[tuple[str, tuple[object, ...]]] = []
+
+    class FakeLogger:
+        def info(self, message: str, *args: object, **_kwargs: object) -> None:
+            records.append((message, args))
+
+    monkeypatch.setattr(adapters_module, "logger", FakeLogger())
+
+    tools = [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+    adapter = adapters_module.ConsoleResponsesPassthroughAdapter(
+        "grok-4.20-multi-agent-0309",
+        prompt_tools=tools,
+    )
+    assert adapter.ingest_raw_line(
+        'data: {"type":"response.output_item.added","response_id":"resp_1",'
+        '"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}'
+    ) is None
+    transformed = adapter.ingest_raw_line(
+        'data: {"type":"response.output_text.delta","response_id":"resp_1",'
+        '"item_id":"msg_1","output_index":0,"content_index":0,'
+        '"delta":"<call>\\nlookup\\n{\\"secret\\":\\"dont-log\\"}\\n</call>"}'
+    )
+
+    assert transformed is not None
+    rendered_logs = "\n".join(f"{message} {args!r}" for message, args in records)
+    assert "Console responses prompt tool call detected" in rendered_logs
+    assert "lookup" in rendered_logs
+    assert "dont-log" not in rendered_logs
+
+
+def test_responses_completed_logs_no_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from grok2api.services.grok.services import console_output_adapters as adapters_module
+
+    records: list[tuple[str, tuple[object, ...]]] = []
+
+    class FakeLogger:
+        def info(self, message: str, *args: object, **_kwargs: object) -> None:
+            records.append((message, args))
+
+    monkeypatch.setattr(adapters_module, "logger", FakeLogger())
+
+    adapter = adapters_module.ConsoleResponsesPassthroughAdapter("grok-4.3")
+    completed = adapter.ingest_raw_line(
+        'data: {"type":"response.completed","response":{"id":"resp_1","output":['
+        '{"type":"message","id":"msg_1","role":"assistant","content":['
+        '{"type":"output_text","text":"Hello"}]}]}}'
+    )
+
+    assert completed is not None
+    result_logs = [
+        args
+        for message, args in records
+        if message.startswith("Console responses tool call result")
+    ]
+    assert result_logs
+    assert result_logs[-1][1] is False
+    assert result_logs[-1][2] == 0
+    assert result_logs[-1][3] == []

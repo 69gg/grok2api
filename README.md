@@ -138,6 +138,7 @@ Responses API 可直接传 `input_image`：
 - multi-agent 多轮 tool loop：历史中的 Chat `tool` / `tool_calls` 消息、Responses `function_call` / `function_call_output` item，以及 Anthropic `tool_use` / `tool_result` block，会转换为 prompt 可读文本后再 replay。
 - multi-agent prompt 模式下，客户端 function 的 `tool_choice` **不会**转发到上游（避免与仅含 search tools 的 payload 冲突）。
 - `/v1/responses` 的 multi-agent prompt 模式会拦截 `<call>` 文本输出并转换为标准 `response.output_item.added`、`response.function_call_arguments.delta/done`、`response.output_item.done` 与最终 `output[].function_call`；普通文本、reasoning、搜索相关事件仍按 Responses SSE/JSON 转发。
+- Tool call 诊断日志：请求进入 Console Chat / Responses 时会记录 `client_tool_count`、`upstream_tool_count`、`prompt_tool_count`、tool 名称和 `tool_choice`；输出适配器会记录 `has_tool_calls`、`tool_call_count` 和实际检测到的工具名。日志不会记录 tool arguments。
 
 ### 图片输入（Console）
 

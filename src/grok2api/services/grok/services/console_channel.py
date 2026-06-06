@@ -97,6 +97,54 @@ def _resolve_model(model_id: str):
     return model
 
 
+def _tool_log_names(tools: Optional[List[Dict[str, Any]]]) -> List[str]:
+    names: List[str] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = tool.get("type")
+        if tool_type == "function":
+            function_obj = tool.get("function")
+            if isinstance(function_obj, dict):
+                name = function_obj.get("name")
+            else:
+                name = tool.get("name")
+            names.append(str(name or "function"))
+            continue
+        names.append(str(tool_type or "unknown"))
+    return names
+
+
+def _log_console_tooling(
+    *,
+    endpoint: str,
+    model: str,
+    stream: bool,
+    client_tools: Optional[List[Dict[str, Any]]],
+    upstream_tools: Optional[List[Dict[str, Any]]],
+    prompt_tools: Optional[List[Dict[str, Any]]],
+    tool_choice: Any,
+    upstream_tool_choice: Any,
+) -> None:
+    logger.info(
+        "Console {} tooling: model={}, stream={}, client_tool_count={}, "
+        "upstream_tool_count={}, prompt_tool_count={}, tool_choice={}, "
+        "upstream_tool_choice={}, client_tool_names={}, upstream_tool_names={}, "
+        "prompt_tool_names={}",
+        endpoint,
+        model,
+        stream,
+        len(client_tools or []),
+        len(upstream_tools or []),
+        len(prompt_tools or []),
+        tool_choice,
+        upstream_tool_choice,
+        _tool_log_names(client_tools),
+        _tool_log_names(upstream_tools),
+        _tool_log_names(prompt_tools),
+    )
+
+
 def _response_format_to_text_format(response_format: Any) -> Optional[Dict[str, Any]]:
     """Map OpenAI response_format to console Responses API text.format."""
     if response_format is None:
@@ -290,6 +338,16 @@ class ConsoleChannelService:
             parallel_tool_calls=parallel_tool_calls,
             instructions=instructions,
         )
+        _log_console_tooling(
+            endpoint="chat",
+            model=model,
+            stream=stream_flag,
+            client_tools=ConsoleInputBuilder.normalize_tools(tools),
+            upstream_tools=upstream_tools,
+            prompt_tools=prompt_tools,
+            tool_choice=tool_choice,
+            upstream_tool_choice=upstream_tool_choice,
+        )
 
         reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         async def build(_token: str) -> Dict[str, Any]:
@@ -478,13 +536,25 @@ class ConsoleChannelService:
         else:
             strategies = CONSOLE_RESPONSES_FALLBACK_STRATEGIES
 
-        _, _, response_prompt_tools, _ = _resolve_console_tooling(
-            caps=caps,
-            tools=tools,
-            console_search=bool(model_info.console_search),
+        response_upstream_tools, _, response_prompt_tools, response_upstream_tool_choice = (
+            _resolve_console_tooling(
+                caps=caps,
+                tools=tools,
+                console_search=bool(model_info.console_search),
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                instructions=None,
+            )
+        )
+        _log_console_tooling(
+            endpoint="responses",
+            model=model,
+            stream=stream_flag,
+            client_tools=ConsoleInputBuilder.normalize_tools(tools),
+            upstream_tools=response_upstream_tools,
+            prompt_tools=response_prompt_tools,
             tool_choice=tool_choice,
-            parallel_tool_calls=parallel_tool_calls,
-            instructions=None,
+            upstream_tool_choice=response_upstream_tool_choice,
         )
 
         def build_for_strategy(

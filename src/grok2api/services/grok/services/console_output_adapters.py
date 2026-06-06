@@ -8,6 +8,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 import orjson
 
+from grok2api.core.logger import logger
 from grok2api.services.grok.services.console_stream_parser import (
     ConsoleEvent,
     ConsoleEventType,
@@ -40,6 +41,23 @@ def _sse_chat_chunk(
     return f"data: {orjson.dumps(payload).decode()}\n\n"
 
 
+def _tool_call_name(tool_call: Dict[str, Any]) -> str:
+    function_obj = tool_call.get("function") or {}
+    name = function_obj.get("name")
+    return str(name or "")
+
+
+def _response_tool_call_names(response: Any) -> List[str]:
+    if not isinstance(response, dict):
+        return []
+    names: List[str] = []
+    for item in response.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        names.append(str(item.get("name") or ""))
+    return names
+
+
 class ConsoleChatStreamAdapter:
     def __init__(
         self,
@@ -67,6 +85,22 @@ class ConsoleChatStreamAdapter:
         )
         self._prompt_tool_calls_seen = False
         self._prompt_content_emitted = False
+
+    def _log_tool_result(self, *, stream: bool) -> None:
+        tool_names = [
+            _tool_call_name(self.tool_calls[index])
+            for index in sorted(self.tool_calls)
+        ]
+        logger.info(
+            "Console chat tool call result: model={}, stream={}, has_tool_calls={}, "
+            "tool_call_count={}, names={}, finish_reason={}",
+            self.model,
+            stream,
+            bool(tool_names),
+            len(tool_names),
+            tool_names,
+            self.finish_reason or "stop",
+        )
 
     def _handle_prompt_tool_stream(self, chunk: str) -> List[tuple[str, Any]]:
         if not chunk:
@@ -99,6 +133,12 @@ class ConsoleChatStreamAdapter:
         }
         self.tool_calls[index] = indexed
         self.finish_reason = "tool_calls"
+        logger.info(
+            "Console chat prompt tool call detected: model={}, index={}, name={}",
+            self.model,
+            index,
+            _tool_call_name(indexed),
+        )
         return [
             _sse_chat_chunk(
                 self.response_id,
@@ -187,6 +227,12 @@ class ConsoleChatStreamAdapter:
                 "type": "function",
                 "function": {"name": event.data.get("name") or "", "arguments": ""},
             }
+            logger.info(
+                "Console chat native tool call started: model={}, index={}, name={}",
+                self.model,
+                index,
+                self.tool_calls[index]["function"]["name"],
+            )
             out.append(
                 _sse_chat_chunk(
                     self.response_id,
@@ -265,6 +311,12 @@ class ConsoleChatStreamAdapter:
                         },
                     }
                     self.finish_reason = "tool_calls"
+                    logger.info(
+                        "Console chat completed response contains tool call: model={}, index={}, name={}",
+                        self.model,
+                        index,
+                        self.tool_calls[index]["function"]["name"],
+                    )
 
         return out
 
@@ -285,6 +337,7 @@ class ConsoleChatStreamAdapter:
                     )
         if self.tool_calls and self.finish_reason != "tool_calls":
             self.finish_reason = "tool_calls"
+        self._log_tool_result(stream=True)
         out.append(
             _sse_chat_chunk(
                 self.response_id,
@@ -310,6 +363,12 @@ class ConsoleChatStreamAdapter:
                             "type": "function",
                             "function": dict(tool_call.get("function") or {}),
                         }
+                        logger.info(
+                            "Console chat non-stream prompt tool call parsed: model={}, index={}, name={}",
+                            self.model,
+                            i,
+                            _tool_call_name(self.tool_calls[i]),
+                        )
                     self.finish_reason = "tool_calls"
         message: Dict[str, Any] = {
             "role": "assistant",
@@ -322,6 +381,7 @@ class ConsoleChatStreamAdapter:
         tool_list = [self.tool_calls[i] for i in sorted(self.tool_calls)]
         if tool_list:
             message["tool_calls"] = tool_list
+        self._log_tool_result(stream=False)
         return {
             "id": self.response_id,
             "object": "chat.completion",
@@ -390,6 +450,15 @@ class ConsoleResponsesPassthroughAdapter:
     def _finalize(self, data: Dict[str, Any]) -> str:
         if data.get("type") == "response.completed":
             self.completed_response = data
+            tool_names = _response_tool_call_names(data.get("response"))
+            logger.info(
+                "Console responses tool call result: model={}, has_tool_calls={}, "
+                "tool_call_count={}, names={}",
+                self.model_id,
+                bool(tool_names),
+                len(tool_names),
+                tool_names,
+            )
         return self._data_line(data)
 
     def _remember_response_id(self, data: Dict[str, Any]) -> None:
@@ -468,6 +537,12 @@ class ConsoleResponsesPassthroughAdapter:
         record = self._make_tool_record(tool_call, preferred_output_index=preferred)
         self._prompt_tool_records.append(record)
         self._prompt_tool_mode = True
+        logger.info(
+            "Console responses prompt tool call detected: model={}, output_index={}, name={}",
+            self.model_id,
+            record["output_index"],
+            record["name"],
+        )
         response_id = self._ensure_response_id()
         chunks = [
             self._data_line(
@@ -645,6 +720,12 @@ class ConsoleResponsesPassthroughAdapter:
                 continue
             transformed = True
             self._prompt_tool_mode = True
+            logger.info(
+                "Console responses completed message has prompt tool calls: model={}, count={}, names={}",
+                self.model_id,
+                len(tool_calls),
+                [_tool_call_name(tool_call) for tool_call in tool_calls],
+            )
             if text_content:
                 new_output.append(self._message_with_text(item, text_content))
             for record in self._records_for_tool_calls(tool_calls):
