@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from grok2api.core.exceptions import UpstreamException
+from grok2api.services.grok.services import console_channel as console_channel_module
 from grok2api.services.grok.services.console_channel import _response_format_to_text_format
 from grok2api.services.grok.services.console_capabilities import (
     CAP_GROK_43,
@@ -203,6 +204,76 @@ async def test_console_responses_stream_fallback_retries_before_first_event(monk
         {"passthrough_items": True, "strip_encrypted": False},
         {"passthrough_items": True, "strip_encrypted": True},
     ]
+
+
+@pytest.mark.asyncio
+async def test_stream_upstream_does_not_double_close_returned_stream(monkeypatch):
+    sessions: list[object] = []
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.close_count = 0
+            sessions.append(self)
+
+        async def close(self) -> None:
+            self.close_count += 1
+
+    async def fake_request(session, token, payload, *, stream):
+        async def gen():
+            try:
+                yield "line-1"
+            finally:
+                await session.close()
+
+        return gen()
+
+    monkeypatch.setattr(console_channel_module, "AsyncSession", FakeSession)
+    monkeypatch.setattr(
+        console_channel_module.ConsoleResponsesReverse,
+        "request",
+        fake_request,
+    )
+
+    chunks: list[str] = []
+    async for chunk in ConsoleChannelService._stream_upstream({"input": []}, token="token"):
+        chunks.append(chunk)
+
+    assert chunks == ["line-1"]
+    assert len(sessions) == 1
+    assert sessions[0].close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_upstream_closes_session_when_request_fails(monkeypatch):
+    sessions: list[object] = []
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.close_count = 0
+            sessions.append(self)
+
+        async def close(self) -> None:
+            self.close_count += 1
+
+    async def fake_request(session, token, payload, *, stream):
+        raise UpstreamException(
+            message="request failed before stream iterator",
+            details={"status": 400},
+        )
+
+    monkeypatch.setattr(console_channel_module, "AsyncSession", FakeSession)
+    monkeypatch.setattr(
+        console_channel_module.ConsoleResponsesReverse,
+        "request",
+        fake_request,
+    )
+
+    with pytest.raises(UpstreamException):
+        async for _ in ConsoleChannelService._stream_upstream({"input": []}, token="token"):
+            pass
+
+    assert len(sessions) == 1
+    assert sessions[0].close_count == 1
 
 
 def test_detect_console_responses_client_mode_grok_first():

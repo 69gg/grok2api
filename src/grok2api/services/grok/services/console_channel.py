@@ -171,10 +171,11 @@ class ConsoleChannelService:
                 payload,
                 stream=True,
             )
-            async for line in line_iter:
-                yield line
-        finally:
+        except Exception:
             await session.close()
+            raise
+        async for line in line_iter:
+            yield line
 
     @staticmethod
     async def _execute_with_token(
