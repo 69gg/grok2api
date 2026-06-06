@@ -8,6 +8,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 from grok2api.services.grok.services.console_input import (
     ConsoleInputBuilder,
     drop_compaction_blobs_from_payload,
+    prompt_tool_history_items,
 )
 
 import orjson
@@ -435,6 +436,15 @@ class ConsoleChannelService:
         else:
             strategies = CONSOLE_RESPONSES_FALLBACK_STRATEGIES
 
+        _, _, response_prompt_tools, _ = _resolve_console_tooling(
+            caps=caps,
+            tools=tools,
+            console_search=bool(model_info.console_search),
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            instructions=None,
+        )
+
         def build_for_strategy(
             passthrough_items: bool,
             strip_encrypted: bool,
@@ -453,6 +463,8 @@ class ConsoleChannelService:
                     parallel_tool_calls=parallel_tool_calls,
                     instructions=instr,
                 )
+                if response_prompt_tools:
+                    input_items = prompt_tool_history_items(input_items)
                 payload = ConsoleInputBuilder.build_payload(
                     console_model=model_info.console_model or model,
                     caps=caps,
@@ -497,14 +509,24 @@ class ConsoleChannelService:
 
         if stream_flag:
             async def resp_stream():
-                adapter = ConsoleResponsesPassthroughAdapter(model)
+                adapter = ConsoleResponsesPassthroughAdapter(
+                    model,
+                    prompt_tools=response_prompt_tools,
+                    tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
+                )
                 async for line in result:
                     out = adapter.ingest_raw_line(line)
                     if out:
                         yield out
             return resp_stream()
 
-        adapter = ConsoleResponsesPassthroughAdapter(model)
+        adapter = ConsoleResponsesPassthroughAdapter(
+            model,
+            prompt_tools=response_prompt_tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+        )
         for line in result:
             adapter.ingest_raw_line(line)
         if adapter.completed_response:
@@ -611,6 +633,8 @@ class ConsoleChannelService:
             parallel_tool_calls=True,
             instructions=instr,
         )
+        if prompt_tools:
+            input_items = prompt_tool_history_items(input_items)
 
         async def build(_token: str) -> Dict[str, Any]:
             payload = ConsoleInputBuilder.build_payload(

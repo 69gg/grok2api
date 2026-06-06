@@ -407,6 +407,7 @@ def parse_tool_calls(
 def format_tool_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert tool-related message history into a text form Grok can consume."""
     result = []
+    tool_names_by_call_id: Dict[str, str] = {}
     for msg in messages:
         role = msg.get("role", "")
         content = msg.get("content")
@@ -422,6 +423,9 @@ def format_tool_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 function = tool_call.get("function", {}) or {}
                 tc_name = function.get("name", "")
                 tc_args = function.get("arguments", "{}")
+                tc_id = tool_call.get("id")
+                if isinstance(tc_id, str) and tc_id and isinstance(tc_name, str) and tc_name:
+                    tool_names_by_call_id[tc_id] = tc_name
                 if not isinstance(tc_args, str):
                     tc_args = json.dumps(tc_args, ensure_ascii=False)
                 parts.append("\n".join([CALL_START_TAG, tc_name, tc_args.strip(), CALL_END_TAG]))
@@ -429,7 +433,7 @@ def format_tool_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         if role == "tool":
-            tool_name = name or "unknown"
+            tool_name = name or tool_names_by_call_id.get(str(tool_call_id or ""), "unknown")
             call_id = tool_call_id or ""
             if isinstance(content, str):
                 content_str = content

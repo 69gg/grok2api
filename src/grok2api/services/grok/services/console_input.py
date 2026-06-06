@@ -14,7 +14,11 @@ from grok2api.services.grok.services.console_capabilities import (
     normalize_reasoning_effort,
     should_include_encrypted,
 )
-from grok2api.services.grok.utils.tool_call import normalize_function_tool
+from grok2api.services.grok.utils.tool_call import (
+    CALL_END_TAG,
+    CALL_START_TAG,
+    normalize_function_tool,
+)
 from grok2api.services.reverse.console_constants import CONSOLE_ALLOWED_INCLUDE
 
 _ENCRYPTED_RE = re.compile(r"^[A-Za-z0-9+/=_-]{80,}$")
@@ -128,6 +132,76 @@ def _normalize_function_call_item(item: Dict[str, Any]) -> Dict[str, Any]:
     if item_id.startswith("fc_"):
         normalized["id"] = item_id
     return normalized
+
+
+def _stringify_tool_payload(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return orjson.dumps(value).decode()
+
+
+def _prompt_assistant_tool_call_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    arguments = _stringify_tool_payload(item.get("arguments") or "{}").strip() or "{}"
+    name = str(item.get("name") or "").strip()
+    return {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": "\n".join([CALL_START_TAG, name, arguments, CALL_END_TAG]),
+            }
+        ],
+    }
+
+
+def _prompt_user_tool_output_item(
+    item: Dict[str, Any],
+    *,
+    tool_names_by_call_id: Dict[str, str],
+) -> Dict[str, Any]:
+    call_id = str(item.get("call_id") or item.get("tool_call_id") or item.get("id") or "")
+    tool_name = str(item.get("name") or tool_names_by_call_id.get(call_id, "unknown"))
+    output = _stringify_tool_payload(item.get("output") or item.get("content") or "")
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": f"tool ({tool_name}, {call_id}): {output}",
+            }
+        ],
+    }
+
+
+def prompt_tool_history_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert Responses function-call replay items into prompt-visible history."""
+    converted: List[Dict[str, Any]] = []
+    tool_names_by_call_id: Dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            converted.append(item)
+            continue
+        item_type = item.get("type")
+        if item_type == "function_call":
+            call_id = str(item.get("call_id") or item.get("id") or "")
+            name = str(item.get("name") or "").strip()
+            if call_id and name:
+                tool_names_by_call_id[call_id] = name
+            converted.append(_prompt_assistant_tool_call_item(item))
+            continue
+        if item_type in {"function_call_output", "tool_call_output", "tool_output"}:
+            converted.append(
+                _prompt_user_tool_output_item(
+                    item,
+                    tool_names_by_call_id=tool_names_by_call_id,
+                )
+            )
+            continue
+        converted.append(item)
+    return converted
 
 
 def _passthrough_replay_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -341,6 +415,16 @@ class ConsoleInputBuilder:
                 content = item.get("content")
                 if isinstance(content, str) and content.strip():
                     instructions_parts.append(content.strip())
+                continue
+
+            if role == "tool":
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": item.get("tool_call_id") or item.get("call_id") or item.get("id"),
+                        "output": item.get("output") or item.get("content") or "",
+                    }
+                )
                 continue
 
             if (
@@ -686,4 +770,9 @@ class ConsoleInputBuilder:
         return payload
 
 
-__all__ = ["ConsoleInputBuilder", "drop_compaction_blobs_from_payload", "is_encrypted_reasoning"]
+__all__ = [
+    "ConsoleInputBuilder",
+    "drop_compaction_blobs_from_payload",
+    "is_encrypted_reasoning",
+    "prompt_tool_history_items",
+]

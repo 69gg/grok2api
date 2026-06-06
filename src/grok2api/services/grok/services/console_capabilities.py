@@ -192,7 +192,11 @@ def prepare_console_tooling(
     merged_instructions = instructions
 
     if normalized and tool_choice != "none":
-        tool_prompt = build_tool_prompt(normalized, tool_choice, parallel_tool_calls)
+        tool_prompt = build_tool_prompt(
+            normalized,
+            tool_choice,
+            True if parallel_tool_calls is None else parallel_tool_calls,
+        )
         if tool_prompt:
             prompt_tools = normalized
             merged_instructions = (

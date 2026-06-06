@@ -12,7 +12,6 @@ from grok2api.services.grok.services.console_capabilities import (
     normalize_reasoning_effort,
     prepare_console_tooling,
     should_include_encrypted,
-    should_passthrough_responses_input,
     detect_console_responses_client_mode,
 )
 from grok2api.services.grok.services.console_channel import (
@@ -22,8 +21,12 @@ from grok2api.services.grok.services.console_input import (
     ConsoleInputBuilder,
     drop_compaction_blobs_from_payload,
     is_encrypted_reasoning,
+    prompt_tool_history_items,
 )
-from grok2api.services.grok.services.console_output_adapters import ConsoleChatStreamAdapter
+from grok2api.services.grok.services.console_output_adapters import (
+    ConsoleChatStreamAdapter,
+    ConsoleResponsesPassthroughAdapter,
+)
 from grok2api.services.grok.services.console_stream_parser import (
     ConsoleEvent,
     ConsoleEventType,
@@ -915,3 +918,136 @@ def test_chat_adapter_prompt_tool_call_non_stream():
     message = response["choices"][0]["message"]
     assert message["tool_calls"][0]["function"]["name"] == "ping"
     assert message.get("content") in (None, "")
+
+
+def test_responses_prompt_tool_history_items_for_multi_agent_replay():
+    items = prompt_tool_history_items(
+        [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": '{"q":"Paris"}',
+            },
+            {"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
+        ]
+    )
+    assert items[0]["type"] == "message"
+    assert "<call>\nlookup\n" in items[0]["content"][0]["text"]
+    assert items[1]["role"] == "user"
+    assert "tool (lookup, call_1): sunny" == items[1]["content"][0]["text"]
+
+
+def test_anthropic_tool_history_items_for_multi_agent_replay():
+    _, raw_items, _ = ConsoleInputBuilder.from_anthropic_raw_messages(
+        [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"q": "Paris"}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "sunny"}
+                ],
+            },
+        ]
+    )
+    items = prompt_tool_history_items(raw_items)
+    assert items[0]["type"] == "message"
+    assert "<call>\nlookup\n" in items[0]["content"][0]["text"]
+    assert items[1]["role"] == "user"
+    assert items[1]["content"][0]["text"] == "tool (lookup, call_1): sunny"
+
+
+def test_responses_prompt_tool_call_non_stream_transforms_output():
+    import orjson
+
+    tools = [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+    adapter = ConsoleResponsesPassthroughAdapter(
+        "grok-4.20-multi-agent-0309",
+        prompt_tools=tools,
+        tool_choice="required",
+    )
+    completed = adapter.ingest_raw_line(
+        'data: {"type":"response.completed","response":{"id":"resp_1","output":['
+        '{"type":"message","id":"msg_1","role":"assistant","content":['
+        '{"type":"output_text","text":"<call>\\nlookup\\n{\\"q\\":\\"Paris\\"}\\n</call>"}]}]}}'
+    )
+    assert completed is not None
+    response = adapter.completed_response["response"]
+    assert response["model"] == "grok-4.20-multi-agent-0309"
+    assert response["tool_choice"] == "required"
+    assert response["tools"] == tools
+    assert response["output"][0]["type"] == "function_call"
+    assert response["output"][0]["name"] == "lookup"
+    assert orjson.loads(response["output"][0]["arguments"]) == {"q": "Paris"}
+
+
+def test_responses_prompt_tool_call_stream_transforms_split_delta():
+    tools = [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+    adapter = ConsoleResponsesPassthroughAdapter(
+        "grok-4.20-multi-agent-0309-search",
+        prompt_tools=tools,
+    )
+    assert adapter.ingest_raw_line(
+        'data: {"type":"response.output_item.added","response_id":"resp_1",'
+        '"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}'
+    ) is None
+    assert adapter.ingest_raw_line(
+        'data: {"type":"response.content_part.added","response_id":"resp_1",'
+        '"item_id":"msg_1","output_index":0,"content_index":0,'
+        '"part":{"type":"output_text","text":"","annotations":[]}}'
+    ) is None
+    assert adapter.ingest_raw_line(
+        'data: {"type":"response.output_text.delta","response_id":"resp_1",'
+        '"item_id":"msg_1","output_index":0,"content_index":0,"delta":"<ca"}'
+    ) is None
+    transformed = adapter.ingest_raw_line(
+        'data: {"type":"response.output_text.delta","response_id":"resp_1",'
+        '"item_id":"msg_1","output_index":0,"content_index":0,'
+        '"delta":"ll>\\nlookup\\n{\\"q\\":\\"Paris\\"}\\n</call>"}'
+    )
+    assert transformed is not None
+    assert "<call>" not in transformed
+    assert '"type":"function_call"' in transformed
+    assert '"type":"response.function_call_arguments.delta"' in transformed
+    assert '"call_id":"' in transformed
+    assert '"name":"lookup"' in transformed
+
+    assert adapter.ingest_raw_line(
+        'data: {"type":"response.output_text.done","response_id":"resp_1",'
+        '"item_id":"msg_1","output_index":0,"content_index":0,'
+        '"text":"<call>\\nlookup\\n{\\"q\\":\\"Paris\\"}\\n</call>"}'
+    ) is None
+    completed = adapter.ingest_raw_line(
+        'data: {"type":"response.completed","response":{"id":"resp_1","output":['
+        '{"type":"message","id":"msg_1","role":"assistant","content":['
+        '{"type":"output_text","text":"<call>\\nlookup\\n{\\"q\\":\\"Paris\\"}\\n</call>"}]}]}}'
+    )
+    assert completed is not None
+    output = adapter.completed_response["response"]["output"]
+    assert output[0]["type"] == "function_call"
+    assert output[0]["call_id"] in transformed
+
+
+def test_responses_prompt_tool_call_stream_passes_normal_text():
+    tools = [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+    adapter = ConsoleResponsesPassthroughAdapter(
+        "grok-4.20-multi-agent-0309",
+        prompt_tools=tools,
+    )
+    assert adapter.ingest_raw_line(
+        'data: {"type":"response.output_item.added","response_id":"resp_1",'
+        '"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}'
+    ) is None
+    passed = adapter.ingest_raw_line(
+        'data: {"type":"response.output_text.delta","response_id":"resp_1",'
+        '"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hello"}'
+    )
+    assert passed is not None
+    assert '"type":"response.output_item.added"' in passed
+    assert '"delta":"Hello"' in passed
+    assert '"type":"function_call"' not in passed

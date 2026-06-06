@@ -123,7 +123,7 @@ Responses API 可直接传 `input_image`：
 ### 与 grok.com 通道的区别
 
 - 除 `grok-4.20-multi-agent-0309` 外，Console 模型走 **xAI Responses API 原生 tool call**。
-- `grok-4.20-multi-agent-0309`（含 `-search` 变体）走 **prompt tool call**：客户端 function tools 写入 `instructions`（与 grok.com 相同的 `<call>` 协议），响应由网关解析为 OpenAI `tool_calls`；无 tools 时不注入 tool prompt。
+- `grok-4.20-multi-agent-0309`（含 `-search` 变体）走 **prompt tool call**：客户端 function tools 写入 `instructions`（与 grok.com 相同的 `<call>` 协议），响应由网关解析为 OpenAI `tool_calls` / Responses `function_call`；无 tools 时不注入 tool prompt。
 - `-search` 变体在 prompt tool call 之外，额外向上游注入 `web_search` / `x_search` 开启内置搜索；**不会**因此改用原生 function calling。
 - Token 用量来自上游 `response.completed.usage`，不是本地估算。
 
@@ -135,8 +135,9 @@ Responses API 可直接传 `input_image`：
 | `grok-4.20-multi-agent-0309` | prompt → `instructions`（`<call>` 协议） | 无 |
 | `grok-4.20-multi-agent-0309-search` | 同上 prompt tool call | 额外注入 `web_search` / `x_search` |
 
-- multi-agent 多轮 tool loop：历史中的 `tool` / `tool_calls` 消息会转换为 prompt 可读文本后再 replay。
+- multi-agent 多轮 tool loop：历史中的 Chat `tool` / `tool_calls` 消息、Responses `function_call` / `function_call_output` item，以及 Anthropic `tool_use` / `tool_result` block，会转换为 prompt 可读文本后再 replay。
 - multi-agent prompt 模式下，客户端 function 的 `tool_choice` **不会**转发到上游（避免与仅含 search tools 的 payload 冲突）。
+- `/v1/responses` 的 multi-agent prompt 模式会拦截 `<call>` 文本输出并转换为标准 `response.output_item.added`、`response.function_call_arguments.delta/done`、`response.output_item.done` 与最终 `output[].function_call`；普通文本、reasoning、搜索相关事件仍按 Responses SSE/JSON 转发。
 
 ### 图片输入（Console）
 
@@ -150,7 +151,7 @@ Playground 五个模型均支持 Image input。网关行为见上文 **图片输
 
 1. Playground 上游默认 `store=false`，**不要依赖** `previous_response_id`；无状态多轮应携带 **完整 `input[]` history**（reasoning / function_call / function_call_output / message items）。
 2. **接口与 CoT 形态**（Console 模型）：
-   - **`POST /v1/responses`**（仅 Console 模型）：上游 SSE/JSON 原样转发；**失败回退**（仍打 console.x.ai）：
+   - **`POST /v1/responses`**（仅 Console 模型）：默认上游 SSE/JSON 原样转发；multi-agent prompt tool call 会做 `<call>` → Responses `function_call` 的兼容转换；**失败回退**（仍打 console.x.ai）：
      1. Grok 原样 `input[]` 透传
      2. 剔除 `encrypted_content` / compaction 后再试
      3. OpenAI Responses 形态规范化 `input[]` 后再试（保留加密 → 剔除加密）

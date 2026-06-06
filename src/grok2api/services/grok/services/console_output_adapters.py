@@ -339,11 +339,35 @@ class ConsoleChatStreamAdapter:
 
 
 class ConsoleResponsesPassthroughAdapter:
-    """Forward upstream Responses SSE/JSON; only rewrite the exposed model alias."""
+    """Forward upstream Responses SSE/JSON and optionally parse prompt tool calls."""
 
-    def __init__(self, model_id: str) -> None:
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        prompt_tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: Optional[bool] = None,
+    ) -> None:
         self.model_id = model_id
         self.completed_response: Optional[Dict[str, Any]] = None
+        self._prompt_tools = prompt_tools
+        self._tool_choice = tool_choice
+        self._parallel_tool_calls = parallel_tool_calls
+        self._prompt_parser = (
+            ToolCallStreamParser(prompt_tools)
+            if prompt_tools and tool_choice != "none"
+            else None
+        )
+        self._pending_text_lines: List[str] = []
+        self._prompt_tool_records: List[Dict[str, Any]] = []
+        self._prompt_tool_mode = False
+        self._prompt_text_mode = False
+        self._response_id: Optional[str] = None
+        self._pending_message_item_id: Optional[str] = None
+        self._pending_message_output_index: Optional[int] = None
+        self._used_output_indexes: set[int] = set()
+        self._max_output_index = -1
 
     def _apply_model_alias(self, data: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(data)
@@ -355,10 +379,378 @@ class ConsoleResponsesPassthroughAdapter:
             data["model"] = self.model_id
         return data
 
+    @staticmethod
+    def _line(line: str) -> str:
+        return line if line.endswith("\n") else line + "\n"
+
+    @staticmethod
+    def _data_line(data: Dict[str, Any]) -> str:
+        return f"data: {orjson.dumps(data).decode()}\n\n"
+
     def _finalize(self, data: Dict[str, Any]) -> str:
         if data.get("type") == "response.completed":
             self.completed_response = data
-        return f"data: {orjson.dumps(data).decode()}\n\n"
+        return self._data_line(data)
+
+    def _remember_response_id(self, data: Dict[str, Any]) -> None:
+        response_id = data.get("response_id")
+        if isinstance(response_id, str) and response_id:
+            self._response_id = response_id
+        response = data.get("response")
+        if isinstance(response, dict):
+            response_id = response.get("id")
+            if isinstance(response_id, str) and response_id:
+                self._response_id = response_id
+
+    def _ensure_response_id(self) -> str:
+        if not self._response_id:
+            self._response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        return self._response_id
+
+    def _remember_output_index(self, data: Dict[str, Any]) -> None:
+        output_index = data.get("output_index")
+        if isinstance(output_index, int):
+            self._max_output_index = max(self._max_output_index, output_index)
+            self._used_output_indexes.add(output_index)
+
+    def _preferred_tool_output_index(self) -> Optional[int]:
+        output_index = self._pending_message_output_index
+        if output_index is None:
+            return None
+        self._used_output_indexes.discard(output_index)
+        return output_index
+
+    def _allocate_tool_output_index(self, preferred: Optional[int] = None) -> int:
+        if preferred is not None and preferred not in self._used_output_indexes:
+            self._used_output_indexes.add(preferred)
+            self._max_output_index = max(self._max_output_index, preferred)
+            return preferred
+        output_index = self._max_output_index + 1
+        while output_index in self._used_output_indexes:
+            output_index += 1
+        self._used_output_indexes.add(output_index)
+        self._max_output_index = max(self._max_output_index, output_index)
+        return output_index
+
+    @staticmethod
+    def _function_call_item(record: Dict[str, Any], *, status: str) -> Dict[str, Any]:
+        return {
+            "id": record["item_id"],
+            "type": "function_call",
+            "status": status,
+            "call_id": record["call_id"],
+            "name": record["name"],
+            "arguments": record["arguments"],
+        }
+
+    def _make_tool_record(
+        self,
+        tool_call: Dict[str, Any],
+        *,
+        preferred_output_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        fn = tool_call.get("function") or {}
+        arguments = fn.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = orjson.dumps(arguments or {}).decode()
+        call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+        name = fn.get("name") or ""
+        return {
+            "item_id": f"fc_{uuid.uuid4().hex[:24]}",
+            "output_index": self._allocate_tool_output_index(preferred_output_index),
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        }
+
+    def _emit_tool_call(self, tool_call: Dict[str, Any]) -> str:
+        preferred = self._preferred_tool_output_index() if not self._prompt_tool_records else None
+        record = self._make_tool_record(tool_call, preferred_output_index=preferred)
+        self._prompt_tool_records.append(record)
+        self._prompt_tool_mode = True
+        response_id = self._ensure_response_id()
+        chunks = [
+            self._data_line(
+                {
+                    "type": "response.output_item.added",
+                    "response_id": response_id,
+                    "output_index": record["output_index"],
+                    "item": self._function_call_item(record, status="in_progress"),
+                }
+            )
+        ]
+        if record["arguments"]:
+            chunks.append(
+                self._data_line(
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "response_id": response_id,
+                        "item_id": record["item_id"],
+                        "output_index": record["output_index"],
+                        "call_id": record["call_id"],
+                        "delta": record["arguments"],
+                    }
+                )
+            )
+        chunks.extend(
+            [
+                self._data_line(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "response_id": response_id,
+                        "item_id": record["item_id"],
+                        "output_index": record["output_index"],
+                        "call_id": record["call_id"],
+                        "name": record["name"],
+                        "arguments": record["arguments"],
+                    }
+                ),
+                self._data_line(
+                    {
+                        "type": "response.output_item.done",
+                        "response_id": response_id,
+                        "output_index": record["output_index"],
+                        "item": self._function_call_item(record, status="completed"),
+                    }
+                ),
+            ]
+        )
+        return "".join(chunks)
+
+    def _flush_pending_text(self) -> str:
+        out = "".join(self._pending_text_lines)
+        self._pending_text_lines = []
+        return out
+
+    def _discard_pending_text(self) -> None:
+        self._pending_text_lines = []
+
+    def _handle_prompt_parser_events(
+        self,
+        events: List[tuple[str, Any]],
+        *,
+        final: bool = False,
+    ) -> Optional[str]:
+        out: List[str] = []
+        for kind, payload in events:
+            if kind == "tool" and isinstance(payload, dict):
+                self._discard_pending_text()
+                out.append(self._emit_tool_call(payload))
+                continue
+            if kind != "text" or not isinstance(payload, str):
+                continue
+            if self._prompt_tool_mode:
+                if payload.strip():
+                    continue
+                continue
+            if payload.strip() or final:
+                self._prompt_text_mode = True
+                out.append(self._flush_pending_text())
+        if out:
+            return "".join(out)
+        return None
+
+    def _flush_prompt_parser(self) -> Optional[str]:
+        if not self._prompt_parser:
+            return None
+        return self._handle_prompt_parser_events(self._prompt_parser.flush(), final=True)
+
+    def _queue_text_event(self, data: Dict[str, Any]) -> None:
+        self._pending_text_lines.append(self._data_line(data))
+
+    def _is_pending_message_event(self, data: Dict[str, Any]) -> bool:
+        item_id = data.get("item_id")
+        if isinstance(item_id, str) and item_id and item_id == self._pending_message_item_id:
+            return True
+        output_index = data.get("output_index")
+        return (
+            isinstance(output_index, int)
+            and self._pending_message_output_index is not None
+            and output_index == self._pending_message_output_index
+        )
+
+    @staticmethod
+    def _message_text(item: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for block in item.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in {"output_text", "text"}:
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+
+    @staticmethod
+    def _message_with_text(item: Dict[str, Any], text: str) -> Dict[str, Any]:
+        cloned = dict(item)
+        cloned["content"] = [{"type": "output_text", "text": text, "annotations": []}]
+        return cloned
+
+    @staticmethod
+    def _merge_response_tools(
+        existing: Any,
+        prompt_tools: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for tool in (existing if isinstance(existing, list) else []) + list(prompt_tools or []):
+            if not isinstance(tool, dict):
+                continue
+            key = (str(tool.get("type") or ""), str(tool.get("name") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(tool)
+        return merged
+
+    def _records_for_tool_calls(
+        self,
+        tool_calls: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        for idx, tool_call in enumerate(tool_calls):
+            if idx < len(self._prompt_tool_records):
+                records.append(self._prompt_tool_records[idx])
+                continue
+            record = self._make_tool_record(tool_call)
+            self._prompt_tool_records.append(record)
+            records.append(record)
+        return records
+
+    def _transform_completed_response(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        if data.get("type") != "response.completed" or not self._prompt_parser:
+            return data
+
+        response = data.get("response")
+        if not isinstance(response, dict):
+            return data
+
+        response = dict(response)
+        output = response.get("output")
+        if not isinstance(output, list):
+            output = []
+
+        new_output: List[Dict[str, Any]] = []
+        transformed = False
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                if isinstance(item, dict):
+                    new_output.append(item)
+                continue
+            text = self._message_text(item)
+            text_content, tool_calls = parse_tool_calls(text, self._prompt_tools)
+            if not tool_calls:
+                new_output.append(item)
+                continue
+            transformed = True
+            self._prompt_tool_mode = True
+            if text_content:
+                new_output.append(self._message_with_text(item, text_content))
+            for record in self._records_for_tool_calls(tool_calls):
+                new_output.append(self._function_call_item(record, status="completed"))
+
+        if transformed or self._prompt_tool_records:
+            if self._prompt_tool_records and not transformed:
+                new_output.extend(
+                    self._function_call_item(record, status="completed")
+                    for record in self._prompt_tool_records
+                )
+            response["output"] = new_output or [
+                self._function_call_item(record, status="completed")
+                for record in self._prompt_tool_records
+            ]
+            response["tools"] = self._merge_response_tools(
+                response.get("tools"),
+                self._prompt_tools,
+            )
+            if self._tool_choice is not None:
+                response["tool_choice"] = self._tool_choice
+            if self._parallel_tool_calls is not None:
+                response["parallel_tool_calls"] = self._parallel_tool_calls
+
+        updated = dict(data)
+        updated["response"] = response
+        return updated
+
+    def _ingest_prompt_data(self, data: Dict[str, Any]) -> Optional[str]:
+        event_type = data.get("type")
+        self._remember_response_id(data)
+        self._remember_output_index(data)
+
+        if event_type == "response.output_item.added":
+            item = data.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "message":
+                self._pending_message_item_id = item.get("id")
+                output_index = data.get("output_index")
+                self._pending_message_output_index = output_index if isinstance(output_index, int) else None
+                if self._prompt_tool_mode:
+                    return None
+                if self._prompt_text_mode:
+                    return self._finalize(data)
+                self._queue_text_event(data)
+                return None
+            return self._finalize(data)
+
+        if event_type == "response.content_part.added" and self._is_pending_message_event(data):
+            if self._prompt_tool_mode:
+                return None
+            if self._prompt_text_mode:
+                return self._finalize(data)
+            self._queue_text_event(data)
+            return None
+
+        if event_type == "response.output_text.delta":
+            if self._prompt_tool_mode:
+                delta = data.get("delta") or ""
+                if isinstance(delta, str) and self._prompt_parser:
+                    return self._handle_prompt_parser_events(
+                        self._prompt_parser.feed(delta),
+                    )
+                return None
+            if self._prompt_text_mode:
+                return self._finalize(data)
+            self._queue_text_event(data)
+            delta = data.get("delta") or ""
+            if isinstance(delta, str) and self._prompt_parser:
+                return self._handle_prompt_parser_events(
+                    self._prompt_parser.feed(delta),
+                )
+            return None
+
+        if event_type in {
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+        } and self._is_pending_message_event(data):
+            if self._prompt_tool_mode:
+                return self._flush_prompt_parser()
+            if self._prompt_text_mode:
+                return self._finalize(data)
+            self._queue_text_event(data)
+            flushed = self._flush_prompt_parser()
+            if flushed:
+                return flushed
+            self._prompt_text_mode = True
+            return self._flush_pending_text()
+
+        if event_type == "response.completed":
+            flushed = None
+            if not self._prompt_text_mode:
+                flushed = self._flush_prompt_parser()
+            if not flushed and not self._prompt_tool_mode and self._pending_text_lines:
+                flushed = self._flush_pending_text()
+            transformed = self._transform_completed_response(data)
+            finalized = self._finalize(transformed)
+            return f"{flushed or ''}{finalized}"
+
+        return self._finalize(data)
+
+    def _ingest_data(self, data: Dict[str, Any]) -> Optional[str]:
+        data = self._apply_model_alias(data)
+        if not self._prompt_parser:
+            return self._finalize(data)
+        return self._ingest_prompt_data(data)
 
     def ingest_raw_line(self, line: str | bytes) -> Optional[str]:
         if isinstance(line, bytes):
@@ -368,23 +760,23 @@ class ConsoleResponsesPassthroughAdapter:
             try:
                 data = orjson.loads(stripped)
             except orjson.JSONDecodeError:
-                return line if line.endswith("\n") else line + "\n"
+                return self._line(line)
             if isinstance(data, dict) and data.get("object") == "response":
                 data = {"type": "response.completed", "response": data}
             if isinstance(data, dict):
-                return self._finalize(self._apply_model_alias(data))
+                return self._ingest_data(data)
         if not stripped.startswith("data:"):
-            return line if line.endswith("\n") else line + "\n"
+            return self._line(line)
         payload_text = stripped[5:].strip()
         if not payload_text or payload_text == "[DONE]":
-            return line if line.endswith("\n") else line + "\n"
+            return self._line(line)
         try:
             data = orjson.loads(payload_text)
         except orjson.JSONDecodeError:
-            return line if line.endswith("\n") else line + "\n"
+            return self._line(line)
         if isinstance(data, dict):
-            return self._finalize(self._apply_model_alias(data))
-        return line if line.endswith("\n") else line + "\n"
+            return self._ingest_data(data)
+        return self._line(line)
 
 
 # Back-compat alias

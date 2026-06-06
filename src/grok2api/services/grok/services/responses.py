@@ -853,6 +853,7 @@ class ResponseStreamAdapter:
                 "response_id": self.response_id,
                 "item_id": item["item_id"],
                 "output_index": item["output_index"],
+                "call_id": item["call_id"],
                 "delta": delta,
             },
         )
@@ -870,6 +871,8 @@ class ResponseStreamAdapter:
                         "response_id": self.response_id,
                         "item_id": item["item_id"],
                         "output_index": item["output_index"],
+                        "call_id": item["call_id"],
+                        "name": item.get("name"),
                         "arguments": item["arguments"],
                     },
                 )
@@ -991,6 +994,8 @@ class ResponsesService:
                 content = None
             reasoning_text = message.get("_grok2api_reasoning_text")
             if not isinstance(reasoning_text, str) or not reasoning_text:
+                reasoning_text = message.get("reasoning_content")
+            if not isinstance(reasoning_text, str) or not reasoning_text:
                 reasoning_text = None
             tool_calls = message.get("tool_calls")
             return _build_response_object(
@@ -1057,6 +1062,8 @@ class ResponsesService:
                         final_usage = to_responses_usage(data.get("usage"))
                     delta = (data.get("choices") or [{}])[0].get("delta") or {}
                     reasoning_delta = delta.get("_grok2api_reasoning")
+                    if not isinstance(reasoning_delta, str) or not reasoning_delta:
+                        reasoning_delta = delta.get("reasoning_content")
                     if isinstance(reasoning_delta, str) and reasoning_delta:
                         for event in adapter.ensure_reasoning_started():
                             yield event
