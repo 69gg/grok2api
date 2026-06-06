@@ -32,14 +32,20 @@ def _normalize_proxy(proxy_url: str) -> str:
     return proxy_url
 
 
-def _is_compaction_blob_decode_error(status_code: int, body: str) -> bool:
+def _is_encrypted_replay_decode_error(status_code: int, body: str) -> bool:
     if status_code != 400:
         return False
     lowered = body.lower()
     return (
         "could not decode the compaction blob" in lowered
         or "compact response" in lowered
+        or "could not decrypt the provided encrypted_content" in lowered
+        or "unmodified encrypted_content from a previous response" in lowered
     )
+
+
+def _is_compaction_blob_decode_error(status_code: int, body: str) -> bool:
+    return _is_encrypted_replay_decode_error(status_code, body)
 
 
 class ConsoleResponsesReverse:
@@ -110,17 +116,17 @@ class ConsoleResponsesReverse:
                 )
                 if (
                     not compaction_stripped
-                    and _is_compaction_blob_decode_error(response.status_code, content)
+                    and _is_encrypted_replay_decode_error(response.status_code, content)
                 ):
                     removed = drop_compaction_blobs_from_payload(payload)
                     if removed > 0:
                         compaction_stripped = True
                         logger.warning(
-                            f"ConsoleResponsesReverse: dropped {removed} encrypted/compaction blob(s), retrying request"
+                            f"ConsoleResponsesReverse: dropped {removed} encrypted replay blob(s), retrying request"
                         )
                         continue
                     logger.warning(
-                        "ConsoleResponsesReverse: compaction blob decode error but input has no encrypted replay blobs to drop"
+                        "ConsoleResponsesReverse: encrypted replay decode/decrypt error but input has no encrypted replay blobs to drop"
                     )
                 raise UpstreamException(
                     message=f"ConsoleResponsesReverse: request failed, {response.status_code}",

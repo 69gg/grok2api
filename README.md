@@ -155,6 +155,7 @@ Playground 五个模型均支持 Image input。网关行为见上文 **图片输
      1. Grok 原样 `input[]` 透传
      2. 剔除 `encrypted_content` / compaction 后再试
      3. OpenAI Responses 形态规范化 `input[]` 后再试（保留加密 → 剔除加密）
+     4. `stream=true` 同样适用上述回退；如果上游在首个 SSE 事件前报 `encrypted_content` 解密失败，会自动剥离 opaque replay blob 后重试。
    - **`POST /v1/chat/completions`**：兼容层——**encrypted 模型**优先 `delta.reasoning_content` = 上游 `encrypted_content` 原字节；**grok-4.3** 使用 `reasoning_summary_text.delta` 映射为 summary 流。
    - **`POST /v1/messages`**（Anthropic）：与 Chat 相同策略（`thinking` / `thinking_delta`）。
 3. **Reasoning 标准字段**（Responses）：

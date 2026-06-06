@@ -164,14 +164,17 @@ class ConsoleChannelService:
         token: str,
     ) -> AsyncIterator[str]:
         session = AsyncSession()
-        line_iter = await ConsoleResponsesReverse.request(
-            session,
-            token,
-            payload,
-            stream=True,
-        )
-        async for line in line_iter:
-            yield line
+        try:
+            line_iter = await ConsoleResponsesReverse.request(
+                session,
+                token,
+                payload,
+                stream=True,
+            )
+            async for line in line_iter:
+                yield line
+        finally:
+            await session.close()
 
     @staticmethod
     async def _execute_with_token(
@@ -358,6 +361,44 @@ class ConsoleChannelService:
         build_for_strategy: Callable[[bool, bool], Callable[[str], Awaitable[Dict[str, Any]]]],
         strategies: Tuple[Tuple[str, bool, bool], ...] = CONSOLE_RESPONSES_FALLBACK_STRATEGIES,
     ):
+        if stream:
+            async def gen():
+                last_error: Optional[UpstreamException] = None
+                for strategy_name, passthrough_items, strip_encrypted in strategies:
+                    logger.info(
+                        "Console responses: model={}, strategy={}, passthrough_items={}, strip_encrypted={}",
+                        model,
+                        strategy_name,
+                        passthrough_items,
+                        strip_encrypted,
+                    )
+                    build_fn = build_for_strategy(passthrough_items, strip_encrypted)
+                    emitted = False
+                    try:
+                        line_iter = await ConsoleChannelService._execute_with_token(
+                            model, build_fn, stream=True
+                        )
+                        async for line in line_iter:
+                            emitted = True
+                            yield line
+                        return
+                    except UpstreamException as exc:
+                        if emitted:
+                            raise
+                        last_error = exc
+                        status = (exc.details or {}).get("status")
+                        logger.warning(
+                            "Console responses stream strategy {} failed before first event (status={}), trying next",
+                            strategy_name,
+                            status,
+                        )
+                        continue
+                if last_error:
+                    raise last_error
+                raise no_token_error(model)
+
+            return gen()
+
         last_error: Optional[UpstreamException] = None
         for strategy_name, passthrough_items, strip_encrypted in strategies:
             try:

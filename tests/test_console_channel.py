@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from grok2api.core.exceptions import UpstreamException
 from grok2api.services.grok.services.console_channel import _response_format_to_text_format
 from grok2api.services.grok.services.console_capabilities import (
     CAP_GROK_43,
@@ -16,6 +19,7 @@ from grok2api.services.grok.services.console_capabilities import (
 )
 from grok2api.services.grok.services.console_channel import (
     CONSOLE_RESPONSES_FALLBACK_STRATEGIES,
+    ConsoleChannelService,
 )
 from grok2api.services.grok.services.console_input import (
     ConsoleInputBuilder,
@@ -141,6 +145,63 @@ def test_console_responses_fallback_strategy_order():
         "grok_passthrough_strip_encrypted",
         "openai_compat",
         "openai_compat_strip_encrypted",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_console_responses_stream_fallback_retries_before_first_event(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    async def fake_execute_with_token(model_id, build_payload_fn, *, stream):
+        payload = await build_payload_fn("token")
+        calls.append(payload)
+
+        async def fake_stream():
+            if len(calls) == 1:
+                raise UpstreamException(
+                    message="ConsoleResponsesReverse: request failed, 400",
+                    details={
+                        "status": 400,
+                        "body": "Could not decrypt the provided encrypted_content.",
+                    },
+                )
+            yield 'data: {"type":"response.completed","response":{"id":"resp_ok"}}\n\n'
+
+        return fake_stream()
+
+    monkeypatch.setattr(
+        ConsoleChannelService,
+        "_execute_with_token",
+        fake_execute_with_token,
+    )
+
+    def build_for_strategy(passthrough_items: bool, strip_encrypted: bool):
+        async def build(_token: str) -> dict[str, object]:
+            return {
+                "passthrough_items": passthrough_items,
+                "strip_encrypted": strip_encrypted,
+            }
+
+        return build
+
+    result = await ConsoleChannelService._execute_responses_with_fallback(
+        "grok-4.20-multi-agent-0309",
+        stream=True,
+        build_for_strategy=build_for_strategy,
+        strategies=(
+            ("first", True, False),
+            ("strip", True, True),
+        ),
+    )
+
+    chunks: list[str] = []
+    async for chunk in result:
+        chunks.append(chunk)
+
+    assert chunks == ['data: {"type":"response.completed","response":{"id":"resp_ok"}}\n\n']
+    assert calls == [
+        {"passthrough_items": True, "strip_encrypted": False},
+        {"passthrough_items": True, "strip_encrypted": True},
     ]
 
 
@@ -609,13 +670,22 @@ def test_drop_compaction_blobs_from_payload():
 
 
 def test_is_compaction_blob_decode_error():
-    from grok2api.services.reverse.console_responses import _is_compaction_blob_decode_error
+    from grok2api.services.reverse.console_responses import (
+        _is_compaction_blob_decode_error,
+        _is_encrypted_replay_decode_error,
+    )
 
     body = (
         '{"code":"Client specified an invalid argument","error":'
         '"Could not decode the compaction blob. Ensure it is unmodified from the compact response."}'
     )
+    decrypt_body = (
+        '{"code":"Client specified an invalid argument","error":'
+        '"Could not decrypt the provided encrypted_content. Ensure the value is the '
+        'unmodified encrypted_content from a previous response."}'
+    )
     assert _is_compaction_blob_decode_error(400, body) is True
+    assert _is_encrypted_replay_decode_error(400, decrypt_body) is True
     assert _is_compaction_blob_decode_error(401, body) is False
     assert _is_compaction_blob_decode_error(400, '{"error":"other"}') is False
 
