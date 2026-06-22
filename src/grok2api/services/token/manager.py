@@ -332,6 +332,13 @@ class TokenManager:
             if self._dirty:
                 self._schedule_save()
 
+    @staticmethod
+    def _token_value(token_info: TokenInfo) -> str:
+        token = token_info.token
+        if token.startswith("sso="):
+            return token[4:]
+        return token
+
     def get_token(self, pool_name: str = "ssoBasic", exclude: set = None, prefer_tags: Optional[Set[str]] = None) -> Optional[str]:
         """
         获取可用 Token
@@ -353,10 +360,36 @@ class TokenManager:
             logger.debug(f"No available token in pool '{pool_name}'")
             return None
 
-        token = token_info.token
-        if token.startswith("sso="):
-            return token[4:]
-        return token
+        return self._token_value(token_info)
+
+    def get_token_round_robin(
+        self,
+        pool_name: str = "ssoBasic",
+        exclude: Optional[Set[str]] = None,
+        prefer_tags: Optional[Set[str]] = None,
+    ) -> Optional[str]:
+        """
+        按池内顺序轮询获取可用 Token。
+
+        Args:
+            pool_name: Token 池名称
+            exclude: 需要排除的 token 字符串集合
+            prefer_tags: 优先选择包含这些 tag 的 token
+
+        Returns:
+            Token 字符串或 None
+        """
+        pool = self.pools.get(pool_name)
+        if not pool:
+            logger.debug(f"Pool '{pool_name}' not found")
+            return None
+
+        token_info = pool.select_round_robin(exclude=exclude, prefer_tags=prefer_tags)
+        if not token_info:
+            logger.debug(f"No available token in pool '{pool_name}'")
+            return None
+
+        return self._token_value(token_info)
 
     def get_token_info(
         self,

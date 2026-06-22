@@ -1,6 +1,7 @@
 """Token 池管理"""
 
 import random
+from threading import Lock
 from typing import Dict, List, Optional, Iterator, Set
 
 from grok2api.services.token.models import TokenInfo, TokenStatus, TokenPoolStats
@@ -13,6 +14,8 @@ class TokenPool:
     def __init__(self, name: str):
         self.name = name
         self._tokens: Dict[str, TokenInfo] = {}
+        self._round_robin_index = 0
+        self._round_robin_lock = Lock()
 
     def add(self, token: TokenInfo):
         """添加 Token"""
@@ -36,8 +39,38 @@ class TokenPool:
         except Exception:
             return False
 
+    @staticmethod
+    def _normalize_exclude(exclude: Optional[Set[str]] = None) -> Set[str]:
+        return {
+            token[4:] if token.startswith("sso=") else token
+            for token in (exclude or set())
+        }
+
+    def _available_tokens(
+        self,
+        *,
+        exclude: Optional[Set[str]] = None,
+        prefer_tags: Optional[Set[str]] = None,
+    ) -> List[TokenInfo]:
+        consumed_mode = self._is_consumed_mode()
+        excluded = self._normalize_exclude(exclude)
+        available = [
+            t
+            for t in self._tokens.values()
+            if t.is_available(consumed_mode=consumed_mode)
+            and (not excluded or t.token not in excluded)
+        ]
+        if not available:
+            return []
+
+        if prefer_tags:
+            preferred = [t for t in available if prefer_tags.issubset(set(t.tags or []))]
+            if preferred:
+                return preferred
+        return available
+
     def select(
-        self, exclude: set = None, prefer_tags: Optional[Set[str]] = None
+        self, exclude: Optional[Set[str]] = None, prefer_tags: Optional[Set[str]] = None
     ) -> Optional[TokenInfo]:
         """
         选择一个可用 Token
@@ -54,52 +87,37 @@ class TokenPool:
             exclude: 需要排除的 token 字符串集合
             prefer_tags: 优先选择包含这些 tag 的 token（若存在则仅在其子集中选择）
         """
-        consumed_mode = self._is_consumed_mode()
+        available = self._available_tokens(exclude=exclude, prefer_tags=prefer_tags)
+        if not available:
+            return None
+        return random.choice(available)
 
-        if consumed_mode:
-            # ===== Consumed 模式（新逻辑）=====
-            available = [
-                t
-                for t in self._tokens.values()
-                if t.is_available(consumed_mode=True)
-                and (not exclude or t.token not in exclude)
-            ]
+    def select_round_robin(
+        self,
+        exclude: Optional[Set[str]] = None,
+        prefer_tags: Optional[Set[str]] = None,
+    ) -> Optional[TokenInfo]:
+        """按池内顺序轮询选择可用 Token，并在每次选择后推进游标。"""
+        available = self._available_tokens(exclude=exclude, prefer_tags=prefer_tags)
+        if not available:
+            return None
 
-            if not available:
-                return None
+        available_tokens = {token.token for token in available}
+        ordered_tokens = list(self._tokens.values())
+        total = len(ordered_tokens)
+        if total == 0:
+            return None
 
-            # 优先选带指定标签的 token（若存在）
-            if prefer_tags:
-                preferred = [
-                    t for t in available if prefer_tags.issubset(set(t.tags or []))
-                ]
-                if preferred:
-                    available = preferred
-
-            return random.choice(available)
-
-
-        else:
-            # ===== 默认模式（旧逻辑）=====
-            available = [
-                t
-                for t in self._tokens.values()
-                if t.is_available(consumed_mode=False)
-                and (not exclude or t.token not in exclude)
-            ]
-
-            if not available:
-                return None
-
-            # 优先选带指定标签的 token（若存在）
-            if prefer_tags:
-                preferred = [
-                    t for t in available if prefer_tags.issubset(set(t.tags or []))
-                ]
-                if preferred:
-                    available = preferred
-
-            return random.choice(available)
+        with self._round_robin_lock:
+            start_index = self._round_robin_index % total
+            for offset in range(total):
+                index = (start_index + offset) % total
+                token = ordered_tokens[index]
+                if token.token not in available_tokens:
+                    continue
+                self._round_robin_index = (index + 1) % total
+                return token
+            return None
 
     def count(self) -> int:
         """Token 数量"""
@@ -134,7 +152,7 @@ class TokenPool:
 
     def _rebuild_index(self):
         """重建索引（预留接口，用于加载时调用）"""
-        pass
+        self._round_robin_index = self._round_robin_index % max(1, len(self._tokens))
 
     def __iter__(self) -> Iterator[TokenInfo]:
         return iter(self._tokens.values())

@@ -33,7 +33,7 @@ from grok2api.services.grok.services.console_output_adapters import (
 from grok2api.services.grok.services.console_stream_parser import ConsoleStreamParser
 from grok2api.services.grok.services.model import Channel, ModelService
 from grok2api.services.grok.utils.errors import no_token_error
-from grok2api.services.grok.utils.retry import pick_token, rate_limited
+from grok2api.services.grok.utils.retry import pick_token_round_robin, rate_limited
 from grok2api.services.grok.utils.tool_call import format_tool_history
 from grok2api.services.reverse.console_payload import merge_console_payload, sanitize_console_upstream_payload
 from grok2api.services.reverse.console_responses import ConsoleResponsesReverse
@@ -243,7 +243,7 @@ class ConsoleChannelService:
             async def gen():
                 last_err: Optional[UpstreamException] = None
                 for attempt in range(max_retries):
-                    token = await pick_token(token_mgr, model_id, tried)
+                    token = await pick_token_round_robin(token_mgr, model_id, tried)
                     if not token:
                         break
                     tried.add(token)
@@ -273,7 +273,7 @@ class ConsoleChannelService:
             return gen()
 
         for attempt in range(max_retries):
-            token = await pick_token(token_mgr, model_id, tried)
+            token = await pick_token_round_robin(token_mgr, model_id, tried)
             if not token:
                 if last_error:
                     raise last_error

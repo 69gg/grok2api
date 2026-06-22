@@ -2,7 +2,7 @@
 Retry helpers for token switching.
 """
 
-from typing import Optional, Set
+from typing import Any, Optional, Set
 
 from grok2api.core.exceptions import UpstreamException
 from grok2api.services.grok.services.model import ModelService
@@ -10,7 +10,7 @@ from grok2api.services.reverse.utils.retry import is_transient_network_error
 
 
 async def pick_token(
-    token_mgr,
+    token_mgr: Any,
     model_id: str,
     tried: Set[str],
     preferred: Optional[str] = None,
@@ -29,6 +29,40 @@ async def pick_token(
         await token_mgr.refresh_cooling_tokens_on_demand()
         for pool_name in ModelService.pool_candidates_for_model(model_id):
             token = token_mgr.get_token(
+                pool_name,
+                exclude=tried,
+                prefer_tags=prefer_tags,
+            )
+            if token:
+                break
+
+    return token
+
+
+async def pick_token_round_robin(
+    token_mgr: Any,
+    model_id: str,
+    tried: Set[str],
+    preferred: Optional[str] = None,
+    prefer_tags: Optional[Set[str]] = None,
+) -> Optional[str]:
+    if preferred and preferred not in tried:
+        return preferred
+
+    token = None
+    for pool_name in ModelService.pool_candidates_for_model(model_id):
+        token = token_mgr.get_token_round_robin(
+            pool_name,
+            exclude=tried,
+            prefer_tags=prefer_tags,
+        )
+        if token:
+            break
+
+    if not token and not tried:
+        await token_mgr.refresh_cooling_tokens_on_demand()
+        for pool_name in ModelService.pool_candidates_for_model(model_id):
+            token = token_mgr.get_token_round_robin(
                 pool_name,
                 exclude=tried,
                 prefer_tags=prefer_tags,
@@ -69,4 +103,4 @@ def transient_upstream(error: Exception) -> bool:
     return any(marker in err for marker in timeout_markers)
 
 
-__all__ = ["pick_token", "rate_limited", "transient_upstream"]
+__all__ = ["pick_token", "pick_token_round_robin", "rate_limited", "transient_upstream"]

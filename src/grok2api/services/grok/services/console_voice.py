@@ -11,7 +11,7 @@ from grok2api.core.exceptions import UpstreamException, ValidationException
 from grok2api.core.logger import logger
 from grok2api.services.grok.services.model import CONSOLE_VOICE_MODEL_IDS, CONSOLE_VOICE_STT_MODEL_IDS, CONSOLE_VOICE_TTS_MODEL_IDS
 from grok2api.services.grok.utils.errors import no_token_error
-from grok2api.services.grok.utils.retry import pick_token, rate_limited
+from grok2api.services.grok.utils.retry import pick_token_round_robin, rate_limited
 from grok2api.services.reverse.console_constants import CONSOLE_TTS_VOICES_API, CONSOLE_VOICE_TIMEOUT
 from grok2api.services.reverse.console_stt import ConsoleSttReverse
 from grok2api.services.reverse.console_tts import ConsoleTtsReverse
@@ -255,7 +255,7 @@ class ConsoleVoiceService:
         max_retries = int(get_config("retry.max_retry") or 3)
         last_error = None
         for attempt in range(max_retries):
-            token = await pick_token(token_mgr, model_id, tried)
+            token = await pick_token_round_robin(token_mgr, model_id, tried)
             if not token:
                 if last_error:
                     raise last_error
