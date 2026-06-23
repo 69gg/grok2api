@@ -30,6 +30,7 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 
 - `ssoBasic`：支持 `grok-4.3-fast`、`grok-imagine-1.0`、`grok-imagine-1.0-edit`，以及全部 **Console Chat Playground** 与 **Console Voice（TTS/STT/translations + STT WS）** 模型（见下）。
 - `ssoSuper`：保持旧项目模型能力。
+- 模型目录与同名模型解析统一按 **Console > Basic app > other** 优先级处理；例如 Console 与 grok.com/super 同名时优先走 Console 通道。
 - Grok 与 Console Chat / Voice 上游调用会按候选池顺序轮询可用 SSO 号；单次请求失败重试时会排除本请求已试过的号，再继续选下一个，429 会标记当前号 cooling 后换号重试。
 - 图片生成/编辑内部使用 `grok-4.3`。
 

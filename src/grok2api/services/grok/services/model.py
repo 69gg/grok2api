@@ -252,6 +252,13 @@ _SUPER_GROK_MODELS = [
 SUPER_GROK_MODEL_IDS = {m.model_id for m in _SUPER_GROK_MODELS}
 
 
+def _prioritized_model_map(models: list[ModelInfo]) -> dict[str, ModelInfo]:
+    mapped: dict[str, ModelInfo] = {}
+    for model in models:
+        mapped.setdefault(model.model_id, model)
+    return mapped
+
+
 class ModelService:
     """模型管理服务"""
 
@@ -262,6 +269,8 @@ class ModelService:
     }
 
     MODELS = [
+        *_CONSOLE_MODELS,
+        *_CONSOLE_VOICE_MODELS,
         ModelInfo(
             model_id="grok-4.3-fast",
             grok_model="grok-43",
@@ -275,11 +284,9 @@ class ModelService:
             is_video=False,
         ),
         *_SUPER_GROK_MODELS,
-        *_CONSOLE_MODELS,
-        *_CONSOLE_VOICE_MODELS,
     ]
 
-    _map = {m.model_id: m for m in MODELS}
+    _map = _prioritized_model_map(MODELS)
 
     @classmethod
     def get(cls, model_id: str) -> Optional[ModelInfo]:

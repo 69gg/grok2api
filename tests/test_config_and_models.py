@@ -4,7 +4,11 @@ from pathlib import Path
 import tomllib
 
 from grok2api.services.grok.model import ModelService as LegacyModelService
-from grok2api.services.grok.services.model import ModelService, SUPER_GROK_MODEL_IDS
+from grok2api.services.grok.services.model import (
+    Channel,
+    ModelService,
+    SUPER_GROK_MODEL_IDS,
+)
 from grok2api.services.grok.utils.errors import no_token_error
 
 
@@ -80,6 +84,30 @@ def test_model_list_hides_super_only_models_without_super_tokens() -> None:
     assert "grok-imagine-image" not in basic_ids
     assert "grok-4.3-fast" in basic_ids
     assert "grok-4.3" in basic_ids
+
+
+def test_model_catalog_uses_channel_priority_order() -> None:
+    models = ModelService.list(has_super_tokens=True)
+    priority = {
+        Channel.CONSOLE: 0,
+        Channel.CONSOLE_VOICE: 0,
+        Channel.GROK: 1,
+    }
+    ranks = [
+        priority[model.channel]
+        if model.model_id == "grok-4.3-fast"
+        or model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE}
+        else 2
+        for model in models
+    ]
+    assert ranks == sorted(ranks)
+
+
+def test_duplicate_model_ids_keep_highest_priority_channel() -> None:
+    model = ModelService.get("grok-4.20-0309-reasoning")
+    assert model is not None
+    assert model.channel == Channel.CONSOLE
+    assert model.owned_by == "xai-console<grok2api@69gg>"
 
 
 def test_image_models_use_declared_upstream_names() -> None:
