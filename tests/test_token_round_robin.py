@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Sequence
+
 import pytest
 
-from grok2api.services.grok.utils.retry import pick_token_round_robin
+from grok2api.core.exceptions import UpstreamException
+from grok2api.services.grok.services.chat import ChatService
+from grok2api.services.grok.services.console_channel import ConsoleChannelService
+from grok2api.services.grok.utils.retry import pick_token, pick_token_round_robin
 from grok2api.services.token.manager import TokenManager
 from grok2api.services.token.models import TokenInfo, TokenStatus
 from grok2api.services.token.pool import TokenPool
@@ -11,6 +16,10 @@ from grok2api.services.token import pool as token_pool_module
 
 def _token(value: str, *, quota: int = 10, tags: list[str] | None = None) -> TokenInfo:
     return TokenInfo(token=value, quota=quota, tags=tags or [])
+
+
+def _first_token(tokens: Sequence[TokenInfo]) -> TokenInfo:
+    return tokens[0]
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +69,50 @@ def test_token_pool_round_robin_respects_preferred_tags() -> None:
 
 
 @pytest.mark.asyncio
+async def test_token_picker_uses_round_robin_across_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = TokenManager()
+    manager.initialized = True
+    manager.pools["ssoBasic"] = TokenPool("ssoBasic")
+    manager.pools["ssoBasic"].add(_token("token-a"))
+    manager.pools["ssoBasic"].add(_token("token-b"))
+
+    async def fake_refresh() -> None:
+        raise AssertionError("refresh should not be called while tokens are available")
+
+    monkeypatch.setattr(token_pool_module.random, "choice", _first_token)
+    monkeypatch.setattr(manager, "refresh_cooling_tokens_on_demand", fake_refresh)
+
+    assert await pick_token(manager, "grok-4.3", set()) == "token-a"
+    assert await pick_token(manager, "grok-4.3", set()) == "token-b"
+    assert await pick_token(manager, "grok-4.3", set()) == "token-a"
+
+
+@pytest.mark.asyncio
+async def test_token_picker_round_robin_skips_tried_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = TokenManager()
+    manager.initialized = True
+    manager.pools["ssoBasic"] = TokenPool("ssoBasic")
+    manager.pools["ssoBasic"].add(_token("token-a"))
+    manager.pools["ssoBasic"].add(_token("token-b"))
+
+    async def fake_refresh() -> None:
+        raise AssertionError("refresh should not be called while tokens are available")
+
+    monkeypatch.setattr(token_pool_module.random, "choice", _first_token)
+    monkeypatch.setattr(manager, "refresh_cooling_tokens_on_demand", fake_refresh)
+
+    first = await pick_token(manager, "grok-4.3", set())
+    second = await pick_token(manager, "grok-4.3", {first})
+
+    assert first == "token-a"
+    assert second == "token-b"
+
+
+@pytest.mark.asyncio
 async def test_console_token_picker_uses_round_robin_across_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -80,7 +133,7 @@ async def test_console_token_picker_uses_round_robin_across_calls(
 
 
 @pytest.mark.asyncio
-async def test_console_token_picker_round_robin_skips_tried_tokens(
+async def test_console_execute_retries_with_next_token_after_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = TokenManager()
@@ -88,14 +141,132 @@ async def test_console_token_picker_round_robin_skips_tried_tokens(
     manager.pools["ssoBasic"] = TokenPool("ssoBasic")
     manager.pools["ssoBasic"].add(_token("token-a"))
     manager.pools["ssoBasic"].add(_token("token-b"))
+    used_tokens: list[str] = []
 
-    async def fake_refresh() -> None:
-        raise AssertionError("refresh should not be called while tokens are available")
+    async def fake_get_token_manager() -> TokenManager:
+        return manager
 
-    monkeypatch.setattr(manager, "refresh_cooling_tokens_on_demand", fake_refresh)
+    async def fake_reload_if_stale() -> None:
+        return None
 
-    first = await pick_token_round_robin(manager, "grok-4.3", set())
-    second = await pick_token_round_robin(manager, "grok-4.3", {first})
+    async def fake_stream_upstream(
+        payload: dict[str, str],
+        *,
+        token: str,
+    ) -> AsyncIterator[str]:
+        used_tokens.append(token)
+        if token == "token-a":
+            raise UpstreamException(
+                "rate limited",
+                status_code=429,
+                details={"status": 429},
+            )
+        yield f"ok:{payload['token']}"
 
-    assert first == "token-a"
-    assert second == "token-b"
+    async def fake_handle_failure(
+        token_mgr: TokenManager,
+        token: str,
+        exc: UpstreamException,
+    ) -> None:
+        return None
+
+    def fake_get_config(key: str, default: object = None) -> object:
+        if key == "retry.max_retry":
+            return 2
+        return default
+
+    async def build_payload(token: str) -> dict[str, str]:
+        return {"token": token}
+
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.console_channel.get_token_manager",
+        fake_get_token_manager,
+    )
+    monkeypatch.setattr(manager, "reload_if_stale", fake_reload_if_stale)
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.console_channel.get_config",
+        fake_get_config,
+    )
+    monkeypatch.setattr(
+        ConsoleChannelService,
+        "_stream_upstream",
+        fake_stream_upstream,
+    )
+    monkeypatch.setattr(
+        ConsoleChannelService,
+        "_handle_token_upstream_failure",
+        fake_handle_failure,
+    )
+
+    result = await ConsoleChannelService._execute_with_token(
+        "grok-4.3",
+        build_payload,
+        stream=False,
+    )
+
+    assert used_tokens == ["token-a", "token-b"]
+    assert result == ["ok:token-b"]
+
+
+@pytest.mark.asyncio
+async def test_app_chat_transient_error_uses_next_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = TokenManager()
+    manager.initialized = True
+    manager.pools["ssoBasic"] = TokenPool("ssoBasic")
+    manager.pools["ssoBasic"].add(_token("token-a"))
+    manager.pools["ssoBasic"].add(_token("token-b"))
+    used_tokens: list[str] = []
+
+    async def fake_get_token_manager() -> TokenManager:
+        return manager
+
+    async def fake_reload_if_stale() -> None:
+        return None
+
+    async def fake_chat_openai(
+        self: object,
+        token: str,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        used_tokens.append(token)
+        raise UpstreamException(
+            "curl: (92) HTTP/2 stream was not closed cleanly",
+            status_code=502,
+            details={
+                "status": 502,
+                "error": "curl: (92) HTTP/2 stream was not closed cleanly",
+            },
+        )
+
+    def fake_get_config(key: str, default: object = None) -> object:
+        values: dict[str, object] = {
+            "retry.max_retry": 3,
+            "app.stream": False,
+        }
+        return values.get(key, default)
+
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.chat.get_token_manager",
+        fake_get_token_manager,
+    )
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.chat.get_config",
+        fake_get_config,
+    )
+    monkeypatch.setattr(manager, "reload_if_stale", fake_reload_if_stale)
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.chat.GrokChatService.chat_openai",
+        fake_chat_openai,
+    )
+
+    with pytest.raises(UpstreamException):
+        await ChatService.completions(
+            model="grok-4.3-fast",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=False,
+        )
+
+    assert used_tokens == ["token-a", "token-b"]

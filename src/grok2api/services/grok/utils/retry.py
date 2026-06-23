@@ -21,14 +21,18 @@ async def pick_token(
 
     token = None
     for pool_name in ModelService.pool_candidates_for_model(model_id):
-        token = token_mgr.get_token(pool_name, exclude=tried, prefer_tags=prefer_tags)
+        token = token_mgr.get_token_round_robin(
+            pool_name,
+            exclude=tried,
+            prefer_tags=prefer_tags,
+        )
         if token:
             break
 
     if not token and not tried:
         await token_mgr.refresh_cooling_tokens_on_demand()
         for pool_name in ModelService.pool_candidates_for_model(model_id):
-            token = token_mgr.get_token(
+            token = token_mgr.get_token_round_robin(
                 pool_name,
                 exclude=tried,
                 prefer_tags=prefer_tags,

@@ -510,9 +510,8 @@ class ChatService:
                 if is_transient_network_error(e):
                     logger.warning(
                         f"Transient network error for token {token[:10]}..., "
-                        f"retrying request (attempt {attempt + 1}/{max_token_retries}): {e}"
+                        f"trying next token (attempt {attempt + 1}/{max_token_retries}): {e}"
                     )
-                    tried_tokens.discard(token)
                     continue
 
                 if rate_limited(e):
