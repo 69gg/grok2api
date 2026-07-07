@@ -142,6 +142,7 @@ async def test_console_execute_retries_with_next_token_after_error(
     manager.pools["ssoBasic"].add(_token("token-a"))
     manager.pools["ssoBasic"].add(_token("token-b"))
     used_tokens: list[str] = []
+    recorded: list[tuple[str, int, str, int | None]] = []
 
     async def fake_get_token_manager() -> TokenManager:
         return manager
@@ -163,12 +164,14 @@ async def test_console_execute_retries_with_next_token_after_error(
             )
         yield f"ok:{payload['token']}"
 
-    async def fake_handle_failure(
-        token_mgr: TokenManager,
+    async def fake_record_fail(
         token: str,
-        exc: UpstreamException,
-    ) -> None:
-        return None
+        status_code: int = 401,
+        reason: str = "",
+        threshold: int | None = None,
+    ) -> bool:
+        recorded.append((token, status_code, reason, threshold))
+        return True
 
     def fake_get_config(key: str, default: object = None) -> object:
         if key == "retry.max_retry":
@@ -193,9 +196,8 @@ async def test_console_execute_retries_with_next_token_after_error(
         fake_stream_upstream,
     )
     monkeypatch.setattr(
-        ConsoleChannelService,
-        "_handle_token_upstream_failure",
-        fake_handle_failure,
+        "grok2api.services.grok.services.console_channel.TokenService.record_fail",
+        fake_record_fail,
     )
 
     result = await ConsoleChannelService._execute_with_token(
@@ -205,6 +207,171 @@ async def test_console_execute_retries_with_next_token_after_error(
     )
 
     assert used_tokens == ["token-a", "token-b"]
+    assert recorded == []
+    assert result == ["ok:token-b"]
+
+
+@pytest.mark.asyncio
+async def test_console_execute_records_blocked_user_and_uses_next_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = TokenManager()
+    manager.initialized = True
+    manager.pools["ssoBasic"] = TokenPool("ssoBasic")
+    manager.pools["ssoBasic"].add(_token("token-a"))
+    manager.pools["ssoBasic"].add(_token("token-b"))
+    used_tokens: list[str] = []
+    recorded: list[tuple[str, int, str, int | None]] = []
+
+    async def fake_get_token_manager() -> TokenManager:
+        return manager
+
+    async def fake_reload_if_stale() -> None:
+        return None
+
+    async def fake_stream_upstream(
+        payload: dict[str, str],
+        *,
+        token: str,
+    ) -> AsyncIterator[str]:
+        used_tokens.append(token)
+        if token == "token-a":
+            raise UpstreamException(
+                "forbidden",
+                status_code=403,
+                details={
+                    "status": 403,
+                    "body": '{"code":"unauthorized:blocked-user","error":"User is blocked"}',
+                },
+            )
+        yield f"ok:{payload['token']}"
+
+    def fake_get_config(key: str, default: object = None) -> object:
+        if key == "retry.max_retry":
+            return 2
+        return default
+
+    async def fake_record_fail(
+        token: str,
+        status_code: int = 401,
+        reason: str = "",
+        threshold: int | None = None,
+    ) -> bool:
+        recorded.append((token, status_code, reason, threshold))
+        return True
+
+    async def build_payload(token: str) -> dict[str, str]:
+        return {"token": token}
+
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.console_channel.get_token_manager",
+        fake_get_token_manager,
+    )
+    monkeypatch.setattr(manager, "reload_if_stale", fake_reload_if_stale)
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.console_channel.get_config",
+        fake_get_config,
+    )
+    monkeypatch.setattr(
+        ConsoleChannelService,
+        "_stream_upstream",
+        fake_stream_upstream,
+    )
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.console_channel.TokenService.record_fail",
+        fake_record_fail,
+    )
+
+    result = await ConsoleChannelService._execute_with_token(
+        "grok-4.3",
+        build_payload,
+        stream=False,
+    )
+
+    assert used_tokens == ["token-a", "token-b"]
+    assert recorded == [("token-a", 401, "console_user_blocked", 1)]
+    assert result == ["ok:token-b"]
+
+
+@pytest.mark.asyncio
+async def test_console_execute_does_not_disable_cloudflare_403(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = TokenManager()
+    manager.initialized = True
+    manager.pools["ssoBasic"] = TokenPool("ssoBasic")
+    manager.pools["ssoBasic"].add(_token("token-a"))
+    manager.pools["ssoBasic"].add(_token("token-b"))
+    used_tokens: list[str] = []
+    recorded: list[tuple[str, int, str, int | None]] = []
+
+    async def fake_get_token_manager() -> TokenManager:
+        return manager
+
+    async def fake_reload_if_stale() -> None:
+        return None
+
+    async def fake_stream_upstream(
+        payload: dict[str, str],
+        *,
+        token: str,
+    ) -> AsyncIterator[str]:
+        used_tokens.append(token)
+        if token == "token-a":
+            raise UpstreamException(
+                "cloudflare challenge",
+                status_code=403,
+                details={
+                    "status": 403,
+                    "body": "<!DOCTYPE html><title>Attention Required! | Cloudflare</title>",
+                },
+            )
+        yield f"ok:{payload['token']}"
+
+    def fake_get_config(key: str, default: object = None) -> object:
+        if key == "retry.max_retry":
+            return 2
+        return default
+
+    async def fake_record_fail(
+        token: str,
+        status_code: int = 401,
+        reason: str = "",
+        threshold: int | None = None,
+    ) -> bool:
+        recorded.append((token, status_code, reason, threshold))
+        return True
+
+    async def build_payload(token: str) -> dict[str, str]:
+        return {"token": token}
+
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.console_channel.get_token_manager",
+        fake_get_token_manager,
+    )
+    monkeypatch.setattr(manager, "reload_if_stale", fake_reload_if_stale)
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.console_channel.get_config",
+        fake_get_config,
+    )
+    monkeypatch.setattr(
+        ConsoleChannelService,
+        "_stream_upstream",
+        fake_stream_upstream,
+    )
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.console_channel.TokenService.record_fail",
+        fake_record_fail,
+    )
+
+    result = await ConsoleChannelService._execute_with_token(
+        "grok-4.3",
+        build_payload,
+        stream=False,
+    )
+
+    assert used_tokens == ["token-a", "token-b"]
+    assert recorded == []
     assert result == ["ok:token-b"]
 
 

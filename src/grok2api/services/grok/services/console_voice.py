@@ -9,6 +9,7 @@ import orjson
 from grok2api.core.config import get_config
 from grok2api.core.exceptions import UpstreamException, ValidationException
 from grok2api.core.logger import logger
+from grok2api.services.grok.services.console_channel import _is_console_user_blocked
 from grok2api.services.grok.services.model import CONSOLE_VOICE_MODEL_IDS, CONSOLE_VOICE_STT_MODEL_IDS, CONSOLE_VOICE_TTS_MODEL_IDS
 from grok2api.services.grok.utils.errors import no_token_error
 from grok2api.services.grok.utils.retry import pick_token_round_robin, rate_limited
@@ -237,9 +238,28 @@ class ConsoleVoiceService:
         status = (exc.details or {}).get("status")
         if status == 401:
             try:
-                await TokenService.record_fail(token, status, "console_voice_auth_failed")
+                await TokenService.record_fail(
+                    token,
+                    status,
+                    "console_voice_auth_failed",
+                )
             except Exception:
                 pass
+        elif _is_console_user_blocked(exc):
+            try:
+                await TokenService.record_fail(
+                    token,
+                    401,
+                    "console_voice_user_blocked",
+                    threshold=1,
+                )
+            except Exception:
+                pass
+        elif status == 403:
+            logger.info(
+                f"Console voice upstream 403 for token {token[:10]}...; "
+                "treating as upstream/proxy forbidden and trying next token without disabling it"
+            )
         elif rate_limited(exc):
             # Console Playground 429 is endpoint throttling, not grok.com SSO quota exhaustion.
             logger.info(
