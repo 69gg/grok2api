@@ -486,6 +486,56 @@ async def test_console_execute_initializes_missing_team_id_before_request(
 
 
 @pytest.mark.asyncio
+async def test_console_team_init_marks_blocked_token_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from grok2api.services.reverse import console_team
+
+    manager = TokenManager()
+    manager.initialized = True
+    manager.pools["ssoBasic"] = TokenPool("ssoBasic")
+    token_info = _token("token-a", console_team_id="")
+    manager.pools["ssoBasic"].add(token_info)
+    save_calls: list[bool] = []
+
+    async def fake_create(*_args: object, **_kwargs: object) -> str:
+        raise UpstreamException(
+            "ConsoleTeamReverse: gRPC failed, 7",
+            details={
+                "status": 403,
+                "grpc_status": 7,
+                "grpc_message": "User is blocked [WKE=unauthorized:blocked-user]",
+            },
+        )
+
+    async def fake_save(*, force: bool = False) -> None:
+        save_calls.append(force)
+
+    def fake_get_config(key: str, default: object = None) -> object:
+        return default
+
+    monkeypatch.setattr(console_team.ConsoleTeamReverse, "create", fake_create)
+    monkeypatch.setattr(manager, "_save", fake_save)
+    monkeypatch.setattr(manager, "_schedule_save", lambda: None)
+    monkeypatch.setattr(
+        "grok2api.services.token.manager.get_config",
+        fake_get_config,
+    )
+
+    with pytest.raises(UpstreamException):
+        await manager.ensure_console_team_id(
+            token_info,
+            "ssoBasic",
+            trigger="scheduler",
+        )
+
+    assert token_info.status == TokenStatus.EXPIRED
+    assert token_info.fail_count == 1
+    assert token_info.last_fail_reason == "console_team_user_blocked"
+    assert save_calls == [True]
+
+
+@pytest.mark.asyncio
 async def test_app_chat_transient_error_uses_next_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

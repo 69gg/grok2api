@@ -6,9 +6,11 @@ from grok2api.services.reverse.utils.headers import build_console_headers
 from grok2api.services.reverse.utils import proxy as proxy_utils
 from grok2api.services.reverse.console_team import (
     build_create_team_payload,
+    is_console_team_user_blocked_error,
     parse_create_team_response,
 )
 from grok2api.services.reverse.utils.grpc import GrpcClient
+from grok2api.core.exceptions import UpstreamException
 
 
 def test_console_proxy_keys_prefer_console_then_base() -> None:
@@ -143,3 +145,25 @@ def test_console_create_team_payload_and_response_parser() -> None:
     response = GrpcClient.encode_payload(message) + b"\x80\x00\x00\x00\x0fgrpc-status:0\r\n"
 
     assert parse_create_team_response(response, "application/grpc-web+proto") == team_id
+
+
+def test_console_create_team_blocked_error_detection() -> None:
+    exc = UpstreamException(
+        "ConsoleTeamReverse: gRPC failed, 7",
+        details={
+            "status": 403,
+            "grpc_status": 7,
+            "grpc_message": "User is blocked [WKE=unauthorized:blocked-user]",
+        },
+    )
+
+    assert is_console_team_user_blocked_error(exc) is True
+
+
+def test_console_create_team_transient_error_is_not_blocked() -> None:
+    exc = UpstreamException(
+        "ConsoleTeamReverse: request failed, 502",
+        details={"status": 502, "body": "bad gateway"},
+    )
+
+    assert is_console_team_user_blocked_error(exc) is False

@@ -979,7 +979,10 @@ class TokenManager:
 
             from curl_cffi.requests import AsyncSession
 
-            from grok2api.services.reverse.console_team import ConsoleTeamReverse
+            from grok2api.services.reverse.console_team import (
+                ConsoleTeamReverse,
+                is_console_team_user_blocked_error,
+            )
 
             team_name = self._console_team_name_for_token(token_info)
             logger.info(
@@ -995,6 +998,20 @@ class TokenManager:
                     token_info.token,
                     team_name,
                 )
+            except UpstreamException as exc:
+                if is_console_team_user_blocked_error(exc):
+                    await self.record_fail(
+                        token_info.token,
+                        401,
+                        "console_team_user_blocked",
+                        threshold=1,
+                    )
+                    await self._save(force=True)
+                    logger.warning(
+                        "Console team init: token {}... blocked during CreateTeam, marked expired",
+                        token_info.token[:10],
+                    )
+                raise
             finally:
                 try:
                     await session.close()

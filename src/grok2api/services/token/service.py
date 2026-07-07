@@ -63,7 +63,12 @@ class TokenService:
         return await manager.sync_usage(token, effort)
 
     @staticmethod
-    async def record_fail(token: str, status_code: int = 401, reason: str = "") -> bool:
+    async def record_fail(
+        token: str,
+        status_code: int = 401,
+        reason: str = "",
+        threshold: Optional[int] = None,
+    ) -> bool:
         """
         记录 Token 失败
 
@@ -71,12 +76,13 @@ class TokenService:
             token: Token 字符串
             status_code: HTTP 状态码
             reason: 失败原因
+            threshold: 强制失败阈值
 
         Returns:
             是否成功
         """
         manager = await TokenService._get_manager()
-        return await manager.record_fail(token, status_code, reason)
+        return await manager.record_fail(token, status_code, reason, threshold=threshold)
 
     @staticmethod
     async def add_token(token: str, pool_name: str = "ssoBasic") -> bool:

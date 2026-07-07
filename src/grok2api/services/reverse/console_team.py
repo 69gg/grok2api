@@ -132,6 +132,24 @@ def parse_create_team_response(
     return team_id
 
 
+def is_console_team_user_blocked_error(exc: Exception) -> bool:
+    """Return True when CreateTeam clearly reports that the SSO user is blocked."""
+    if not isinstance(exc, UpstreamException):
+        return False
+    details = exc.details if isinstance(exc.details, dict) else {}
+    grpc_status = details.get("grpc_status")
+    status = details.get("status")
+    message = " ".join(
+        str(details.get(key) or "")
+        for key in ("grpc_message", "body", "error", "code")
+    ).lower()
+    if "blocked-user" in message or "blocked_user" in message:
+        return True
+    if "user is blocked" in message:
+        return True
+    return grpc_status == 7 and status == 403 and "blocked" in message
+
+
 class ConsoleTeamReverse:
     """Create a console.x.ai team using SSO cookies."""
 
@@ -212,5 +230,6 @@ __all__ = [
     "CONSOLE_CREATE_TEAM_API",
     "ConsoleTeamReverse",
     "build_create_team_payload",
+    "is_console_team_user_blocked_error",
     "parse_create_team_response",
 ]
