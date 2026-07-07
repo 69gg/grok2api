@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, AsyncIterator
+
 import pytest
 
 from grok2api.core.exceptions import UpstreamException
@@ -43,6 +45,7 @@ from grok2api.services.reverse.console_payload import (
     merge_console_payload,
     strip_console_client_extra,
 )
+from grok2api.services.reverse.utils.proxy import CurlCffiProxyKwargs
 
 
 def test_console_models_registered_and_listed():
@@ -274,6 +277,65 @@ async def test_stream_upstream_closes_session_when_request_fails(monkeypatch):
 
     assert len(sessions) == 1
     assert sessions[0].close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_console_responses_uses_console_proxy_first(monkeypatch):
+    from grok2api.services.reverse import console_responses
+
+    calls: list[dict[str, object]] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        async def aiter_lines(self) -> AsyncIterator[str]:
+            yield "data: ok"
+
+    class FakeSession:
+        async def post(self, *args: Any, **kwargs: Any) -> FakeResponse:
+            calls.append(kwargs)
+            return FakeResponse()
+
+        async def close(self) -> None:
+            pass
+
+    def fake_proxy_kwargs(*keys: str) -> CurlCffiProxyKwargs:
+        assert keys == ("proxy.console_proxy_url", "proxy.base_proxy_url")
+        return CurlCffiProxyKwargs(
+            "proxy.console_proxy_url",
+            None,
+            {"http": "http://console-proxy", "https": "http://console-proxy"},
+        )
+
+    monkeypatch.setattr(console_responses, "build_curl_cffi_proxy_kwargs", fake_proxy_kwargs)
+    monkeypatch.setattr(console_responses, "get_config", lambda key, default=None: "chrome136")
+    monkeypatch.setattr(
+        "grok2api.services.reverse.utils.retry.get_config",
+        lambda key, default=None: {
+            "retry.max_retry": 0,
+            "retry.retry_status_codes": [502],
+            "retry.retry_budget": 1.0,
+            "retry.retry_backoff_base": 0.1,
+            "retry.retry_backoff_factor": 2.0,
+            "retry.retry_backoff_max": 1.0,
+        }.get(key, default),
+    )
+
+    chunks: list[str] = []
+    line_iter = await console_responses.ConsoleResponsesReverse.request(
+        FakeSession(),
+        "token",
+        {"input": []},
+    )
+    async for chunk in line_iter:
+        chunks.append(chunk)
+
+    assert chunks == ["data: ok"]
+    assert calls[0]["proxy"] is None
+    assert calls[0]["proxies"] == {
+        "http": "http://console-proxy",
+        "https": "http://console-proxy",
+    }
 
 
 def test_detect_console_responses_client_mode_grok_first():

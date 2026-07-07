@@ -17,6 +17,10 @@
 
 Grok 与 Console Chat / Voice 通道都使用进程内轮询游标：每次上游调用都会在候选池中推进到下一个可用 SSO 号。单次请求内的失败重试会排除已尝试的号，继续轮询后续可用号；429 会标记当前号为 cooling 后换号重试。
 
+## 代理选择
+
+Console Chat / Responses / Messages 与 Console Voice（TTS、STT、voices、STT WebSocket）请求优先使用 `proxy.console_proxy_url`，为空时回退 `proxy.base_proxy_url`。这两个配置都支持逗号分隔多个代理，并复用现有粘性选择和失败轮换；grok.com、assets、注册与 CF 刷新等非 Console 请求仍按各自原有代理配置运行。
+
 ## CF 自动刷新
 
 `proxy.enabled = true` 时，`TokenRefreshScheduler` 会单独启动 `cf_clearance` 刷新循环。这个循环在启动后立即刷新一次，后续按 `proxy.refresh_interval` 续期；它复用 `register.solver_url`，本机地址且 `register.auto_start_solver = true` 时会自动启动内置 solver。

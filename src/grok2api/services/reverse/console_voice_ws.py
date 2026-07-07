@@ -14,6 +14,7 @@ from grok2api.core.exceptions import UpstreamException
 from grok2api.core.logger import logger
 from grok2api.services.reverse.console_constants import CONSOLE_STT_WS, CONSOLE_VOICE_TIMEOUT
 from grok2api.services.reverse.utils.headers import build_console_voice_ws_headers
+from grok2api.services.reverse.utils.proxy import CONSOLE_PROXY_KEYS
 from grok2api.services.reverse.utils.websocket import WebSocketClient
 
 
@@ -83,7 +84,7 @@ async def relay_stt_websocket(
     """Connect to console.x.ai STT WebSocket and relay traffic to the client."""
     url = build_stt_ws_url(query_params)
     headers = build_console_voice_ws_headers(token)
-    client = WebSocketClient()
+    client = WebSocketClient(proxy_config_keys=CONSOLE_PROXY_KEYS)
     conn = None
     try:
         conn = await client.connect(url, headers=headers, timeout=CONSOLE_VOICE_TIMEOUT)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 from typing import Any, AsyncIterator, Dict, Optional
-from urllib.parse import urlparse
 
 import orjson
 from curl_cffi.requests import AsyncSession
@@ -13,23 +12,15 @@ from curl_cffi.requests import AsyncSession
 from grok2api.core.config import get_config
 from grok2api.core.exceptions import UpstreamException
 from grok2api.core.logger import logger
-from grok2api.core.proxy_pool import get_current_proxy_from, rotate_proxy, should_rotate_proxy
+from grok2api.core.proxy_pool import rotate_proxy, should_rotate_proxy
 from grok2api.services.grok.services.console_input import drop_compaction_blobs_from_payload
 from grok2api.services.reverse.console_constants import CONSOLE_RESPONSES_API, CONSOLE_TIMEOUT
 from grok2api.services.reverse.utils.headers import build_console_headers
+from grok2api.services.reverse.utils.proxy import (
+    CONSOLE_PROXY_KEYS,
+    build_curl_cffi_proxy_kwargs,
+)
 from grok2api.services.reverse.utils.retry import RetryContext, extract_status_for_retry
-
-
-def _normalize_proxy(proxy_url: str) -> str:
-    if not proxy_url:
-        return proxy_url
-    parsed = urlparse(proxy_url)
-    scheme = parsed.scheme.lower()
-    if scheme == "socks5":
-        return proxy_url.replace("socks5://", "socks5h://", 1)
-    if scheme == "socks4":
-        return proxy_url.replace("socks4://", "socks4a://", 1)
-    return proxy_url
 
 
 def _is_encrypted_replay_decode_error(status_code: int, body: str) -> bool:
@@ -87,16 +78,8 @@ class ConsoleResponsesReverse:
             nonlocal active_proxy_key
             compaction_stripped = False
             while True:
-                active_proxy_key, base_proxy = get_current_proxy_from("proxy.base_proxy_url")
-                proxy = None
-                proxies = None
-                if base_proxy:
-                    normalized = _normalize_proxy(base_proxy)
-                    scheme = urlparse(normalized).scheme.lower()
-                    if scheme.startswith("socks"):
-                        proxy = normalized
-                    else:
-                        proxies = {"http": normalized, "https": normalized}
+                proxy_kwargs = build_curl_cffi_proxy_kwargs(*CONSOLE_PROXY_KEYS)
+                active_proxy_key = proxy_kwargs.active_proxy_key
                 body = orjson.dumps(payload)
                 response = await session.post(
                     CONSOLE_RESPONSES_API,
@@ -104,8 +87,8 @@ class ConsoleResponsesReverse:
                     data=body,
                     timeout=timeout,
                     stream=stream,
-                    proxy=proxy,
-                    proxies=proxies,
+                    proxy=proxy_kwargs.proxy,
+                    proxies=proxy_kwargs.proxies,
                     impersonate=browser,
                 )
                 if response.status_code == 200:

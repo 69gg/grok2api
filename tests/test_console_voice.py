@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any, AsyncIterator
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -24,6 +25,7 @@ from grok2api.services.grok.services.model import (
     CONSOLE_VOICE_TTS_MODEL_IDS,
     ModelService,
 )
+from grok2api.services.reverse.utils.proxy import CurlCffiProxyKwargs
 
 
 def test_console_voice_models_registered():
@@ -181,6 +183,83 @@ async def test_transcribe_mock_upstream():
 
 
 @pytest.mark.asyncio
+async def test_console_voice_transport_uses_console_proxy_first(monkeypatch):
+    from grok2api.services.reverse import console_voice_transport
+
+    calls: list[dict[str, object]] = []
+
+    class FakeSession:
+        async def close(self) -> None:
+            pass
+
+    class FakeResponse:
+        status_code = 200
+        content = b"{}"
+        headers = {}
+
+    def fake_session() -> FakeSession:
+        return FakeSession()
+
+    def fake_proxy_kwargs(*keys: str) -> CurlCffiProxyKwargs:
+        assert keys == ("proxy.console_proxy_url", "proxy.base_proxy_url")
+        return CurlCffiProxyKwargs(
+            "proxy.console_proxy_url",
+            "socks5h://127.0.0.1:1080",
+            None,
+        )
+
+    async def fake_do_post(
+        session: FakeSession,
+        proxy: str | None,
+        proxies: dict[str, str] | None,
+        browser: str | None,
+    ) -> FakeResponse:
+        calls.append({"proxy": proxy, "proxies": proxies, "browser": browser})
+        return FakeResponse()
+
+    async def fake_process(_response: FakeResponse) -> dict[str, bool]:
+        return {"ok": True}
+
+    monkeypatch.setattr(console_voice_transport, "AsyncSession", fake_session)
+    monkeypatch.setattr(
+        console_voice_transport,
+        "build_curl_cffi_proxy_kwargs",
+        fake_proxy_kwargs,
+    )
+    monkeypatch.setattr(
+        console_voice_transport,
+        "get_config",
+        lambda key, default=None: "chrome136" if key == "proxy.browser" else default,
+    )
+    monkeypatch.setattr(
+        "grok2api.services.reverse.utils.retry.get_config",
+        lambda key, default=None: {
+            "retry.max_retry": 0,
+            "retry.retry_status_codes": [502],
+            "retry.retry_budget": 1.0,
+            "retry.retry_backoff_base": 0.1,
+            "retry.retry_backoff_factor": 2.0,
+            "retry.retry_backoff_max": 1.0,
+        }.get(key, default),
+    )
+
+    result = await console_voice_transport.execute_console_voice_request(
+        label="test",
+        process=fake_process,
+        do_post=fake_do_post,
+    )
+
+    assert result == {"ok": True}
+    assert calls == [
+        {
+            "proxy": "socks5h://127.0.0.1:1080",
+            "proxies": None,
+            "browser": "chrome136",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_translate_forces_english():
     async def _fake_execute(_model, call):
         return await call("token")
@@ -212,6 +291,54 @@ def test_build_stt_ws_url():
     url = build_stt_ws_url({"sample_rate": "16000", "encoding": "pcm"})
     assert url.startswith("wss://console.x.ai/v1/stt?")
     assert "sample_rate=16000" in url
+
+
+@pytest.mark.asyncio
+async def test_relay_stt_websocket_uses_console_proxy_keys(monkeypatch):
+    from grok2api.services.reverse import console_voice_ws
+
+    created: list[tuple[str, ...]] = []
+
+    class FakeUpstreamWS:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+        def __aiter__(self) -> AsyncIterator[object]:
+            return self
+
+        async def __anext__(self) -> object:
+            raise StopAsyncIteration
+
+    class FakeConn:
+        def __init__(self) -> None:
+            self.ws = FakeUpstreamWS()
+
+        async def close(self) -> None:
+            await self.ws.close()
+
+    class FakeClient:
+        def __init__(self, *, proxy_config_keys: tuple[str, ...]) -> None:
+            created.append(proxy_config_keys)
+
+        async def connect(self, *args: Any, **kwargs: Any) -> FakeConn:
+            return FakeConn()
+
+    class FakeClientWS:
+        client_state = type("S", (), {"name": "DISCONNECTED"})()
+
+        async def receive(self) -> dict[str, str]:
+            return {"type": "websocket.disconnect"}
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(console_voice_ws, "WebSocketClient", FakeClient)
+
+    await console_voice_ws.relay_stt_websocket(FakeClientWS(), "token")
+
+    assert created == [("proxy.console_proxy_url", "proxy.base_proxy_url")]
 
 
 @pytest.mark.asyncio

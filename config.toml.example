@@ -46,6 +46,8 @@ url = ""
 [proxy]
 # 基础代理地址（代理到 Grok 官网）
 base_proxy_url = ""
+# Console 专用代理地址（代理到 console.x.ai；为空时回退 base_proxy_url；支持逗号分隔多个代理）
+console_proxy_url = ""
 # 资源代理地址（代理静态资源如图片/视频）
 asset_proxy_url = ""
 # 完整 CF Cookies（自动刷新写入）

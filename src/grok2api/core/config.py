@@ -63,6 +63,7 @@ def _apply_env_overrides(config_data: DictConfig) -> DictConfig:
         "SERVER_PORT": "server.port",
         "SERVER_WORKERS": "server.workers",
         "BASE_PROXY_URL": "proxy.base_proxy_url",
+        "CONSOLE_PROXY_URL": "proxy.console_proxy_url",
         "ASSET_PROXY_URL": "proxy.asset_proxy_url",
         "CF_CLEARANCE": "proxy.cf_clearance",
         "CF_COOKIES": "proxy.cf_cookies",

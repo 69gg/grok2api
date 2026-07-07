@@ -5,29 +5,26 @@ from __future__ import annotations
 import asyncio
 import inspect
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypeVar
-from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
 
 from grok2api.core.config import get_config
 from grok2api.core.exceptions import UpstreamException
 from grok2api.core.logger import logger
-from grok2api.core.proxy_pool import get_current_proxy_from, rotate_proxy, should_rotate_proxy
+from grok2api.core.proxy_pool import rotate_proxy, should_rotate_proxy
+from grok2api.services.reverse.utils.proxy import (
+    CONSOLE_PROXY_KEYS,
+    CurlCffiProxyKwargs,
+    build_curl_cffi_proxy_kwargs,
+    normalize_curl_proxy,
+)
 from grok2api.services.reverse.utils.retry import RetryContext, extract_status_for_retry
 
 T = TypeVar("T")
 
 
 def normalize_proxy(proxy_url: str) -> str:
-    if not proxy_url:
-        return proxy_url
-    parsed = urlparse(proxy_url)
-    scheme = parsed.scheme.lower()
-    if scheme == "socks5":
-        return proxy_url.replace("socks5://", "socks5h://", 1)
-    if scheme == "socks4":
-        return proxy_url.replace("socks4://", "socks4a://", 1)
-    return proxy_url
+    return normalize_curl_proxy(proxy_url)
 
 
 async def read_response_body(response: Any) -> bytes:
@@ -54,14 +51,8 @@ async def read_error_text(response: Any) -> str:
 
 
 def proxy_kwargs() -> Tuple[Optional[str], Optional[Dict[str, str]], Optional[str]]:
-    active_proxy_key, base_proxy = get_current_proxy_from("proxy.base_proxy_url")
-    if not base_proxy:
-        return active_proxy_key, None, None
-    normalized = normalize_proxy(base_proxy)
-    scheme = urlparse(normalized).scheme.lower()
-    if scheme.startswith("socks"):
-        return active_proxy_key, None, normalized
-    return active_proxy_key, {"http": normalized, "https": normalized}, None
+    kwargs = build_curl_cffi_proxy_kwargs(*CONSOLE_PROXY_KEYS)
+    return kwargs.active_proxy_key, kwargs.proxies, kwargs.proxy
 
 
 async def execute_console_voice_request(
@@ -83,8 +74,16 @@ async def execute_console_voice_request(
 
     while ctx.attempt <= ctx.max_retry:
         try:
-            active_proxy_key, proxies, proxy = proxy_kwargs()
-            response = await do_post(session, proxy, proxies, browser)
+            proxy_settings: CurlCffiProxyKwargs = build_curl_cffi_proxy_kwargs(
+                *CONSOLE_PROXY_KEYS
+            )
+            active_proxy_key = proxy_settings.active_proxy_key
+            response = await do_post(
+                session,
+                proxy_settings.proxy,
+                proxy_settings.proxies,
+                browser,
+            )
             if response.status_code == 200:
                 try:
                     return await process(response)

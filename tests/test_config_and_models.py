@@ -38,6 +38,11 @@ def test_cf_refresh_config_uses_local_solver_route() -> None:
     assert config_example["register"]["solver_url"] == "http://127.0.0.1:5072"
 
 
+def test_console_proxy_config_defaults_to_empty() -> None:
+    config_example = tomllib.loads((ROOT / "config.toml.example").read_text(encoding="utf-8"))
+    assert config_example["proxy"]["console_proxy_url"] == ""
+
+
 def test_retry_config_defaults_to_more_token_attempts() -> None:
     config_example = tomllib.loads((ROOT / "config.toml.example").read_text(encoding="utf-8"))
     assert config_example["retry"]["max_retry"] == 30

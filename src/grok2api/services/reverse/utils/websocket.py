@@ -11,7 +11,11 @@ from urllib.parse import urlparse
 
 from grok2api.core.logger import logger
 from grok2api.core.config import get_config
-from grok2api.core.proxy_pool import get_current_proxy_from, rotate_proxy
+from grok2api.core.proxy_pool import rotate_proxy
+from grok2api.services.reverse.utils.proxy import (
+    BASE_PROXY_KEYS,
+    get_current_proxy_url_from,
+)
 
 
 def _default_ssl_context() -> ssl.SSLContext:
@@ -91,8 +95,13 @@ class WebSocketConnection:
 class WebSocketClient:
     """WebSocket client with proxy support."""
 
-    def __init__(self, proxy: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        proxy: Optional[str] = None,
+        proxy_config_keys: tuple[str, ...] = BASE_PROXY_KEYS,
+    ) -> None:
         self._proxy_override = proxy
+        self._proxy_config_keys = proxy_config_keys
         self._ssl_context = _default_ssl_context()
 
     async def connect(
@@ -119,7 +128,9 @@ class WebSocketClient:
             active_proxy_key = None
             proxy_url = self._proxy_override
             if not proxy_url:
-                active_proxy_key, proxy_url = get_current_proxy_from("proxy.base_proxy_url")
+                active_proxy_key, proxy_url = get_current_proxy_url_from(
+                    *self._proxy_config_keys
+                )
             connector, resolved_proxy = resolve_proxy(proxy_url, self._ssl_context)
             logger.debug(
                 f"WebSocket connect: proxy_url={proxy_url}, resolved_proxy={resolved_proxy}, connector={type(connector).__name__}"

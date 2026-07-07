@@ -15,6 +15,7 @@ uv run granian --interface asgi grok2api.main:app --host 0.0.0.0 --port 8000
 - `config.toml`：本地运行配置，已加入 `.gitignore`。
 - `config.toml.example`：完整示例配置，提交到仓库。
 - 环境变量可覆盖少量路径和日志配置：`DATA_DIR`、`LOG_DIR`、`LOG_LEVEL`。
+- `proxy.console_proxy_url`：Console 通道专用代理，覆盖 `console.x.ai` 的 Chat/Responses/Messages 与 Voice REST/WS；为空时回退 `proxy.base_proxy_url`。
 
 ## Cloudflare Clearance
 
@@ -86,6 +87,8 @@ Responses API 可直接传 `input_image`：
 ## Console Chat Playground 模型
 
 通过 `console.x.ai` SSO 逆向的 Playground 免费高级模型。在 `GET /v1/models` 中 `owned_by` 为 `xai-console`。
+
+Console Chat 请求优先使用 `proxy.console_proxy_url`，未配置时回退 `proxy.base_proxy_url`。两个字段都支持逗号分隔多个代理，并沿用现有粘性选择与失败轮换。
 
 | model_id | 说明 |
 |---|---|
@@ -171,6 +174,8 @@ Playground 五个模型均支持 Image input。网关行为见上文 **图片输
 ## Console Voice（TTS/STT）
 
 通过 `console.x.ai` SSO 逆向的 Voice Playground API，对外暴露 OpenAI 兼容音频端点（REST + STT WebSocket）。在 `GET /v1/models` 中 `owned_by` 为 `xai-console-voice`。
+
+Console Voice 的 REST 与 STT WebSocket 使用同一套 Console 专用代理优先级：`proxy.console_proxy_url` → `proxy.base_proxy_url`。
 
 | model_id | 用途 |
 |---|---|
