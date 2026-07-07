@@ -77,6 +77,50 @@ async def pick_token_round_robin(
     return token
 
 
+async def pick_token_info_round_robin(
+    token_mgr: Any,
+    model_id: str,
+    tried: Set[str],
+    preferred: Optional[str] = None,
+    prefer_tags: Optional[Set[str]] = None,
+) -> Optional[tuple[str, Any]]:
+    if preferred and preferred not in tried:
+        pool_name = token_mgr.get_pool_name_for_token(preferred)
+        if pool_name:
+            pool = token_mgr.pools.get(pool_name)
+            raw_preferred = (
+                preferred[4:] if preferred.startswith("sso=") else preferred
+            )
+            token_info = pool.get(raw_preferred) if pool else None
+            if token_info:
+                return pool_name, token_info
+
+    selected: Optional[tuple[str, Any]] = None
+    for pool_name in ModelService.pool_candidates_for_model(model_id):
+        token_info = token_mgr.get_token_info_round_robin(
+            pool_name,
+            exclude=tried,
+            prefer_tags=prefer_tags,
+        )
+        if token_info:
+            selected = (pool_name, token_info)
+            break
+
+    if not selected and not tried:
+        await token_mgr.refresh_cooling_tokens_on_demand()
+        for pool_name in ModelService.pool_candidates_for_model(model_id):
+            token_info = token_mgr.get_token_info_round_robin(
+                pool_name,
+                exclude=tried,
+                prefer_tags=prefer_tags,
+            )
+            if token_info:
+                selected = (pool_name, token_info)
+                break
+
+    return selected
+
+
 def rate_limited(error: Exception) -> bool:
     if not isinstance(error, UpstreamException):
         return False
@@ -107,4 +151,10 @@ def transient_upstream(error: Exception) -> bool:
     return any(marker in err for marker in timeout_markers)
 
 
-__all__ = ["pick_token", "pick_token_round_robin", "rate_limited", "transient_upstream"]
+__all__ = [
+    "pick_token",
+    "pick_token_info_round_robin",
+    "pick_token_round_robin",
+    "rate_limited",
+    "transient_upstream",
+]

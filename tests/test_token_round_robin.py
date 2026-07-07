@@ -14,8 +14,19 @@ from grok2api.services.token.pool import TokenPool
 from grok2api.services.token import pool as token_pool_module
 
 
-def _token(value: str, *, quota: int = 10, tags: list[str] | None = None) -> TokenInfo:
-    return TokenInfo(token=value, quota=quota, tags=tags or [])
+def _token(
+    value: str,
+    *,
+    quota: int = 10,
+    tags: list[str] | None = None,
+    console_team_id: str = "33ec95d2-5364-4c7f-b1b3-b5bff151adb0",
+) -> TokenInfo:
+    return TokenInfo(
+        token=value,
+        quota=quota,
+        tags=tags or [],
+        console_team_id=console_team_id,
+    )
 
 
 def _first_token(tokens: Sequence[TokenInfo]) -> TokenInfo:
@@ -66,6 +77,27 @@ def test_token_pool_round_robin_respects_preferred_tags() -> None:
     assert pool.select_round_robin(prefer_tags={"console"}).token == "token-b"
     assert pool.select_round_robin(prefer_tags={"console"}).token == "token-c"
     assert pool.select_round_robin(prefer_tags={"console"}).token == "token-b"
+
+
+def test_token_info_console_team_fields_are_backward_compatible() -> None:
+    token = TokenInfo(token="token-a")
+
+    assert token.console_team_id == ""
+    assert token.console_team_name == ""
+    assert "console_team_id" in TokenInfo.model_fields
+    assert "console_team_name" in TokenInfo.model_fields
+
+
+def test_token_info_preserves_console_team_fields() -> None:
+    token = TokenInfo(
+        token="token-a",
+        console_team_id="33ec95d2-5364-4c7f-b1b3-b5bff151adb0",
+        console_team_name="Grok2API team token-a",
+    )
+    dumped = token.model_dump()
+
+    assert dumped["console_team_id"] == "33ec95d2-5364-4c7f-b1b3-b5bff151adb0"
+    assert dumped["console_team_name"] == "Grok2API team token-a"
 
 
 @pytest.mark.asyncio
@@ -154,6 +186,7 @@ async def test_console_execute_retries_with_next_token_after_error(
         payload: dict[str, str],
         *,
         token: str,
+        team_id: str | None = None,
     ) -> AsyncIterator[str]:
         used_tokens.append(token)
         if token == "token-a":
@@ -233,6 +266,7 @@ async def test_console_execute_records_blocked_user_and_uses_next_token(
         payload: dict[str, str],
         *,
         token: str,
+        team_id: str | None = None,
     ) -> AsyncIterator[str]:
         used_tokens.append(token)
         if token == "token-a":
@@ -315,6 +349,7 @@ async def test_console_execute_does_not_disable_cloudflare_403(
         payload: dict[str, str],
         *,
         token: str,
+        team_id: str | None = None,
     ) -> AsyncIterator[str]:
         used_tokens.append(token)
         if token == "token-a":
@@ -373,6 +408,81 @@ async def test_console_execute_does_not_disable_cloudflare_403(
     assert used_tokens == ["token-a", "token-b"]
     assert recorded == []
     assert result == ["ok:token-b"]
+
+
+@pytest.mark.asyncio
+async def test_console_execute_initializes_missing_team_id_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = TokenManager()
+    manager.initialized = True
+    manager.pools["ssoBasic"] = TokenPool("ssoBasic")
+    manager.pools["ssoBasic"].add(_token("token-a", console_team_id=""))
+    seen_team_ids: list[str | None] = []
+    ensure_calls: list[tuple[str, str, str]] = []
+
+    async def fake_get_token_manager() -> TokenManager:
+        return manager
+
+    async def fake_reload_if_stale() -> None:
+        return None
+
+    async def fake_ensure_console_team_id(
+        token_info: TokenInfo,
+        pool_name: str,
+        *,
+        trigger: str = "request",
+    ) -> str:
+        ensure_calls.append((token_info.token, pool_name, trigger))
+        token_info.console_team_id = "33ec95d2-5364-4c7f-b1b3-b5bff151adb0"
+        return token_info.console_team_id
+
+    async def fake_stream_upstream(
+        payload: dict[str, str],
+        *,
+        token: str,
+        team_id: str | None = None,
+    ) -> AsyncIterator[str]:
+        seen_team_ids.append(team_id)
+        yield f"ok:{payload['token']}"
+
+    def fake_get_config(key: str, default: object = None) -> object:
+        if key == "retry.max_retry":
+            return 1
+        return default
+
+    async def build_payload(token: str) -> dict[str, str]:
+        return {"token": token}
+
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.console_channel.get_token_manager",
+        fake_get_token_manager,
+    )
+    monkeypatch.setattr(manager, "reload_if_stale", fake_reload_if_stale)
+    monkeypatch.setattr(
+        manager,
+        "ensure_console_team_id",
+        fake_ensure_console_team_id,
+    )
+    monkeypatch.setattr(
+        "grok2api.services.grok.services.console_channel.get_config",
+        fake_get_config,
+    )
+    monkeypatch.setattr(
+        ConsoleChannelService,
+        "_stream_upstream",
+        fake_stream_upstream,
+    )
+
+    result = await ConsoleChannelService._execute_with_token(
+        "grok-4.3",
+        build_payload,
+        stream=False,
+    )
+
+    assert ensure_calls == [("token-a", "ssoBasic", "request")]
+    assert seen_team_ids == ["33ec95d2-5364-4c7f-b1b3-b5bff151adb0"]
+    assert result == ["ok:token-a"]
 
 
 @pytest.mark.asyncio

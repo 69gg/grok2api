@@ -25,6 +25,8 @@ Console Chat / Responses / Messages 与 Console Voice（TTS、STT、voices、STT
 
 Console Chat 的 `/v1/responses` 逆向请求复刻 Playground 登录态路径：使用 SSO Cookie、`x-cluster` 与 Sentry tracing headers，不发送 `Authorization: Bearer anonymous`、`x-statsig-id` 或 `x-xai-request-id`。服务会剥离 `proxy.cf_cookies` 中浏览器残留的 `last-team-id` 与 playground/voice team 计数 cookie，避免把某个浏览器 team 状态污染到账号池请求。官方 `api.x.ai` API key 路径不属于这个 SSO 逆向通道，仍会按真实 team credits/licenses 校验。
 
+每个 SSO 号可以携带独立的 `console_team_id`。当 Console Chat 请求选中缺少该字段的账号时，服务会先用该账号的 `sso/sso-rw` 通过 `auth_mgmt.AuthManagement/CreateTeam` 创建 team，解析 gRPC-Web 响应里的 team id，持久化到该 token 后再请求 `/v1/responses`。后台默认每 60 秒主动扫描 `ssoBasic` 中缺失 `console_team_id` 的可用账号并补全，避免流量请求首次命中时才创建。`CreateTeam` 与 Console 请求都优先使用 `proxy.console_proxy_url`，为空时回退 `proxy.base_proxy_url`。
+
 ## CF 自动刷新
 
 `proxy.enabled = true` 时，`TokenRefreshScheduler` 会单独启动 `cf_clearance` 刷新循环。这个循环在启动后立即刷新一次，后续按 `proxy.refresh_interval` 续期；它复用 `register.solver_url`，本机地址且 `register.auto_start_solver = true` 时会自动启动内置 solver。

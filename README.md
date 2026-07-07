@@ -16,6 +16,7 @@ uv run granian --interface asgi grok2api.main:app --host 0.0.0.0 --port 8000
 - `config.toml.example`：完整示例配置，提交到仓库。
 - 环境变量可覆盖少量路径和日志配置：`DATA_DIR`、`LOG_DIR`、`LOG_LEVEL`。
 - `proxy.console_proxy_url`：Console 通道专用代理，覆盖 `console.x.ai` 的 Chat/Responses/Messages 与 Voice REST/WS；为空时回退 `proxy.base_proxy_url`。
+- `token.console_team_auto_init_enabled`：默认开启。服务会为缺少 `console_team_id` 的 `ssoBasic` 主动调用 Console `CreateTeam`，并把每号 team id 持久化到账号数据；请求命中缺字段账号时也会先补全再访问 Console。
 
 ## Cloudflare Clearance
 

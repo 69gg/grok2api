@@ -74,6 +74,8 @@ class TokenInfo(BaseModel):
     tags: List[str] = Field(default_factory=list)
     note: str = ""
     last_asset_clear_at: Optional[int] = None
+    console_team_id: str = ""
+    console_team_name: str = ""
 
     @field_validator("token", mode="before")
     @classmethod

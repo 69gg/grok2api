@@ -68,8 +68,9 @@ class ConsoleResponsesReverse:
         payload: Dict[str, Any],
         *,
         stream: bool = True,
+        team_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
-        headers = build_console_headers(cookie_token=token)
+        headers = build_console_headers(cookie_token=token, team_id=team_id)
         timeout = float(CONSOLE_TIMEOUT)
         browser = get_config("proxy.browser")
         active_proxy_key = None

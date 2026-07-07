@@ -359,6 +359,7 @@ def build_console_sso_cookie(
     *,
     cf_cookies: Optional[str] = None,
     cf_clearance: Optional[str] = None,
+    team_id: Optional[str] = None,
 ) -> str:
     """Build SSO cookie for console.x.ai, reusing proxy CF clearance when present."""
     sso_token = sso_token[4:] if sso_token.startswith("sso=") else sso_token
@@ -384,6 +385,11 @@ def build_console_sso_cookie(
         ).strip("; ")
     if merged_cf:
         cookie = f"{cookie}; {merged_cf}" if cookie else merged_cf
+    team_id = _sanitize_header_value(
+        team_id or "", field_name="console_team_id", remove_all_spaces=True
+    )
+    if team_id:
+        cookie = f"{cookie}; last-team-id={team_id}" if cookie else f"last-team-id={team_id}"
     return cookie
 
 
@@ -416,13 +422,17 @@ def build_console_headers(
     *,
     content_type: Optional[str] = "application/json",
     cluster: Optional[str] = None,
+    team_id: Optional[str] = None,
 ) -> Dict[str, str]:
     """Build headers for console.x.ai /v1/responses."""
     user_agent = _sanitize_header_value(
         get_config("proxy.user_agent"), field_name="proxy.user_agent"
     )
     base_url = CONSOLE_BASE_URL.rstrip("/")
-    referer = f"{base_url}/"
+    team_id = _sanitize_header_value(
+        team_id or "", field_name="console_team_id", remove_all_spaces=True
+    )
+    referer = f"{base_url}/team/{team_id}/chat-playground" if team_id else f"{base_url}/"
     cluster_url = cluster or CONSOLE_DEFAULT_CLUSTER
 
     headers = {
@@ -437,7 +447,7 @@ def build_console_headers(
         "Sec-Fetch-Dest": "empty",
         "x-user-agent": "connect-es/2.1.1",
         "x-cluster": _sanitize_header_value(cluster_url, field_name="x-cluster"),
-        "Cookie": build_console_sso_cookie(cookie_token),
+        "Cookie": build_console_sso_cookie(cookie_token, team_id=team_id),
     }
     headers.update(_build_console_sentry_headers())
 

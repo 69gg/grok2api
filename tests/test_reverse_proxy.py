@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from grok2api.services.reverse.utils.headers import build_console_headers
 from grok2api.services.reverse.utils import proxy as proxy_utils
+from grok2api.services.reverse.console_team import (
+    build_create_team_payload,
+    parse_create_team_response,
+)
+from grok2api.services.reverse.utils.grpc import GrpcClient
 
 
 def test_console_proxy_keys_prefer_console_then_base() -> None:
@@ -101,3 +106,40 @@ def test_console_headers_strip_browser_team_cookies_without_team_id(monkeypatch)
     assert "last-team-id=" not in headers["Cookie"]
     assert "chat-playground-n:" not in headers["Cookie"]
     assert "voice-stt-n:" not in headers["Cookie"]
+
+
+def test_console_headers_include_token_team_id(monkeypatch) -> None:
+    values = {
+        "proxy.user_agent": "Mozilla/5.0 Chrome/136.0.0.0",
+        "proxy.browser": "chrome136",
+        "proxy.cf_cookies": "cf_clearance=abc; last-team-id=browser-team",
+        "proxy.cf_clearance": "",
+    }
+
+    def fake_get_config(key: str, default: object = None) -> object:
+        return values.get(key, default)
+
+    monkeypatch.setattr(
+        "grok2api.services.reverse.utils.headers.get_config",
+        fake_get_config,
+    )
+
+    team_id = "33ec95d2-5364-4c7f-b1b3-b5bff151adb0"
+    headers = build_console_headers("sso-token", team_id=team_id)
+
+    assert headers["Referer"] == f"https://console.x.ai/team/{team_id}/chat-playground"
+    assert "cf_clearance=abc" in headers["Cookie"]
+    assert "last-team-id=browser-team" not in headers["Cookie"]
+    assert f"last-team-id={team_id}" in headers["Cookie"]
+
+
+def test_console_create_team_payload_and_response_parser() -> None:
+    payload = build_create_team_payload("Alex's team")
+
+    assert payload == b"\x00\x00\x00\x00\r\x0a\x0bAlex's team"
+
+    team_id = "33ec95d2-5364-4c7f-b1b3-b5bff151adb0"
+    message = b"\x0a\x24" + team_id.encode("utf-8")
+    response = GrpcClient.encode_payload(message) + b"\x80\x00\x00\x00\x0fgrpc-status:0\r\n"
+
+    assert parse_create_team_response(response, "application/grpc-web+proto") == team_id

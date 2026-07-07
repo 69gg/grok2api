@@ -58,14 +58,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     token_refresh_enabled = bool(get_config("token.auto_refresh", True))
     cf_refresh_enabled = bool(get_config("proxy.enabled", False))
+    console_team_init_enabled = bool(
+        get_config("token.console_team_auto_init_enabled", True)
+    )
     scheduler = None
-    if token_refresh_enabled or cf_refresh_enabled:
+    if token_refresh_enabled or cf_refresh_enabled or console_team_init_enabled:
         basic_interval = float(get_config("token.refresh_interval_hours", 8) or 8)
         super_interval = float(get_config("token.super_refresh_interval_hours", 2) or 2)
         scheduler = get_scheduler(min(basic_interval, super_interval))
         scheduler.start(
             token_refresh_enabled=token_refresh_enabled,
             cf_refresh_enabled=cf_refresh_enabled,
+            console_team_init_enabled=console_team_init_enabled,
         )
 
     logger.info("Application startup complete.")

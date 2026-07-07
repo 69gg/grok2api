@@ -20,7 +20,6 @@ from grok2api.core.logger import logger
 from grok2api.services.grok.services.console_capabilities import (
     filter_payload,
     get_console_capabilities,
-    merge_tools,
     normalize_reasoning_effort,
     prepare_console_tooling,
     should_emit_plaintext_reasoning_summary,
@@ -33,7 +32,10 @@ from grok2api.services.grok.services.console_output_adapters import (
 from grok2api.services.grok.services.console_stream_parser import ConsoleStreamParser
 from grok2api.services.grok.services.model import Channel, ModelService
 from grok2api.services.grok.utils.errors import no_token_error
-from grok2api.services.grok.utils.retry import pick_token_round_robin, rate_limited
+from grok2api.services.grok.utils.retry import (
+    pick_token_info_round_robin,
+    rate_limited,
+)
 from grok2api.services.grok.utils.tool_call import format_tool_history
 from grok2api.services.reverse.console_payload import merge_console_payload, sanitize_console_upstream_payload
 from grok2api.services.reverse.console_responses import ConsoleResponsesReverse
@@ -245,6 +247,7 @@ class ConsoleChannelService:
         payload: Dict[str, Any],
         *,
         token: str,
+        team_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         session = AsyncSession()
         try:
@@ -253,6 +256,7 @@ class ConsoleChannelService:
                 token,
                 payload,
                 stream=True,
+                team_id=team_id,
             )
         except Exception:
             await session.close()
@@ -278,14 +282,23 @@ class ConsoleChannelService:
             async def gen():
                 last_err: Optional[UpstreamException] = None
                 for attempt in range(max_retries):
-                    token = await pick_token_round_robin(token_mgr, model_id, tried)
-                    if not token:
+                    selected = await pick_token_info_round_robin(
+                        token_mgr, model_id, tried
+                    )
+                    if not selected:
                         break
+                    pool_name, token_info = selected
+                    token = token_mgr.token_value(token_info)
                     tried.add(token)
                     try:
+                        team_id = await token_mgr.ensure_console_team_id(
+                            token_info,
+                            pool_name,
+                            trigger="request",
+                        )
                         payload = await build_payload_fn(token)
                         async for line in ConsoleChannelService._stream_upstream(
-                            payload, token=token
+                            payload, token=token, team_id=team_id
                         ):
                             yield line
                         return
@@ -308,17 +321,26 @@ class ConsoleChannelService:
             return gen()
 
         for attempt in range(max_retries):
-            token = await pick_token_round_robin(token_mgr, model_id, tried)
-            if not token:
+            selected = await pick_token_info_round_robin(
+                token_mgr, model_id, tried
+            )
+            if not selected:
                 if last_error:
                     raise last_error
                 raise no_token_error(model_id)
+            pool_name, token_info = selected
+            token = token_mgr.token_value(token_info)
             tried.add(token)
             try:
+                team_id = await token_mgr.ensure_console_team_id(
+                    token_info,
+                    pool_name,
+                    trigger="request",
+                )
                 payload = await build_payload_fn(token)
                 lines = []
                 async for line in ConsoleChannelService._stream_upstream(
-                    payload, token=token
+                    payload, token=token, team_id=team_id
                 ):
                     lines.append(line)
                 return lines

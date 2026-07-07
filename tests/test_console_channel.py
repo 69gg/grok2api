@@ -221,7 +221,7 @@ async def test_stream_upstream_does_not_double_close_returned_stream(monkeypatch
         async def close(self) -> None:
             self.close_count += 1
 
-    async def fake_request(session, token, payload, *, stream):
+    async def fake_request(session, token, payload, *, stream, team_id=None):
         async def gen():
             try:
                 yield "line-1"
@@ -238,7 +238,11 @@ async def test_stream_upstream_does_not_double_close_returned_stream(monkeypatch
     )
 
     chunks: list[str] = []
-    async for chunk in ConsoleChannelService._stream_upstream({"input": []}, token="token"):
+    async for chunk in ConsoleChannelService._stream_upstream(
+        {"input": []},
+        token="token",
+        team_id="33ec95d2-5364-4c7f-b1b3-b5bff151adb0",
+    ):
         chunks.append(chunk)
 
     assert chunks == ["line-1"]
@@ -258,7 +262,7 @@ async def test_stream_upstream_closes_session_when_request_fails(monkeypatch):
         async def close(self) -> None:
             self.close_count += 1
 
-    async def fake_request(session, token, payload, *, stream):
+    async def fake_request(session, token, payload, *, stream, team_id=None):
         raise UpstreamException(
             message="request failed before stream iterator",
             details={"status": 400},
@@ -272,7 +276,11 @@ async def test_stream_upstream_closes_session_when_request_fails(monkeypatch):
     )
 
     with pytest.raises(UpstreamException):
-        async for _ in ConsoleChannelService._stream_upstream({"input": []}, token="token"):
+        async for _ in ConsoleChannelService._stream_upstream(
+            {"input": []},
+            token="token",
+            team_id="33ec95d2-5364-4c7f-b1b3-b5bff151adb0",
+        ):
             pass
 
     assert len(sessions) == 1
@@ -331,6 +339,69 @@ async def test_console_responses_uses_console_proxy_first(monkeypatch):
         chunks.append(chunk)
 
     assert chunks == ["data: ok"]
+    assert calls[0]["proxy"] is None
+    assert calls[0]["proxies"] == {
+        "http": "http://console-proxy",
+        "https": "http://console-proxy",
+    }
+
+
+@pytest.mark.asyncio
+async def test_console_team_create_uses_console_proxy_first(monkeypatch):
+    from grok2api.services.reverse import console_team
+    from grok2api.services.reverse.utils.grpc import GrpcClient
+
+    calls: list[dict[str, object]] = []
+    team_id = "33ec95d2-5364-4c7f-b1b3-b5bff151adb0"
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "application/grpc-web+proto"}
+        content = (
+            GrpcClient.encode_payload(b"\x0a\x24" + team_id.encode("utf-8"))
+            + b"\x80\x00\x00\x00\x0fgrpc-status:0\r\n"
+        )
+
+    class FakeSession:
+        async def post(self, *args: Any, **kwargs: Any) -> FakeResponse:
+            calls.append(kwargs)
+            return FakeResponse()
+
+    def fake_proxy_kwargs(*keys: str) -> CurlCffiProxyKwargs:
+        assert keys == ("proxy.console_proxy_url", "proxy.base_proxy_url")
+        return CurlCffiProxyKwargs(
+            "proxy.console_proxy_url",
+            None,
+            {"http": "http://console-proxy", "https": "http://console-proxy"},
+        )
+
+    monkeypatch.setattr(console_team, "build_curl_cffi_proxy_kwargs", fake_proxy_kwargs)
+    monkeypatch.setattr(
+        console_team,
+        "get_config",
+        lambda key, default=None: {
+            "proxy.browser": "chrome136",
+            "proxy.user_agent": "Mozilla/5.0 Chrome/136.0.0.0",
+            "token.console_team_init_timeout": 120,
+        }.get(key, default),
+    )
+    monkeypatch.setattr(
+        "grok2api.services.reverse.utils.retry.get_config",
+        lambda key, default=None: {
+            "retry.max_retry": 0,
+            "retry.retry_status_codes": [502],
+            "retry.retry_budget": 1.0,
+            "retry.retry_backoff_base": 0.1,
+            "retry.retry_backoff_factor": 2.0,
+            "retry.retry_backoff_max": 1.0,
+        }.get(key, default),
+    )
+
+    assert await console_team.ConsoleTeamReverse.create(
+        FakeSession(),
+        "token",
+        "Grok2API team token",
+    ) == team_id
     assert calls[0]["proxy"] is None
     assert calls[0]["proxies"] == {
         "http": "http://console-proxy",

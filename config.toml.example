@@ -108,6 +108,18 @@ on_demand_refresh_enabled = true
 on_demand_refresh_min_interval_sec = 300
 # 请求侧按需刷新最大检查 Token 数量
 on_demand_refresh_max_tokens = 100
+# 是否启用 Console team_id 自动补全；缺少 team_id 的 ssoBasic 会主动调用 Console CreateTeam 并持久化
+console_team_auto_init_enabled = true
+# Console team_id 后台补全间隔（秒）
+console_team_auto_init_interval_sec = 60
+# Console team_id 后台补全并发数
+console_team_auto_init_concurrency = 5
+# Console team_id 每轮最多补全 Token 数量
+console_team_auto_init_batch_size = 100
+# 自动创建 Console team 时使用的名称前缀
+console_team_name_prefix = "Grok2API team"
+# Console CreateTeam 请求超时（秒）
+console_team_init_timeout = 120
 # 启用消耗模式（试验性功能，默认关闭）
 consumed_mode_enabled = false
 

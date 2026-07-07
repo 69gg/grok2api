@@ -43,6 +43,16 @@ def test_console_proxy_config_defaults_to_empty() -> None:
     assert config_example["proxy"]["console_proxy_url"] == ""
 
 
+def test_console_team_auto_init_config_defaults() -> None:
+    config_example = tomllib.loads((ROOT / "config.toml.example").read_text(encoding="utf-8"))
+    token_config = config_example["token"]
+    assert token_config["console_team_auto_init_enabled"] is True
+    assert token_config["console_team_auto_init_interval_sec"] == 60
+    assert token_config["console_team_auto_init_concurrency"] == 5
+    assert token_config["console_team_auto_init_batch_size"] == 100
+    assert token_config["console_team_name_prefix"] == "Grok2API team"
+
+
 def test_retry_config_defaults_to_more_token_attempts() -> None:
     config_example = tomllib.loads((ROOT / "config.toml.example").read_text(encoding="utf-8"))
     assert config_example["retry"]["max_retry"] == 30

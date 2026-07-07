@@ -15,6 +15,8 @@ from grok2api.services.token.manager import get_token_manager
 CF_CLEARANCE_DEFAULT_INTERVAL_SECONDS = 25 * 60
 CF_CLEARANCE_LOCK_SECONDS = 35 * 60
 CF_CLEARANCE_STOP_TIMEOUT_SECONDS = 25.0
+CONSOLE_TEAM_DEFAULT_INTERVAL_SECONDS = 60
+CONSOLE_TEAM_LOCK_SECONDS = 10 * 60
 LOCAL_SOLVER_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 
@@ -38,6 +40,17 @@ def _cf_refresh_interval_seconds() -> int:
         get_config("proxy.refresh_interval", CF_CLEARANCE_DEFAULT_INTERVAL_SECONDS),
         CF_CLEARANCE_DEFAULT_INTERVAL_SECONDS,
         minimum=60,
+    )
+
+
+def _console_team_init_interval_seconds() -> int:
+    return _as_int(
+        get_config(
+            "token.console_team_auto_init_interval_sec",
+            CONSOLE_TEAM_DEFAULT_INTERVAL_SECONDS,
+        ),
+        CONSOLE_TEAM_DEFAULT_INTERVAL_SECONDS,
+        minimum=10,
     )
 
 
@@ -117,6 +130,7 @@ class TokenRefreshScheduler:
         self.interval_seconds = interval_hours * 3600
         self._task: Optional[asyncio.Task] = None
         self._cf_task: Optional[asyncio.Task] = None
+        self._console_team_task: Optional[asyncio.Task] = None
         self._cf_solver: TurnstileSolverProcess | None = None
         self._cf_stop_event: threading.Event | None = None
         self._running = False
@@ -262,11 +276,91 @@ class TokenRefreshScheduler:
         finally:
             await self._stop_cf_solver()
 
+    async def _run_console_team_init_with_lock(self) -> None:
+        storage = get_storage()
+        lock_acquired = False
+        lock = None
+
+        try:
+            if isinstance(storage, RedisStorage):
+                lock = storage.redis.lock(
+                    "grok2api:lock:console_team_init",
+                    timeout=CONSOLE_TEAM_LOCK_SECONDS,
+                    blocking_timeout=0,
+                )
+                lock_acquired = await lock.acquire(blocking=False)
+                if not lock_acquired:
+                    logger.info("Console team init: skipped (lock not acquired)")
+                    return
+                manager = await get_token_manager()
+                await manager.reload_if_stale()
+                await manager.init_missing_console_team_ids(
+                    trigger="scheduler",
+                    max_tokens=_as_int(
+                        get_config("token.console_team_auto_init_batch_size", 100),
+                        100,
+                    ),
+                    concurrency=_as_int(
+                        get_config("token.console_team_auto_init_concurrency", 5),
+                        5,
+                    ),
+                )
+                return
+
+            try:
+                async with storage.acquire_lock("console_team_init", timeout=1):
+                    manager = await get_token_manager()
+                    await manager.reload_if_stale()
+                    await manager.init_missing_console_team_ids(
+                        trigger="scheduler",
+                        max_tokens=_as_int(
+                            get_config("token.console_team_auto_init_batch_size", 100),
+                            100,
+                        ),
+                        concurrency=_as_int(
+                            get_config("token.console_team_auto_init_concurrency", 5),
+                            5,
+                        ),
+                    )
+            except StorageError:
+                logger.info("Console team init: skipped (lock not acquired)")
+        finally:
+            if lock is not None and lock_acquired:
+                try:
+                    await lock.release()
+                except Exception:
+                    pass
+
+    async def _console_team_init_loop(self) -> None:
+        """主动补全 Console team id 的后台循环。"""
+        interval_seconds = _console_team_init_interval_seconds()
+        logger.info(
+            "Scheduler: console team init loop started (interval: {}s)",
+            interval_seconds,
+        )
+
+        try:
+            while self._running:
+                try:
+                    await self._run_console_team_init_with_lock()
+                except Exception as e:
+                    logger.warning(f"Scheduler: console team init error - {e}")
+
+                deadline = asyncio.get_running_loop().time() + interval_seconds
+                while self._running:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(1.0, remaining))
+        except asyncio.CancelledError:
+            raise
+
     def start(
         self,
         *,
         token_refresh_enabled: bool = True,
         cf_refresh_enabled: bool | None = None,
+        console_team_init_enabled: bool | None = None,
     ) -> None:
         """启动调度器"""
         if self._running:
@@ -275,6 +369,11 @@ class TokenRefreshScheduler:
 
         if cf_refresh_enabled is None:
             cf_refresh_enabled = _as_bool(get_config("proxy.enabled", False), False)
+        if console_team_init_enabled is None:
+            console_team_init_enabled = _as_bool(
+                get_config("token.console_team_auto_init_enabled", True),
+                True,
+            )
 
         self._running = True
         if token_refresh_enabled:
@@ -282,6 +381,10 @@ class TokenRefreshScheduler:
         if cf_refresh_enabled:
             self._cf_stop_event = threading.Event()
             self._cf_task = asyncio.create_task(self._cf_clearance_loop())
+        if console_team_init_enabled:
+            self._console_team_task = asyncio.create_task(
+                self._console_team_init_loop()
+            )
         logger.info("Scheduler: enabled")
 
     async def stop(self) -> None:
@@ -297,6 +400,9 @@ class TokenRefreshScheduler:
         if self._task:
             self._task.cancel()
             tasks.append(self._task)
+        if self._console_team_task:
+            self._console_team_task.cancel()
+            tasks.append(self._console_team_task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -312,6 +418,7 @@ class TokenRefreshScheduler:
 
         await self._stop_cf_solver()
         self._task = None
+        self._console_team_task = None
         self._cf_task = None
         self._cf_stop_event = None
         logger.info("Scheduler: stopped")

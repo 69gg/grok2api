@@ -32,6 +32,8 @@ DEFAULT_USAGE_FLUSH_INTERVAL_SEC = 5
 DEFAULT_ON_DEMAND_REFRESH_MIN_INTERVAL_SEC = 300
 DEFAULT_ON_DEMAND_REFRESH_MAX_TOKENS = 100
 DEFAULT_ON_DEMAND_REFRESH_LOCK_TIMEOUT_SEC = 5
+DEFAULT_CONSOLE_TEAM_INIT_BATCH_SIZE = 100
+DEFAULT_CONSOLE_TEAM_NAME_PREFIX = "Grok2API team"
 SUPER_WINDOW_THRESHOLD_SECONDS = 14400
 
 SUPER_POOL_NAME = "ssoSuper"
@@ -67,6 +69,7 @@ class TokenManager:
         self._dirty_deletes = set()
         self._on_demand_refresh_lock = asyncio.Lock()
         self._last_on_demand_refresh_at = 0.0
+        self._console_team_locks: Dict[str, asyncio.Lock] = {}
 
     @classmethod
     async def get_instance(cls) -> "TokenManager":
@@ -339,6 +342,11 @@ class TokenManager:
             return token[4:]
         return token
 
+    @staticmethod
+    def token_value(token_info: TokenInfo) -> str:
+        """Return the normalized token string used by upstream requests."""
+        return TokenManager._token_value(token_info)
+
     def get_token(self, pool_name: str = "ssoBasic", exclude: set = None, prefer_tags: Optional[Set[str]] = None) -> Optional[str]:
         """
         获取可用 Token
@@ -390,6 +398,25 @@ class TokenManager:
             return None
 
         return self._token_value(token_info)
+
+    def get_token_info_round_robin(
+        self,
+        pool_name: str = "ssoBasic",
+        exclude: Optional[Set[str]] = None,
+        prefer_tags: Optional[Set[str]] = None,
+    ) -> Optional["TokenInfo"]:
+        """按池内顺序轮询获取可用 TokenInfo。"""
+        pool = self.pools.get(pool_name)
+        if not pool:
+            logger.debug(f"Pool '{pool_name}' not found")
+            return None
+
+        token_info = pool.select_round_robin(exclude=exclude, prefer_tags=prefer_tags)
+        if not token_info:
+            logger.debug(f"No available token in pool '{pool_name}'")
+            return None
+
+        return token_info
 
     def get_token_info(
         self,
@@ -907,6 +934,168 @@ class TokenManager:
         if not pool:
             return []
         return pool.list()
+
+    def _console_team_name_for_token(self, token_info: TokenInfo) -> str:
+        configured = str(token_info.console_team_name or "").strip()
+        if configured:
+            return configured
+        prefix = str(
+            get_config(
+                "token.console_team_name_prefix",
+                DEFAULT_CONSOLE_TEAM_NAME_PREFIX,
+            )
+            or DEFAULT_CONSOLE_TEAM_NAME_PREFIX
+        ).strip()
+        if not prefix:
+            prefix = DEFAULT_CONSOLE_TEAM_NAME_PREFIX
+        suffix = token_info.token[:8] if token_info.token else "default"
+        return f"{prefix} {suffix}"
+
+    def _console_team_lock_for_token(self, token: str) -> asyncio.Lock:
+        raw_token = token[4:] if token.startswith("sso=") else token
+        lock = self._console_team_locks.get(raw_token)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._console_team_locks[raw_token] = lock
+        return lock
+
+    async def ensure_console_team_id(
+        self,
+        token_info: TokenInfo,
+        pool_name: str,
+        *,
+        trigger: str = "request",
+    ) -> str:
+        """Ensure the token has a console team id, creating and persisting one if missing."""
+        team_id = str(token_info.console_team_id or "").strip()
+        if team_id:
+            return team_id
+
+        lock = self._console_team_lock_for_token(token_info.token)
+        async with lock:
+            team_id = str(token_info.console_team_id or "").strip()
+            if team_id:
+                return team_id
+
+            from curl_cffi.requests import AsyncSession
+
+            from grok2api.services.reverse.console_team import ConsoleTeamReverse
+
+            team_name = self._console_team_name_for_token(token_info)
+            logger.info(
+                "Console team init: creating team for token {}... trigger={} pool={}",
+                token_info.token[:10],
+                trigger,
+                pool_name,
+            )
+            session = AsyncSession()
+            try:
+                team_id = await ConsoleTeamReverse.create(
+                    session,
+                    token_info.token,
+                    team_name,
+                )
+            finally:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+
+            token_info.console_team_id = team_id
+            if not token_info.console_team_name:
+                token_info.console_team_name = team_name
+            self._track_token_change(token_info, pool_name, "state")
+            await self._save(force=True)
+            logger.info(
+                "Console team init: token {}... assigned team_id={} trigger={}",
+                token_info.token[:10],
+                team_id,
+                trigger,
+            )
+            return team_id
+
+    async def init_missing_console_team_ids(
+        self,
+        *,
+        trigger: str = "scheduler",
+        max_tokens: Optional[int] = None,
+        concurrency: int = 5,
+    ) -> Dict[str, int]:
+        """Create and persist console team ids for ssoBasic tokens that do not have one."""
+        pool = self.pools.get(BASIC_POOL_NAME)
+        if not pool:
+            return {"checked": 0, "created": 0, "failed": 0, "skipped": 0}
+
+        candidates: List[TokenInfo] = []
+        skipped = 0
+        consumed_mode = self._is_consumed_mode()
+        for token_info in pool:
+            if token_info.console_team_id:
+                skipped += 1
+                continue
+            if not token_info.is_available(consumed_mode=consumed_mode):
+                skipped += 1
+                continue
+            candidates.append(token_info)
+
+        if max_tokens is None:
+            max_tokens = int(
+                get_config(
+                    "token.console_team_auto_init_batch_size",
+                    DEFAULT_CONSOLE_TEAM_INIT_BATCH_SIZE,
+                )
+                or DEFAULT_CONSOLE_TEAM_INIT_BATCH_SIZE
+            )
+        max_tokens = max(1, int(max_tokens))
+        selected = candidates[:max_tokens]
+        if not selected:
+            logger.debug(
+                "Console team init: trigger={}, no missing team ids (skipped={})",
+                trigger,
+                skipped,
+            )
+            return {"checked": 0, "created": 0, "failed": 0, "skipped": skipped}
+
+        concurrency = max(1, int(concurrency or 1))
+        sem = asyncio.Semaphore(concurrency)
+        created = 0
+        failed = 0
+
+        async def _init_one(token_info: TokenInfo) -> bool:
+            async with sem:
+                try:
+                    await self.ensure_console_team_id(
+                        token_info,
+                        BASIC_POOL_NAME,
+                        trigger=trigger,
+                    )
+                    return True
+                except Exception as exc:
+                    logger.warning(
+                        "Console team init: token {}... failed trigger={} error={}",
+                        token_info.token[:10],
+                        trigger,
+                        exc,
+                    )
+                    return False
+
+        results = await asyncio.gather(*[_init_one(token_info) for token_info in selected])
+        created = sum(1 for ok in results if ok)
+        failed = len(results) - created
+        logger.info(
+            "Console team init: trigger={} checked={} created={} failed={} skipped={}",
+            trigger,
+            len(selected),
+            created,
+            failed,
+            skipped,
+        )
+        return {
+            "checked": len(selected),
+            "created": created,
+            "failed": failed,
+            "skipped": skipped,
+        }
 
     async def refresh_cooling_tokens(
         self,
