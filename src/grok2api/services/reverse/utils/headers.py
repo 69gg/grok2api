@@ -371,8 +371,44 @@ def build_console_sso_cookie(
         cf_clearance if cf_clearance is not None else get_config("proxy.cf_clearance") or "",
     )
     if merged_cf:
+        merged_cf = re.sub(
+            r"(?:^|;\s*)last-team-id=[^;]*",
+            "",
+            merged_cf,
+        ).strip("; ")
+    if merged_cf:
+        merged_cf = re.sub(
+            r"(?:^|;\s*)(?:chat-playground-n|voice-stt-n|voice-tts-n):[^=;]+=[^;]*",
+            "",
+            merged_cf,
+        ).strip("; ")
+    if merged_cf:
         cookie = f"{cookie}; {merged_cf}" if cookie else merged_cf
     return cookie
+
+
+def _build_console_sentry_headers() -> Dict[str, str]:
+    """Build Sentry tracing headers used by Console Playground fetches."""
+    trace_id = uuid.uuid4().hex
+    span_id = uuid.uuid4().hex[:16]
+    transaction = "GET%20%2Fchat-playground"
+    baggage = ",".join(
+        (
+            "sentry-environment=production",
+            "sentry-release=ec8ce3d25d9c2c881a9b793ba894475fb35b8610",
+            "sentry-public_key=2c359cd5d0075e2b21b60bc8d48f0a27",
+            f"sentry-trace_id={trace_id}",
+            "sentry-org_id=4508179396558848",
+            f"sentry-transaction={transaction}",
+            "sentry-sampled=true",
+            "sentry-sample_rand=0.6153690660622317",
+            "sentry-sample_rate=0",
+        )
+    )
+    return {
+        "sentry-trace": f"{trace_id}-{span_id}-0",
+        "baggage": baggage,
+    }
 
 
 def build_console_headers(
@@ -392,18 +428,18 @@ def build_console_headers(
     headers = {
         "Accept-Encoding": "gzip, deflate, br, zstd",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Authorization": "Bearer anonymous",
+        "Accept": "*/*",
         "Origin": base_url,
         "Referer": _sanitize_header_value(referer, field_name="referer"),
         "User-Agent": user_agent,
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
         "Sec-Fetch-Dest": "empty",
+        "x-user-agent": "connect-es/2.1.1",
         "x-cluster": _sanitize_header_value(cluster_url, field_name="x-cluster"),
-        "x-statsig-id": StatsigGenerator.gen_id(),
-        "x-xai-request-id": str(uuid.uuid4()),
         "Cookie": build_console_sso_cookie(cookie_token),
     }
+    headers.update(_build_console_sentry_headers())
 
     resolved_browser = resolve_proxy_browser(get_config("proxy.browser"), user_agent)
     client_hints = _build_client_hints(resolved_browser, user_agent)
@@ -412,11 +448,6 @@ def build_console_headers(
 
     if content_type:
         headers["Content-Type"] = content_type
-        if content_type == "application/json":
-            headers["Accept"] = "text/event-stream" if content_type else "*/*"
-
-    if content_type == "application/json":
-        headers["Accept"] = "text/event-stream, application/json"
 
     return headers
 

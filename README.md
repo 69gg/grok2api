@@ -90,6 +90,8 @@ Responses API 可直接传 `input_image`：
 
 Console Chat 请求优先使用 `proxy.console_proxy_url`，未配置时回退 `proxy.base_proxy_url`。两个字段都支持逗号分隔多个代理，并沿用现有粘性选择与失败轮换。
 
+Console Chat 的 SSO 逆向请求使用 `console.x.ai/v1/responses` 登录态 Cookie，不发送 `Authorization: Bearer anonymous`，并携带 Console Playground 同类的 tracing headers 与 `x-cluster`。服务会剥离 `proxy.cf_cookies` 中浏览器残留的 team 相关 cookie，避免把某个浏览器 team 状态污染到账号池请求。官方 `api.x.ai + xai-... API key` 路径仍按真实 team credits/licenses 计费，不属于这个 SSO 逆向通道。
+
 | model_id | 说明 |
 |---|---|
 | `grok-4.3` / `grok-4.3-search` | grok-4.3；`-search` 自动启用 web/x 搜索 |
