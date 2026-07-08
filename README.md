@@ -15,7 +15,7 @@ uv run granian --interface asgi grok2api.main:app --host 0.0.0.0 --port 8000
 - `config.toml`：本地运行配置，已加入 `.gitignore`。
 - `config.toml.example`：完整示例配置，提交到仓库。
 - 环境变量可覆盖少量路径和日志配置：`DATA_DIR`、`LOG_DIR`、`LOG_LEVEL`。
-- `proxy.console_proxy_url`：Console 通道专用代理，覆盖 `console.x.ai` 的 Chat/Responses/Messages 与 Voice REST/WS；为空时回退 `proxy.base_proxy_url`。
+- `proxy.console_proxy_url`：Console 通道专用代理，覆盖 `console.x.ai` 的 Chat/Responses/Messages、Images 与 Voice REST/WS；为空时回退 `proxy.base_proxy_url`。
 - `token.console_team_auto_init_enabled`：默认开启。服务会为缺少 `console_team_id` 的 `ssoBasic` 主动调用 Console `CreateTeam`，并把每号 team id 持久化到账号数据；请求命中缺字段账号时也会先补全再访问 Console。
 
 ## Cloudflare Clearance
@@ -30,11 +30,11 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 
 ## 模型池规则
 
-- `ssoBasic`：支持 `grok-4.3-fast`、`grok-imagine-1.0`、`grok-imagine-1.0-edit`，以及全部 **Console Chat Playground** 与 **Console Voice（TTS/STT/translations + STT WS）** 模型（见下）。
+- `ssoBasic`：支持 `grok-4.3-fast`、`grok-imagine-1.0`、`grok-imagine-1.0-edit`、`grok-imagine-image`，以及全部 **Console Chat Playground** 与 **Console Voice（TTS/STT/translations + STT WS）** 模型（见下）。
 - `ssoSuper`：保持旧项目模型能力。
-- 模型目录与同名模型解析统一按 **Console > Basic app > other** 优先级处理；例如 Console 与 grok.com/super 同名时优先走 Console 通道。
-- Grok 与 Console Chat / Voice 上游调用会按候选池顺序轮询可用 SSO 号；单次请求失败重试时会排除本请求已试过的号，再继续选下一个，429 会标记当前号 cooling 后换号重试。
-- 图片生成/编辑内部使用 `grok-4.3`。
+- 模型目录与同名模型解析统一按 **Console > ssoBasic > ssoSuper > other** 优先级处理；例如 Console 与 grok.com/super 同名时优先走 Console 通道。
+- Grok 与 Console Chat / Voice / Image 上游调用会按候选池顺序轮询可用 SSO 号；单次请求失败重试时会排除本请求已试过的号，再继续选下一个，429 会标记当前号 cooling 后换号重试。
+- `grok-imagine-image` 是 Console 原生图片模型，支持 `/v1/images/generations` 与 `/v1/images/edits`；旧的 `grok-imagine-image-edit` 只保留为 legacy grok.com 路径。
 
 ## 图片输入（Vision）
 
@@ -46,11 +46,11 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 |---|---|---|
 | Console 模型 + `/v1/chat/completions` | ✅ | OpenAI `image_url` → 上游 `input_image`（URL 直传，不上传） |
 | Console 模型 + `/v1/responses` | ✅ | `input_image` 或 message 内嵌图片 block；多轮 replay 支持 |
-| Console 模型 + `/v1/messages` | ❌ | Anthropic 路径暂不支持 user `image` block |
+| Console 模型 + `/v1/messages` | ✅ | Console 原生 Anthropic Messages 透传 |
 | grok.com 模型 + `/v1/chat/completions` | ✅ | 图片先上传 Grok assets，再走 `fileAttachments` |
 | grok.com 模型 + `/v1/responses` | ✅ | 内部转换为 Chat 消息后走同一上传链路 |
-| `grok-imagine-*` | — | 文生图 / 图生图专用，不是通用 vision chat |
-| `/v1/videos/*` | — | 可将图片作为视频 reference，不是聊天 vision |
+| `grok-imagine-image` | — | Console 原生文生图 / 图生图专用，不是通用 vision chat |
+| `/v1/videos/*` | — | 不接 Console 原生 video；继续使用 grok.com legacy 路径 |
 
 ### 请求格式
 
@@ -85,13 +85,38 @@ Responses API 可直接传 `input_image`：
 - Console 通道不做本地上传，URL 原样转发 upstream；公网 HTTPS 最稳妥。
 - grok.com 通道（如 `grok-4.3-fast`）会下载 URL / 解析 data URI 后上传，需 SSO 号具备 upload 能力。
 
+## Console 原生端点
+
+Console 原生端点只重写 SSO Cookie、team id、`x-cluster`、Referer 与浏览器类 headers，然后把请求体透传到 `console.x.ai`。返回体同样直接返回给客户端；上游响应头不会原样透传，内部记录的 `set-cookie`、鉴权类 header 会脱敏。
+
+当前直接透传的 Console 原生路径：
+
+| 本地端点 | Console 上游路径 | 说明 |
+|---|---|---|
+| `POST /v1/responses` | `/v1/responses` | Console chat 模型原生 Responses |
+| `POST /v1/chat/completions` | `/v1/chat/completions` | Console chat 模型原生 Chat Completions |
+| `POST /v1/messages` | `/v1/messages` | Console chat 模型原生 Anthropic Messages |
+| `POST /v1/images/generations` | `/v1/images/generations` | `grok-imagine-image`，强制 `response_format=b64_json` |
+| `POST /v1/images/edits` | `/v1/images/edits` | multipart 图片会转成 JSON data URI 后透传，强制 `response_format=b64_json` |
+| `POST /v1/audio/speech` | `/v1/audio/speech` | 优先原生；失败时回退旧 `/v1/tts` 映射 |
+
+项目里仍存在但不是 Console 原生透传的路径：
+
+| 本地能力 | 当前实现 |
+|---|---|
+| `/v1/models` | 本地模型目录，不请求 Console `/v1/models` |
+| `/v1/audio/transcriptions`、`/v1/audio/translations`、`/v1/audio/voices` | 继续使用 Console Voice `/v1/stt`、`/v1/tts/voices` 等兼容映射 |
+| `WS /v1/audio/stt/ws` | 继续透传 Console Voice WebSocket `/v1/stt` |
+| `/v1/videos/*` | 不接 Console video；继续使用 grok.com legacy video 路径 |
+| `/v1/files/*`、assets 上传下载 | 本地/grok.com 兼容能力，不是 Console 原生 |
+
 ## Console Chat Playground 模型
 
 通过 `console.x.ai` SSO 逆向的 Playground 免费高级模型。在 `GET /v1/models` 中 `owned_by` 为 `xai-console`。
 
 Console Chat 请求优先使用 `proxy.console_proxy_url`，未配置时回退 `proxy.base_proxy_url`。两个字段都支持逗号分隔多个代理，并沿用现有粘性选择与失败轮换。
 
-Console Chat 的 SSO 逆向请求使用 `console.x.ai/v1/responses` 登录态 Cookie，不发送 `Authorization: Bearer anonymous`，并携带 Console Playground 同类的 tracing headers 与 `x-cluster`。服务会剥离 `proxy.cf_cookies` 中浏览器残留的 team 相关 cookie，避免把某个浏览器 team 状态污染到账号池请求。官方 `api.x.ai + xai-... API key` 路径仍按真实 team credits/licenses 计费，不属于这个 SSO 逆向通道。
+Console Chat 的 SSO 逆向请求使用 `console.x.ai/v1/*` 登录态 Cookie，不发送 `Authorization: Bearer anonymous`，并携带 Console Playground 同类的 tracing headers 与 `x-cluster`。服务会剥离 `proxy.cf_cookies` 中浏览器残留的 team 相关 cookie，避免把某个浏览器 team 状态污染到账号池请求。官方 `api.x.ai + xai-... API key` 路径仍按真实 team credits/licenses 计费，不属于这个 SSO 逆向通道。
 
 | model_id | 说明 |
 |---|---|
@@ -130,49 +155,17 @@ Console Chat 的 SSO 逆向请求使用 `console.x.ai/v1/responses` 登录态 Co
 
 ### 与 grok.com 通道的区别
 
-- 除 `grok-4.20-multi-agent-0309` 外，Console 模型走 **xAI Responses API 原生 tool call**。
-- `grok-4.20-multi-agent-0309`（含 `-search` 变体）走 **prompt tool call**：客户端 function tools 写入 `instructions`（与 grok.com 相同的 `<call>` 协议），响应由网关解析为 OpenAI `tool_calls` / Responses `function_call`；无 tools 时不注入 tool prompt。
-- `-search` 变体在 prompt tool call 之外，额外向上游注入 `web_search` / `x_search` 开启内置搜索；**不会**因此改用原生 function calling。
-- Token 用量来自上游 `response.completed.usage`，不是本地估算。
-
-### Tool Call（Console）
-
-| 模型 | function tools | 搜索 |
-|---|---|---|
-| `grok-4.3` 等（非 multi-agent） | 原生 Responses API `tools` + `tool_choice` | 仅 `-search` 变体自动注入 |
-| `grok-4.20-multi-agent-0309` | prompt → `instructions`（`<call>` 协议） | 无 |
-| `grok-4.20-multi-agent-0309-search` | 同上 prompt tool call | 额外注入 `web_search` / `x_search` |
-
-- multi-agent 多轮 tool loop：历史中的 Chat `tool` / `tool_calls` 消息、Responses `function_call` / `function_call_output` item，以及 Anthropic `tool_use` / `tool_result` block，会转换为 prompt 可读文本后再 replay。
-- multi-agent prompt 模式下，客户端 function 的 `tool_choice` **不会**转发到上游（避免与仅含 search tools 的 payload 冲突）。
-- `/v1/responses` 的 multi-agent prompt 模式会拦截 `<call>` 文本输出并转换为标准 `response.output_item.added`、`response.function_call_arguments.delta/done`、`response.output_item.done` 与最终 `output[].function_call`；普通文本、reasoning、搜索相关事件仍按 Responses SSE/JSON 转发。
-- Tool call 诊断日志：请求进入 Console Chat / Responses 时会记录 `client_tool_count`、`upstream_tool_count`、`prompt_tool_count`、tool 名称和 `tool_choice`；输出适配器会记录 `has_tool_calls`、`tool_call_count` 和实际检测到的工具名。日志不会记录 tool arguments。
+- Console Chat / Responses / Messages 当前为原生透传：网关不再做 tool call prompt 注入、CoT 事件重排或 Chat/Messages 兼容转换。
+- Tool call、reasoning、usage、搜索等字段以 Console 上游原生响应为准；客户端应按对应原生端点格式处理。
+- `-search` 变体只表示模型 id 选择，不在网关侧额外注入搜索 tools。
 
 ### 图片输入（Console）
 
-Playground 五个模型均支持 Image input。网关行为见上文 **图片输入（Vision）** 章节；Console 侧要点：
+Playground 模型的图片输入按上游原生端点格式透传。Chat Completions 使用 OpenAI `image_url`，Responses 使用 `input_image`，Messages 使用上游支持的 Anthropic content block。
 
-- **`/v1/chat/completions`**：`image_url` 自动映射为 Responses `input_image`（含 `detail`）。
-- **`/v1/responses`**：原生 `input_image` item 直接 replay。
-- **`/v1/messages`**：暂不支持；需改用 Chat Completions 或 Responses。
+### 客户端多轮对话约定（Console）
 
-### 客户端多轮对话约定（对齐 xAI / OpenAI Responses API）
-
-1. Playground 上游默认 `store=false`，**不要依赖** `previous_response_id`；无状态多轮应携带 **完整 `input[]` history**（reasoning / function_call / function_call_output / message items）。
-2. **接口与 CoT 形态**（Console 模型）：
-   - **`POST /v1/responses`**（仅 Console 模型）：默认上游 SSE/JSON 原样转发；multi-agent prompt tool call 会做 `<call>` → Responses `function_call` 的兼容转换；**失败回退**（仍打 console.x.ai）：
-     1. Grok 原样 `input[]` 透传
-     2. 剔除 `encrypted_content` / compaction 后再试
-     3. OpenAI Responses 形态规范化 `input[]` 后再试（保留加密 → 剔除加密）
-     4. `stream=true` 同样适用上述回退；如果上游在首个 SSE 事件前报 `encrypted_content` 解密失败，会自动剥离 opaque replay blob 后重试。
-   - **`POST /v1/chat/completions`**：兼容层——**encrypted 模型**优先 `delta.reasoning_content` = 上游 `encrypted_content` 原字节；**grok-4.3** 使用 `reasoning_summary_text.delta` 映射为 summary 流。
-   - **`POST /v1/messages`**（Anthropic）：与 Chat 相同策略（`thinking` / `thinking_delta`）。
-3. **Reasoning 标准字段**（Responses）：
-   - `output[]` 中 `{type:"reasoning", summary?, encrypted_content?}`；encrypted 续轮 item 建议 `summary: []` + `encrypted_content`（与 xAI 文档示例一致）。
-4. 无状态续轮：请求带 `include: ["reasoning.encrypted_content"]`，将上一轮 reasoning item（含 `encrypted_content`）放入 `input[]`；也可用 `*response.output` 整体 replay。
-5. **grok-4.3**：`reasoning.effort != none` 时请求 `reasoning.summary: "auto"`，输出可见 summary；**build / 4.20 / multi-agent** 等以 encrypted 为主，网关不在 Chat 里拼接 summary+encrypted。
-6. Assistant message 的 `phase`（`commentary` / `final_answer`）在 replay 时会原样保留。
-7. `-search` 变体会自动注入 `web_search` 与 `x_search`，无需客户端手动添加搜索 tools。
+Console Chat / Responses / Messages 均为原生透传。多轮、reasoning replay、tool loop 和搜索字段不由网关重写，客户端应按所选原生端点的格式携带完整上下文或上游支持的续轮字段。
 
 ## Console Voice（TTS/STT）
 

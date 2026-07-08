@@ -71,7 +71,11 @@ def test_basic_pool_model_policy() -> None:
     }
     assert "grok-4.3-fast" in basic_models
     assert "grok-4.3" in basic_models
-    assert "grok-imagine-image" not in basic_models
+    assert "grok-imagine-image" in basic_models
+    assert ModelService.pool_candidates_for_model("grok-imagine-image") == [
+        "ssoBasic",
+        "ssoSuper",
+    ]
     assert ModelService.pool_candidates_for_model("grok-4.20-auto") == ["ssoSuper"]
     assert ModelService.is_super_pool_only("grok-4.20-auto") is True
     assert ModelService.is_super_pool_only("grok-4.3-fast") is False
@@ -88,7 +92,6 @@ def test_super_grok_model_catalog() -> None:
         "grok-4.20-auto",
         "grok-4.20-expert",
         "grok-4.3-beta",
-        "grok-imagine-image",
         "grok-imagine-image-pro",
         "grok-imagine-image-edit",
         "grok-imagine-1.0-video",
@@ -101,7 +104,7 @@ def test_model_list_hides_super_only_models_without_super_tokens() -> None:
     assert "grok-4.20-auto" in all_ids
     assert "grok-imagine-image" in all_ids
     assert "grok-4.20-auto" not in basic_ids
-    assert "grok-imagine-image" not in basic_ids
+    assert "grok-imagine-image" in basic_ids
     assert "grok-4.3-fast" in basic_ids
     assert "grok-4.3" in basic_ids
 
@@ -111,12 +114,13 @@ def test_model_catalog_uses_channel_priority_order() -> None:
     priority = {
         Channel.CONSOLE: 0,
         Channel.CONSOLE_VOICE: 0,
+        Channel.CONSOLE_IMAGE: 0,
         Channel.GROK: 1,
     }
     ranks = [
         priority[model.channel]
         if model.model_id == "grok-4.3-fast"
-        or model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE}
+        or model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE, Channel.CONSOLE_IMAGE}
         else 2
         for model in models
     ]
@@ -130,11 +134,18 @@ def test_duplicate_model_ids_keep_highest_priority_channel() -> None:
     assert model.owned_by == "xai-console<grok2api@69gg>"
 
 
+def test_image_model_prefers_console_channel() -> None:
+    model = ModelService.get("grok-imagine-image")
+    assert model is not None
+    assert model.channel == Channel.CONSOLE_IMAGE
+    assert model.owned_by == "xai-console-image<grok2api@69gg>"
+
+
 def test_image_models_use_declared_upstream_names() -> None:
     assert ModelService.get("grok-imagine-image").grok_model == "grok-imagine-image"
-    assert ModelService.get("grok-imagine-image-edit").grok_model == "grok-imagine-image-edit"
+    assert ModelService.get("grok-imagine-image-edit").grok_model == "grok-imagine-image"
     assert LegacyModelService.get("grok-imagine-image").grok_model == "grok-imagine-image"
-    assert LegacyModelService.get("grok-imagine-image-edit").grok_model == "grok-imagine-image-edit"
+    assert LegacyModelService.get("grok-imagine-image-edit").grok_model == "grok-imagine-image"
 
 
 def test_no_super_token_for_super_only_model_returns_model_not_found() -> None:

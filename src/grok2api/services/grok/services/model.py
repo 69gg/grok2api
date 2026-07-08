@@ -35,6 +35,7 @@ class Channel(str, Enum):
     GROK = "grok"
     CONSOLE = "console"
     CONSOLE_VOICE = "console_voice"
+    CONSOLE_IMAGE = "console_image"
 
 
 OWNER_SOURCE = "grok2api@69gg"
@@ -70,6 +71,8 @@ class ModelInfo(BaseModel):
             return _owned_by("xai-console")
         if self.channel == Channel.CONSOLE_VOICE:
             return _owned_by("xai-console-voice")
+        if self.channel == Channel.CONSOLE_IMAGE:
+            return _owned_by("xai-console-image")
         return _owned_by("grok-app")
 
 
@@ -145,6 +148,26 @@ def _console_voice_model(
     )
 
 
+def _console_image_model(
+    model_id: str,
+    *,
+    display_name: Optional[str] = None,
+    description: str = "",
+) -> ModelInfo:
+    return ModelInfo(
+        model_id=model_id,
+        grok_model=model_id,
+        model_mode="MODEL_MODE_AUTO",
+        tier=Tier.BASIC,
+        cost=Cost.HIGH,
+        display_name=display_name or model_id.upper(),
+        description=description,
+        is_image=True,
+        is_image_edit=True,
+        channel=Channel.CONSOLE_IMAGE,
+    )
+
+
 _CONSOLE_VOICE_MODELS = [
     _console_voice_model(
         "grok-tts-1",
@@ -161,6 +184,16 @@ _CONSOLE_VOICE_MODELS = [
 CONSOLE_VOICE_MODEL_IDS = {m.model_id for m in _CONSOLE_VOICE_MODELS}
 CONSOLE_VOICE_TTS_MODEL_IDS = {"grok-tts-1"}
 CONSOLE_VOICE_STT_MODEL_IDS = {"grok-stt-1"}
+
+_CONSOLE_IMAGE_MODELS = [
+    _console_image_model(
+        "grok-imagine-image",
+        display_name="Grok Imagine Image",
+        description="Console native image generation and edits",
+    )
+]
+
+CONSOLE_IMAGE_MODEL_IDS = {m.model_id for m in _CONSOLE_IMAGE_MODELS}
 
 
 def _super_grok_model(
@@ -213,14 +246,6 @@ _SUPER_GROK_MODELS = [
         grok_model="grok-43",
         model_mode="grok-420-computer-use-sa",
     ),
-    # Image
-    _super_grok_model(
-        "grok-imagine-image",
-        model_mode="MODEL_MODE_AUTO",
-        cost=Cost.HIGH,
-        is_image=True,
-        display_name="Grok Imagine Image",
-    ),
     _super_grok_model(
         "grok-imagine-image-pro",
         model_mode="MODEL_MODE_AUTO",
@@ -232,10 +257,12 @@ _SUPER_GROK_MODELS = [
     # Image edit
     _super_grok_model(
         "grok-imagine-image-edit",
+        grok_model="grok-imagine-image",
         model_mode="MODEL_MODE_AUTO",
         cost=Cost.HIGH,
         is_image_edit=True,
         display_name="Grok Imagine Image Edit",
+        description="Legacy edit alias; Console native uses grok-imagine-image",
     ),
     # Video (legacy route; super pool only)
     _super_grok_model(
@@ -266,11 +293,13 @@ class ModelService:
         "grok-4.3-fast",
         *CONSOLE_MODEL_IDS,
         *CONSOLE_VOICE_MODEL_IDS,
+        *CONSOLE_IMAGE_MODEL_IDS,
     }
 
     MODELS = [
         *_CONSOLE_MODELS,
         *_CONSOLE_VOICE_MODELS,
+        *_CONSOLE_IMAGE_MODELS,
         ModelInfo(
             model_id="grok-4.3-fast",
             grok_model="grok-43",
@@ -333,7 +362,7 @@ class ModelService:
     def pool_for_model(cls, model_id: str) -> str:
         """根据模型选择 Token 池"""
         model = cls.get(model_id)
-        if model and model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE}:
+        if model and model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE, Channel.CONSOLE_IMAGE}:
             return "ssoBasic"
         if model and model.model_id not in cls.BASIC_MODEL_IDS:
             return "ssoSuper"
@@ -346,7 +375,7 @@ class ModelService:
         if not model:
             return ["ssoSuper"]
         if (
-            model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE}
+            model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE, Channel.CONSOLE_IMAGE}
             or model.model_id in cls.BASIC_MODEL_IDS
         ):
             return ["ssoBasic", "ssoSuper"]
@@ -358,6 +387,7 @@ class ModelService:
 __all__ = [
     "Channel",
     "CONSOLE_MODEL_IDS",
+    "CONSOLE_IMAGE_MODEL_IDS",
     "CONSOLE_VOICE_MODEL_IDS",
     "CONSOLE_VOICE_STT_MODEL_IDS",
     "CONSOLE_VOICE_TTS_MODEL_IDS",

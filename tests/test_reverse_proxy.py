@@ -129,10 +129,31 @@ def test_console_headers_include_token_team_id(monkeypatch) -> None:
     team_id = "33ec95d2-5364-4c7f-b1b3-b5bff151adb0"
     headers = build_console_headers("sso-token", team_id=team_id)
 
-    assert headers["Referer"] == f"https://console.x.ai/team/{team_id}/chat-playground"
+    assert headers["Referer"] == f"https://console.x.ai/team/{team_id}/chat"
     assert "cf_clearance=abc" in headers["Cookie"]
     assert "last-team-id=browser-team" not in headers["Cookie"]
     assert f"last-team-id={team_id}" in headers["Cookie"]
+
+
+def test_console_headers_allow_endpoint_referer_path(monkeypatch) -> None:
+    values = {
+        "proxy.user_agent": "Mozilla/5.0 Chrome/136.0.0.0",
+        "proxy.browser": "chrome136",
+        "proxy.cf_cookies": "",
+        "proxy.cf_clearance": "",
+    }
+
+    def fake_get_config(key: str, default: object = None) -> object:
+        return values.get(key, default)
+
+    monkeypatch.setattr(
+        "grok2api.services.reverse.utils.headers.get_config",
+        fake_get_config,
+    )
+
+    headers = build_console_headers("sso-token", referer_path="/image")
+
+    assert headers["Referer"] == "https://console.x.ai/image"
 
 
 def test_console_create_team_payload_and_response_parser() -> None:

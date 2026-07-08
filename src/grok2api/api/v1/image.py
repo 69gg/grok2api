@@ -5,18 +5,21 @@ Image Generation API 路由
 import base64
 import time
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Union, cast
 
+import orjson
 from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from grok2api.services.grok.services.image import ImageGenerationService
 from grok2api.services.grok.services.image_edit import ImageEditService
-from grok2api.services.grok.services.model import ModelService
+from grok2api.services.grok.services.console_native import ConsoleNativeService
+from grok2api.services.grok.services.model import Channel, ModelService
 from grok2api.services.grok.utils.errors import no_token_error
+from grok2api.services.reverse.console_native import ConsoleNativeResponse
 from grok2api.services.token import get_token_manager
-from grok2api.core.exceptions import ValidationException, AppException, ErrorType
+from grok2api.core.exceptions import ValidationException
 from grok2api.core.config import get_config
 
 
@@ -60,7 +63,7 @@ class ImageEditRequest(BaseModel):
     """图片编辑请求 - OpenAI 兼容"""
 
     prompt: str = Field(..., description="编辑描述")
-    model: Optional[str] = Field("grok-imagine-image-edit", description="模型名称")
+    model: Optional[str] = Field("grok-imagine-image", description="模型名称")
     image: Optional[Union[str, List[str]]] = Field(None, description="待编辑图片文件")
     n: Optional[int] = Field(1, ge=1, le=10, description="生成数量 (1-10)")
     size: Optional[str] = Field(
@@ -192,9 +195,9 @@ def resolve_aspect_ratio(size: str) -> str:
 
 def validate_edit_request(request: ImageEditRequest, images: List[UploadFile]):
     """验证图片编辑请求参数"""
-    if request.model != "grok-imagine-image-edit":
+    if request.model != "grok-imagine-image":
         raise ValidationException(
-            message=("The model `grok-imagine-image-edit` is required for image edits."),
+            message=("The model `grok-imagine-image` is required for image edits."),
             param="model",
             code="model_not_supported",
         )
@@ -241,6 +244,62 @@ async def _get_token(model: str):
     return token_mgr, token
 
 
+def _console_image_format(response_format: Optional[str]) -> str:
+    fmt = (response_format or "b64_json").strip().lower()
+    if fmt == "base64":
+        return "b64_json"
+    if fmt != "b64_json":
+        return "b64_json"
+    return fmt
+
+
+async def _console_image_generation(request: ImageGenerationRequest) -> JSONResponse:
+    response_format = _console_image_format(request.response_format)
+    payload = request.model_dump(exclude_none=True)
+    payload["model"] = "grok-imagine-image"
+    payload["response_format"] = response_format
+    payload.pop("stream", None)
+    result = await ConsoleNativeService.json_request(
+        model_id="grok-imagine-image",
+        path="/v1/images/generations",
+        payload=payload,
+        referer_path="/image",
+    )
+    native = cast(ConsoleNativeResponse, result)
+    return JSONResponse(content=orjson.loads(native.body))
+
+
+async def _console_image_edit(
+    edit_request: ImageEditRequest,
+    images: List[str],
+) -> JSONResponse:
+    response_format = _console_image_format(edit_request.response_format)
+    if len(images) == 1:
+        image_payload: dict = {"url": images[0], "type": "image_url"}
+        payload_images = None
+    else:
+        image_payload = None
+        payload_images = [{"url": image, "type": "image_url"} for image in images]
+    payload = {
+        "model": "grok-imagine-image",
+        "prompt": edit_request.prompt,
+        "n": edit_request.n,
+        "response_format": response_format,
+    }
+    if image_payload is not None:
+        payload["image"] = image_payload
+    if payload_images is not None:
+        payload["images"] = payload_images
+    result = await ConsoleNativeService.json_request(
+        model_id="grok-imagine-image",
+        path="/v1/images/edits",
+        payload=payload,
+        referer_path="/image",
+    )
+    native = cast(ConsoleNativeResponse, result)
+    return JSONResponse(content=orjson.loads(native.body))
+
+
 @router.post("/images/generations")
 async def create_image(request: ImageGenerationRequest):
     """
@@ -270,9 +329,16 @@ async def create_image(request: ImageGenerationRequest):
     response_format = resolve_response_format(request.response_format)
     response_field = response_field_name(response_format)
 
+    model_info = ModelService.get(request.model)
+    if model_info and model_info.channel == Channel.CONSOLE_IMAGE:
+        try:
+            return await _console_image_generation(request)
+        except Exception:
+            if request.stream:
+                raise
+
     # 获取 token 和模型信息
     token_mgr, token = await _get_token(request.model)
-    model_info = ModelService.get(request.model)
     aspect_ratio = resolve_aspect_ratio(request.size)
 
     result = await ImageGenerationService().generate(
@@ -315,7 +381,7 @@ async def create_image(request: ImageGenerationRequest):
 async def edit_image(
     prompt: str = Form(...),
     image: List[UploadFile] = File(...),
-    model: Optional[str] = Form("grok-imagine-image-edit"),
+    model: Optional[str] = Form("grok-imagine-image"),
     n: int = Form(1),
     size: str = Form("1024x1024"),
     quality: str = Form("standard"),
@@ -407,9 +473,16 @@ async def edit_image(
         b64 = base64.b64encode(content).decode()
         images.append(f"data:{mime};base64,{b64}")
 
+    model_info = ModelService.get(edit_request.model)
+    if model_info and model_info.channel == Channel.CONSOLE_IMAGE:
+        try:
+            return await _console_image_edit(edit_request, images)
+        except Exception:
+            if edit_request.stream:
+                raise
+
     # 获取 token 和模型信息
     token_mgr, token = await _get_token(edit_request.model)
-    model_info = ModelService.get(edit_request.model)
 
     result = await ImageEditService().edit(
         token_mgr=token_mgr,

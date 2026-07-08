@@ -19,6 +19,7 @@ from grok2api.services.grok.services.console_voice import (
     words_to_srt,
     words_to_vtt,
 )
+from grok2api.services.reverse.console_native import ConsoleNativeResponse
 from grok2api.services.grok.services.model import (
     CONSOLE_VOICE_MODEL_IDS,
     CONSOLE_VOICE_STT_MODEL_IDS,
@@ -440,8 +441,15 @@ def test_audio_api_speech_route():
     app = create_app()
     client = TestClient(app)
     with patch(
-        "grok2api.api.v1.audio.ConsoleVoiceService.speech",
-        new=AsyncMock(return_value=(b"audio-bytes", "audio/mpeg")),
+        "grok2api.api.v1.audio.ConsoleNativeService.json_request",
+        new=AsyncMock(
+            return_value=ConsoleNativeResponse(
+                body=b"audio-bytes",
+                status_code=200,
+                content_type="audio/mpeg",
+                headers={},
+            )
+        ),
     ):
         response = client.post(
             "/v1/audio/speech",

@@ -64,6 +64,7 @@ class ModelService:
 
     BASIC_MODEL_IDS = {
         "grok-4.3-fast",
+        "grok-imagine-image",
     }
 
     MODELS = [
@@ -104,7 +105,7 @@ class ModelService:
         ),
         _super_model(
             "grok-imagine-image-edit",
-            grok_model="grok-imagine-image-edit",
+            grok_model="grok-imagine-image",
             model_mode="MODEL_MODE_AUTO",
             cost=Cost.HIGH,
             display_name="Grok Imagine Image Edit",

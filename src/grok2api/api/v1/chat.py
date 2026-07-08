@@ -2,20 +2,18 @@
 Chat Completions API 路由
 """
 
-from typing import Any, AsyncGenerator, AsyncIterable, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, AsyncIterator, Dict, List, Optional, Union, cast
 import base64
 import binascii
-import time
-import uuid
 
 from fastapi import APIRouter
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 import orjson
 
 from grok2api.services.grok.services.chat import ChatService
 from grok2api.services.grok.services.console_capabilities import normalize_reasoning_effort
-from grok2api.services.grok.services.console_channel import ConsoleChannelService
+from grok2api.services.grok.services.console_native import ConsoleNativeService
 from grok2api.services.grok.services.image import ImageGenerationService
 from grok2api.services.grok.services.image_edit import ImageEditService
 from grok2api.services.grok.services.model import Channel, ModelService
@@ -24,8 +22,9 @@ from grok2api.services.grok.utils.response import make_chat_response
 from grok2api.services.grok.utils.errors import no_token_error
 from grok2api.services.token import get_token_manager
 from grok2api.core.config import get_config
-from grok2api.core.exceptions import ValidationException, AppException, ErrorType
+from grok2api.core.exceptions import ValidationException, AppException
 from grok2api.core.streaming import safe_openai_chat_stream
+from grok2api.services.reverse.console_native import ConsoleNativeResponse
 
 
 class MessageItem(BaseModel):
@@ -263,6 +262,15 @@ def _validate_image_config(image_conf: ImageConfig, *, stream: bool):
             param="image_config.size",
             code="invalid_size",
         )
+
+
+def _console_image_response_format(value: Optional[str]) -> str:
+    fmt = (value or "b64_json").strip().lower()
+    if fmt == "base64":
+        return "b64_json"
+    return "b64_json"
+
+
 def validate_request(request: ChatCompletionRequest):
     """验证请求参数"""
     # 验证模型
@@ -682,6 +690,29 @@ def validate_request(request: ChatCompletionRequest):
 router = APIRouter(tags=["Chat"])
 
 
+async def _console_native_chat_response(request: ChatCompletionRequest) -> Response:
+    payload = request.model_dump(exclude_none=True)
+    stream = bool(request.stream)
+    result = await ConsoleNativeService.json_request(
+        model_id=request.model,
+        path="/v1/chat/completions",
+        payload=payload,
+        stream=stream,
+        referer_path="/chat",
+    )
+    if stream:
+        return StreamingResponse(
+            cast(AsyncIterator[bytes], result),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    native = cast(ConsoleNativeResponse, result)
+    return Response(
+        content=native.body,
+        media_type=(native.content_type or "application/json").split(";")[0],
+    )
+
+
 @router.post("/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     """Chat Completions API - 兼容 OpenAI"""
@@ -694,8 +725,10 @@ async def chat_completions(request: ChatCompletionRequest):
 
     # 检测模型类型
     model_info = ModelService.get(request.model)
-    if model_info and model_info.is_image_edit:
-        prompt, image_urls = _extract_prompt_images(request.messages)
+    prompt_for_media, image_urls_for_media = _extract_prompt_images(request.messages)
+
+    if model_info and model_info.is_image_edit and image_urls_for_media:
+        prompt, image_urls = prompt_for_media, image_urls_for_media
         if not image_urls:
             raise ValidationException(
                 message="Image is required",
@@ -709,8 +742,42 @@ async def chat_completions(request: ChatCompletionRequest):
         image_conf = request.image_config or ImageConfig()
         _validate_image_config(image_conf, stream=bool(is_stream))
         response_format = _resolve_image_format(image_conf.response_format)
-        response_field = _image_field(response_format)
         n = image_conf.n or 1
+        if model_info.channel == Channel.CONSOLE_IMAGE:
+            try:
+                payload = {
+                    "model": "grok-imagine-image",
+                    "prompt": prompt,
+                    "n": n,
+                    "response_format": _console_image_response_format(response_format),
+                }
+                if len(image_urls) == 1:
+                    payload["image"] = {"url": image_urls[0], "type": "image_url"}
+                else:
+                    payload["images"] = [
+                        {"url": image_url, "type": "image_url"}
+                        for image_url in image_urls
+                    ]
+                native = await ConsoleNativeService.json_request(
+                    model_id=request.model,
+                    path="/v1/images/edits",
+                    payload=payload,
+                    referer_path="/image",
+                )
+                native_response = cast(ConsoleNativeResponse, native)
+                parsed = orjson.loads(native_response.body)
+                data = parsed.get("data") if isinstance(parsed, dict) else []
+                content = ""
+                usage = parsed.get("usage") if isinstance(parsed, dict) else None
+                if isinstance(data, list) and data:
+                    first = data[0] if isinstance(data[0], dict) else {}
+                    content = first.get("b64_json") or first.get("url") or ""
+                return JSONResponse(
+                    content=make_chat_response(request.model, content, usage=usage)
+                )
+            except Exception:
+                if is_stream:
+                    raise
 
         token_mgr = await get_token_manager()
         await token_mgr.reload_if_stale()
@@ -749,7 +816,7 @@ async def chat_completions(request: ChatCompletionRequest):
         )
 
     if model_info and model_info.is_image:
-        prompt, _ = _extract_prompt_images(request.messages)
+        prompt = prompt_for_media
 
         is_stream = (
             request.stream if request.stream is not None else get_config("app.stream")
@@ -757,9 +824,36 @@ async def chat_completions(request: ChatCompletionRequest):
         image_conf = _imagine_fast_server_image_config() if request.model == IMAGINE_FAST_MODEL_ID else (request.image_config or ImageConfig())
         _validate_image_config(image_conf, stream=bool(is_stream))
         response_format = _resolve_image_format(image_conf.response_format)
-        response_field = _image_field(response_format)
         n = image_conf.n or 1
         size = image_conf.size or "1024x1024"
+        if model_info.channel == Channel.CONSOLE_IMAGE:
+            try:
+                payload = {
+                    "model": request.model,
+                    "prompt": prompt,
+                    "n": n,
+                    "response_format": _console_image_response_format(response_format),
+                }
+                native = await ConsoleNativeService.json_request(
+                    model_id=request.model,
+                    path="/v1/images/generations",
+                    payload=payload,
+                    referer_path="/image",
+                )
+                native_response = cast(ConsoleNativeResponse, native)
+                parsed = orjson.loads(native_response.body)
+                data = parsed.get("data") if isinstance(parsed, dict) else []
+                content = ""
+                usage = parsed.get("usage") if isinstance(parsed, dict) else None
+                if isinstance(data, list) and data:
+                    first = data[0] if isinstance(data[0], dict) else {}
+                    content = first.get("b64_json") or first.get("url") or ""
+                return JSONResponse(
+                    content=make_chat_response(request.model, content, usage=usage)
+                )
+            except Exception:
+                if is_stream:
+                    raise
         aspect_ratio_map = {
             "1280x720": "16:9",
             "720x1280": "9:16",
@@ -829,21 +923,7 @@ async def chat_completions(request: ChatCompletionRequest):
     else:
         try:
             if model_info and model_info.channel == Channel.CONSOLE:
-                result = await ConsoleChannelService.chat_completions(
-                    model=request.model,
-                    messages=[msg.model_dump(exclude_none=True) for msg in request.messages],
-                    stream=request.stream,
-                    reasoning_effort=request.reasoning_effort,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    tools=request.tools,
-                    tool_choice=request.tool_choice,
-                    parallel_tool_calls=request.parallel_tool_calls,
-                    max_tokens=request.max_tokens,
-                    frequency_penalty=request.frequency_penalty,
-                    presence_penalty=request.presence_penalty,
-                    response_format=request.response_format,
-                )
+                return await _console_native_chat_response(request)
             else:
                 result = await ChatService.completions(
                     model=request.model,

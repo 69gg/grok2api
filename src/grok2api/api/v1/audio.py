@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, cast
 
 from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
 from grok2api.core.exceptions import ValidationException
+from grok2api.services.grok.services.console_native import ConsoleNativeService
 from grok2api.services.grok.services.console_voice import (
     ConsoleVoiceService,
     to_openai_verbose_json,
     words_to_srt,
     words_to_vtt,
 )
+from grok2api.services.reverse.console_native import ConsoleNativeResponse
 
 router = APIRouter(tags=["Audio"])
 
@@ -49,14 +51,25 @@ class SpeechRequest(BaseModel):
 
 @router.post("/audio/speech")
 async def create_speech(request: SpeechRequest) -> Response:
-    body, content_type = await ConsoleVoiceService.speech(
-        model=request.model,
-        input_text=request.input,
-        voice=request.voice,
-        response_format=request.response_format,
-        speed=request.speed,
-    )
-    return Response(content=body, media_type=content_type)
+    payload = request.model_dump(exclude_none=True)
+    try:
+        result = await ConsoleNativeService.json_request(
+            model_id=request.model,
+            path="/v1/audio/speech",
+            payload=payload,
+            referer_path="/voice",
+        )
+        native = cast(ConsoleNativeResponse, result)
+        return Response(content=native.body, media_type=native.content_type.split(";")[0])
+    except Exception:
+        body, content_type = await ConsoleVoiceService.speech(
+            model=request.model,
+            input_text=request.input,
+            voice=request.voice,
+            response_format=request.response_format,
+            speed=request.speed,
+        )
+        return Response(content=body, media_type=content_type)
 
 
 @router.post("/audio/transcriptions")

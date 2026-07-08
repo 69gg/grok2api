@@ -7,11 +7,11 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from typing import Any, AsyncGenerator, AsyncIterable, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, AsyncIterable, AsyncIterator, Dict, List, Optional, Tuple, cast
 
 import orjson
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from grok2api.core.auth import get_admin_api_keys, is_valid_admin_api_key
@@ -25,12 +25,35 @@ from grok2api.core.exceptions import (
 )
 from grok2api.core.logger import logger
 from grok2api.services.grok.services.chat import ChatService
-from grok2api.services.grok.services.console_channel import ConsoleChannelService
-from grok2api.services.grok.services.model import Channel, ModelService
+from grok2api.services.grok.services.console_native import ConsoleNativeService
+from grok2api.services.grok.services.model import ModelService
 from grok2api.services.grok.utils import process as proc_base
+from grok2api.services.reverse.console_native import ConsoleNativeResponse
 
 
 router = APIRouter(tags=["Anthropic Messages"])
+
+
+async def _console_native_messages_response(payload: AnthropicMessagesRequest) -> Response:
+    stream = bool(payload.stream)
+    result = await ConsoleNativeService.json_request(
+        model_id=payload.model,
+        path="/v1/messages",
+        payload=payload.model_dump(exclude_none=True),
+        stream=stream,
+        referer_path="/chat",
+    )
+    if stream:
+        return StreamingResponse(
+            cast(AsyncIterator[bytes], result),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    native = cast(ConsoleNativeResponse, result)
+    return Response(
+        content=native.body,
+        media_type=(native.content_type or "application/json").split(";")[0],
+    )
 
 
 _SUPPORTED_MESSAGE_ROLES = {"user", "assistant"}
@@ -906,32 +929,7 @@ async def create_message(request: Request, payload: AnthropicMessagesRequest):
             return _anthropic_json_error("messages cannot be empty")
 
         if ModelService.is_console(payload.model):
-            raw_messages = [msg.model_dump() for msg in payload.messages]
-            thinking_cfg: Optional[Dict[str, Any]] = None
-            if payload.thinking is not None:
-                if isinstance(payload.thinking, dict):
-                    thinking_cfg = payload.thinking
-                elif hasattr(payload.thinking, "model_dump"):
-                    thinking_cfg = payload.thinking.model_dump()
-            result = await ConsoleChannelService.messages(
-                model=payload.model,
-                messages=raw_messages,
-                system=payload.system,
-                stream=bool(payload.stream),
-                max_tokens=payload.max_tokens,
-                temperature=payload.temperature,
-                top_p=payload.top_p,
-                tools=tools or None,
-                tool_choice=tool_choice,
-                thinking=thinking_cfg,
-            )
-            if payload.stream:
-                return StreamingResponse(
-                    safe_anthropic_stream(result),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-                )
-            return JSONResponse(content=result)
+            return await _console_native_messages_response(payload)
 
         result = await ChatService.completions(
             model=payload.model,

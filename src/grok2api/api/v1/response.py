@@ -2,29 +2,54 @@
 Responses API 路由 (OpenAI / xAI compatible).
 
 自动路由：
-- Console 模型 → console.x.ai `/v1/responses`（SSE 原样透传），失败时按序重试：
-  1. Grok 原样 input 透传
-  2. 剔除 input 中 encrypted/compaction CoT 后再请求
-  3. OpenAI Responses 形态规范化 input 后再请求（含保留加密与剔除加密两轮）
+- Console 模型 → console.x.ai `/v1/responses` 原生透传
 - 其它模型 → Grok App Responses 合成层
 """
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Union, cast
 
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from grok2api.core.streaming import safe_responses_stream
 from grok2api.core.exceptions import ValidationException
 from grok2api.services.grok.services.console_capabilities import normalize_reasoning_effort
-from grok2api.services.grok.services.console_channel import ConsoleChannelService
+from grok2api.services.grok.services.console_native import ConsoleNativeService
 from grok2api.services.grok.services.model import ModelService
 from grok2api.services.grok.services.responses import ResponsesService
-from grok2api.services.reverse.console_payload import strip_console_client_extra
+from grok2api.services.reverse.console_native import ConsoleNativeResponse
 
 
 router = APIRouter(tags=["Responses"])
+
+
+async def _console_native_json_response(
+    *,
+    model_id: str,
+    path: str,
+    payload: Dict[str, Any],
+    stream: bool,
+    referer_path: str,
+) -> Response:
+    result = await ConsoleNativeService.json_request(
+        model_id=model_id,
+        path=path,
+        payload=payload,
+        stream=stream,
+        referer_path=referer_path,
+    )
+    if stream:
+        return StreamingResponse(
+            cast(AsyncIterator[bytes], result),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    native = cast(ConsoleNativeResponse, result)
+    return Response(
+        content=native.body,
+        media_type=(native.content_type or "application/json").split(";")[0],
+    )
 
 
 class ResponseCreateRequest(BaseModel):
@@ -92,28 +117,14 @@ async def create_response(request: ResponseCreateRequest):
     if isinstance(reasoning, dict) and reasoning.get("effort"):
         reasoning = {**reasoning, "effort": normalize_reasoning_effort(reasoning.get("effort"))}
 
-    extra_fields = strip_console_client_extra(raw_extra)
-
     if ModelService.is_console(request.model):
-        result = await ConsoleChannelService.responses(
-            model=request.model,
-            input_value=request.input,
-            instructions=request.instructions,
+        payload = request.model_dump(exclude_none=True)
+        return await _console_native_json_response(
+            model_id=request.model,
+            path="/v1/responses",
+            payload=payload,
             stream=bool(request.stream),
-            temperature=request.temperature,
-            top_p=request.top_p,
-            tools=request.tools,
-            tool_choice=request.tool_choice,
-            parallel_tool_calls=request.parallel_tool_calls,
-            reasoning=reasoning,
-            max_output_tokens=request.max_output_tokens,
-            include=extra_fields.pop("include", None),
-            text=extra_fields.pop("text", None),
-            frequency_penalty=extra_fields.pop("frequency_penalty", None),
-            presence_penalty=extra_fields.pop("presence_penalty", None),
-            store=request.store,
-            previous_response_id=request.previous_response_id,
-            **extra_fields,
+            referer_path="/chat",
         )
     else:
         result = await ResponsesService.create(

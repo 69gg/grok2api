@@ -423,6 +423,7 @@ def build_console_headers(
     content_type: Optional[str] = "application/json",
     cluster: Optional[str] = None,
     team_id: Optional[str] = None,
+    referer_path: Optional[str] = None,
 ) -> Dict[str, str]:
     """Build headers for console.x.ai /v1/responses."""
     user_agent = _sanitize_header_value(
@@ -432,7 +433,12 @@ def build_console_headers(
     team_id = _sanitize_header_value(
         team_id or "", field_name="console_team_id", remove_all_spaces=True
     )
-    referer = f"{base_url}/team/{team_id}/chat-playground" if team_id else f"{base_url}/"
+    if referer_path:
+        referer = f"{base_url}{referer_path if referer_path.startswith('/') else '/' + referer_path}"
+    elif team_id:
+        referer = f"{base_url}/team/{team_id}/chat"
+    else:
+        referer = f"{base_url}/"
     cluster_url = cluster or CONSOLE_DEFAULT_CLUSTER
 
     headers = {

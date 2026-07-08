@@ -13,19 +13,21 @@
 
 ## Token 选择
 
-模型目录和同名模型解析按固定优先级处理：Console Chat / Voice 优先，其次是 Basic grok.com app，最后是其他 super-only 模型。这个顺序同时影响 `GET /v1/models` 的返回顺序和 `ModelService.get()` 对同名 `model_id` 的解析。
+模型目录和同名模型解析按固定优先级处理：Console Chat / Voice / Image 优先，其次是 Basic grok.com app，再到 ssoSuper，最后是其他模型。这个顺序同时影响 `GET /v1/models` 的返回顺序和 `ModelService.get()` 对同名 `model_id` 的解析。
 
-Grok 与 Console Chat / Voice 通道都使用进程内轮询游标：每次上游调用都会在候选池中推进到下一个可用 SSO 号。单次请求内的失败重试会排除已尝试的号，继续轮询后续可用号；grok.com 通道的 429 会标记当前号为 cooling 后换号重试，Console 通道的 429 只在当前请求内换号。
+Grok 与 Console Chat / Voice / Image 通道都使用进程内轮询游标：每次上游调用都会在候选池中推进到下一个可用 SSO 号。单次请求内的失败重试会排除已尝试的号，继续轮询后续可用号；grok.com 通道的 429 会标记当前号为 cooling 后换号重试，Console 通道的 429 只在当前请求内换号。
 
-Console 通道对上游失败做更细的账号状态区分：429、普通 403 和 Cloudflare HTML challenge 只在当前请求内换下一个号重试，不禁用账号；只有明确的 blocked-user 响应（例如 `unauthorized:blocked-user` / `User is blocked`）才会立即标记该 Console 号失效。这个规则同时适用于 `/v1/responses` 正式请求和缺失 `console_team_id` 时的 `CreateTeam` 初始化请求。
+Console 通道对上游失败做更细的账号状态区分：429、普通 403 和 Cloudflare HTML challenge 只在当前请求内换下一个号重试，不禁用账号；只有明确的 blocked-user 响应（例如 `unauthorized:blocked-user` / `User is blocked`）才会立即标记该 Console 号失效。这个规则同时适用于 Console 原生请求和缺失 `console_team_id` 时的 `CreateTeam` 初始化请求。
 
 ## 代理选择
 
-Console Chat / Responses / Messages 与 Console Voice（TTS、STT、voices、STT WebSocket）请求优先使用 `proxy.console_proxy_url`，为空时回退 `proxy.base_proxy_url`。这两个配置都支持逗号分隔多个代理，并复用现有粘性选择和失败轮换；grok.com、assets、注册与 CF 刷新等非 Console 请求仍按各自原有代理配置运行。
+Console Chat / Responses / Messages / Images 与 Console Voice（TTS、STT、voices、STT WebSocket）请求优先使用 `proxy.console_proxy_url`，为空时回退 `proxy.base_proxy_url`。这两个配置都支持逗号分隔多个代理，并复用现有粘性选择和失败轮换；grok.com、assets、注册与 CF 刷新等非 Console 请求仍按各自原有代理配置运行。
 
-Console Chat 的 `/v1/responses` 逆向请求复刻 Playground 登录态路径：使用 SSO Cookie、`x-cluster` 与 Sentry tracing headers，不发送 `Authorization: Bearer anonymous`、`x-statsig-id` 或 `x-xai-request-id`。服务会剥离 `proxy.cf_cookies` 中浏览器残留的 `last-team-id` 与 playground/voice team 计数 cookie，避免把某个浏览器 team 状态污染到账号池请求。官方 `api.x.ai` API key 路径不属于这个 SSO 逆向通道，仍会按真实 team credits/licenses 校验。
+Console 原生逆向请求复刻 Console 登录态路径：使用 SSO Cookie、`x-cluster` 与 Sentry tracing headers，不发送 `Authorization: Bearer anonymous`、`x-statsig-id` 或 `x-xai-request-id`。服务会剥离 `proxy.cf_cookies` 中浏览器残留的 `last-team-id` 与 playground/voice team 计数 cookie，避免把某个浏览器 team 状态污染到账号池请求。官方 `api.x.ai` API key 路径不属于这个 SSO 逆向通道，仍会按真实 team credits/licenses 校验。
 
-每个 SSO 号可以携带独立的 `console_team_id`。当 Console Chat 请求选中缺少该字段的账号时，服务会先用该账号的 `sso/sso-rw` 通过 `auth_mgmt.AuthManagement/CreateTeam` 创建 team，解析 gRPC-Web 响应里的 team id，持久化到该 token 后再请求 `/v1/responses`。后台默认每 60 秒主动扫描 `ssoBasic` 中缺失 `console_team_id` 的可用账号并补全，避免流量请求首次命中时才创建。`CreateTeam` 与 Console 请求都优先使用 `proxy.console_proxy_url`，为空时回退 `proxy.base_proxy_url`。
+每个 SSO 号可以携带独立的 `console_team_id`。当 Console 请求选中缺少该字段的账号时，服务会先用该账号的 `sso/sso-rw` 通过 `auth_mgmt.AuthManagement/CreateTeam` 创建 team，解析 gRPC-Web 响应里的 team id，持久化到该 token 后再请求 Console 原生端点。后台默认每 60 秒主动扫描 `ssoBasic` 中缺失 `console_team_id` 的可用账号并补全，避免流量请求首次命中时才创建。`CreateTeam` 与 Console 请求都优先使用 `proxy.console_proxy_url`，为空时回退 `proxy.base_proxy_url`。
+
+Console 原生响应返回给客户端时只透传 body 和必要的 content type；上游响应头只在内部 metadata 中保留脱敏版本，`set-cookie`、鉴权类 header 不会暴露给调用方。
 
 ## CF 自动刷新
 
