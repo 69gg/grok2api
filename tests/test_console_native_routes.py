@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 from grok2api.main import create_app
 from grok2api.services.reverse.console_native import (
     ConsoleNativeResponse,
+    build_console_body_log_preview,
+    sanitize_console_request_headers,
     sanitize_console_response_headers,
 )
 
@@ -121,3 +123,48 @@ def test_console_native_response_headers_are_redacted() -> None:
     assert headers["set-cookie"] == "<redacted>"
     assert headers["Authorization"] == "<redacted>"
     assert headers["x-trace-id"] == "trace-1"
+
+
+def test_console_native_request_headers_are_redacted() -> None:
+    headers = sanitize_console_request_headers(
+        {
+            "content-type": "application/json",
+            "Cookie": "sso=secret",
+            "Authorization": "Bearer secret",
+            "x-session-token": "secret",
+            "x-request-id": "req-1",
+        }
+    )
+
+    assert headers["content-type"] == "application/json"
+    assert headers["Cookie"] == "<redacted>"
+    assert headers["Authorization"] == "<redacted>"
+    assert headers["x-session-token"] == "<redacted>"
+    assert headers["x-request-id"] == "req-1"
+
+
+def test_console_native_body_log_preview_redacts_sensitive_json_values() -> None:
+    body = (
+        b'{"model":"grok-4.3","token":"secret-token","messages":[{"role":"user",'
+        b'"content":"hello"}],"metadata":{"refresh_token":"refresh-secret",'
+        b'"note":"visible"}}'
+    )
+
+    preview = build_console_body_log_preview(body, "application/json")
+
+    assert "grok-4.3" in preview
+    assert "visible" in preview
+    assert "hello" in preview
+    assert "secret-token" not in preview
+    assert "refresh-secret" not in preview
+    assert preview.count("<redacted>") == 2
+
+
+def test_console_native_body_log_preview_truncates_large_strings() -> None:
+    body = b'{"image":"data:image/png;base64,' + (b"a" * 5000) + b'"}'
+
+    preview = build_console_body_log_preview(body, "application/json")
+
+    assert "data:image/png;base64," in preview
+    assert "<truncated" in preview
+    assert len(preview) < 1300

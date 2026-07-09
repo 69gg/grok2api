@@ -29,6 +29,8 @@ Console 原生逆向请求复刻 Console 登录态路径：使用 SSO Cookie、`
 
 Console 原生响应返回给客户端时只透传 body 和必要的 content type；上游响应头只在内部 metadata 中保留脱敏版本，`set-cookie`、鉴权类 header 不会暴露给调用方。
 
+Console 原生失败日志会记录 method、path、status、stream、content type、代理配置键、team id 是否存在、脱敏后的请求/响应 headers，以及截断后的请求体和响应体预览。请求体中的 token、cookie、secret、password、API key 等常见敏感字段会递归替换为 `<redacted>`。
+
 ## CF 自动刷新
 
 `proxy.enabled = true` 时，`TokenRefreshScheduler` 会单独启动 `cf_clearance` 刷新循环。这个循环在启动后立即刷新一次，后续按 `proxy.refresh_interval` 续期；它复用 `register.solver_url`，本机地址且 `register.auto_start_solver = true` 时会自动启动内置 solver。
