@@ -89,6 +89,8 @@ Responses API 可直接传 `input_image`：
 
 Console 原生端点只重写 SSO Cookie、team id、`x-cluster`、Referer 与浏览器类 headers，然后把请求体透传到 `console.x.ai`。返回体同样直接返回给客户端；上游响应头不会原样透传，内部记录的 `set-cookie`、鉴权类 header 会脱敏。
 
+`grok-imagine-image` 命中 Console image 通道后固定走 Console 原生 `/v1/images/*`；如果 Console 上游失败，会直接返回上游错误，不再静默回退到 grok.com legacy 图片链路。
+
 Console 原生请求失败时，日志会输出 method、path、status、stream、content type、当前代理配置键、是否携带 team id、脱敏后的请求/响应 headers，以及截断后的请求体和响应体预览。`Cookie`、`Authorization`、token、secret、password、API key 等字段会在日志中替换为 `<redacted>`。
 
 当前直接透传的 Console 原生路径：

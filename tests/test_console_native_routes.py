@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
+from grok2api.core.exceptions import UpstreamException
 from grok2api.main import create_app
 from grok2api.services.reverse.console_native import (
     ConsoleNativeResponse,
@@ -26,7 +27,8 @@ def _json_response(body: bytes = b'{"data":[{"b64_json":"abc"}]}') -> ConsoleNat
 def test_console_image_generation_uses_native_b64_json() -> None:
     app = create_app()
     client = TestClient(app)
-    native = AsyncMock(return_value=_json_response())
+    native_body = b'{ "data" : [ { "b64_json" : "abc" } ] }'
+    native = AsyncMock(return_value=_json_response(native_body))
 
     with patch("grok2api.api.v1.image.ConsoleNativeService.json_request", new=native):
         response = client.post(
@@ -36,6 +38,7 @@ def test_console_image_generation_uses_native_b64_json() -> None:
         )
 
     assert response.status_code == 200
+    assert response.content == native_body
     assert response.json()["data"][0]["b64_json"] == "abc"
     call = native.await_args.kwargs
     assert call["model_id"] == "grok-imagine-image"
@@ -46,7 +49,8 @@ def test_console_image_generation_uses_native_b64_json() -> None:
 def test_console_image_edit_multipart_converts_to_native_json_data_uri() -> None:
     app = create_app()
     client = TestClient(app)
-    native = AsyncMock(return_value=_json_response())
+    native_body = b'{ "data" : [ { "b64_json" : "abc" } ] }'
+    native = AsyncMock(return_value=_json_response(native_body))
     image_bytes = b"\xff\xd8\xff"
 
     with patch("grok2api.api.v1.image.ConsoleNativeService.json_request", new=native):
@@ -58,6 +62,7 @@ def test_console_image_edit_multipart_converts_to_native_json_data_uri() -> None
         )
 
     assert response.status_code == 200
+    assert response.content == native_body
     call = native.await_args.kwargs
     assert call["path"] == "/v1/images/edits"
     payload = call["payload"]
@@ -65,6 +70,59 @@ def test_console_image_edit_multipart_converts_to_native_json_data_uri() -> None
     assert payload["response_format"] == "b64_json"
     expected = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode()
     assert payload["image"]["url"] == expected
+
+
+def test_console_image_generation_failure_does_not_fallback_to_legacy() -> None:
+    app = create_app()
+    client = TestClient(app)
+    native = AsyncMock(
+        side_effect=UpstreamException(
+            "console failed",
+            details={"status": 502},
+            status_code=502,
+        )
+    )
+    legacy = AsyncMock()
+
+    with (
+        patch("grok2api.api.v1.image.ConsoleNativeService.json_request", new=native),
+        patch("grok2api.api.v1.image.ImageGenerationService.generate", new=legacy),
+    ):
+        response = client.post(
+            "/v1/images/generations",
+            json={"model": "grok-imagine-image", "prompt": "red square"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 502
+    assert legacy.await_count == 0
+
+
+def test_console_image_edit_failure_does_not_fallback_to_legacy() -> None:
+    app = create_app()
+    client = TestClient(app)
+    native = AsyncMock(
+        side_effect=UpstreamException(
+            "console failed",
+            details={"status": 502},
+            status_code=502,
+        )
+    )
+    legacy = AsyncMock()
+
+    with (
+        patch("grok2api.api.v1.image.ConsoleNativeService.json_request", new=native),
+        patch("grok2api.api.v1.image.ImageEditService.edit", new=legacy),
+    ):
+        response = client.post(
+            "/v1/images/edits",
+            data={"model": "grok-imagine-image", "prompt": "make it blue"},
+            files={"image": ("input.jpg", b"\xff\xd8\xff", "image/jpeg")},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 502
+    assert legacy.await_count == 0
 
 
 def test_console_responses_route_uses_native_passthrough() -> None:

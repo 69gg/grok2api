@@ -7,9 +7,8 @@ import time
 from pathlib import Path
 from typing import List, Optional, Union, cast
 
-import orjson
 from fastapi import APIRouter, File, Form, UploadFile
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, ValidationError
 
 from grok2api.services.grok.services.image import ImageGenerationService
@@ -253,7 +252,14 @@ def _console_image_format(response_format: Optional[str]) -> str:
     return fmt
 
 
-async def _console_image_generation(request: ImageGenerationRequest) -> JSONResponse:
+def _console_native_response(native: ConsoleNativeResponse) -> Response:
+    return Response(
+        content=native.body,
+        media_type=(native.content_type or "application/json").split(";")[0],
+    )
+
+
+async def _console_image_generation(request: ImageGenerationRequest) -> Response:
     response_format = _console_image_format(request.response_format)
     payload = request.model_dump(exclude_none=True)
     payload["model"] = "grok-imagine-image"
@@ -266,13 +272,13 @@ async def _console_image_generation(request: ImageGenerationRequest) -> JSONResp
         referer_path="/image",
     )
     native = cast(ConsoleNativeResponse, result)
-    return JSONResponse(content=orjson.loads(native.body))
+    return _console_native_response(native)
 
 
 async def _console_image_edit(
     edit_request: ImageEditRequest,
     images: List[str],
-) -> JSONResponse:
+) -> Response:
     response_format = _console_image_format(edit_request.response_format)
     if len(images) == 1:
         image_payload: dict = {"url": images[0], "type": "image_url"}
@@ -297,7 +303,7 @@ async def _console_image_edit(
         referer_path="/image",
     )
     native = cast(ConsoleNativeResponse, result)
-    return JSONResponse(content=orjson.loads(native.body))
+    return _console_native_response(native)
 
 
 @router.post("/images/generations")
@@ -331,11 +337,7 @@ async def create_image(request: ImageGenerationRequest):
 
     model_info = ModelService.get(request.model)
     if model_info and model_info.channel == Channel.CONSOLE_IMAGE:
-        try:
-            return await _console_image_generation(request)
-        except Exception:
-            if request.stream:
-                raise
+        return await _console_image_generation(request)
 
     # 获取 token 和模型信息
     token_mgr, token = await _get_token(request.model)
@@ -475,11 +477,7 @@ async def edit_image(
 
     model_info = ModelService.get(edit_request.model)
     if model_info and model_info.channel == Channel.CONSOLE_IMAGE:
-        try:
-            return await _console_image_edit(edit_request, images)
-        except Exception:
-            if edit_request.stream:
-                raise
+        return await _console_image_edit(edit_request, images)
 
     # 获取 token 和模型信息
     token_mgr, token = await _get_token(edit_request.model)
