@@ -40,6 +40,13 @@ SIZE_TO_ASPECT = {
     "1024x1024": "1:1",
 }
 ALLOWED_ASPECT_RATIOS = {"1:1", "2:3", "3:2", "9:16", "16:9"}
+ALLOWED_IMAGE_QUALITIES = {"standard", "hd", "auto", "low", "medium", "high"}
+CONSOLE_IMAGE_QUALITY_ALIASES = {
+    "standard": "medium",
+    "auto": "medium",
+    "hd": "high",
+}
+CONSOLE_IMAGE_QUALITIES = {"low", "medium", "high"}
 
 
 class ImageGenerationRequest(BaseModel):
@@ -126,6 +133,15 @@ def _validate_common_request(
             param="size",
             code="invalid_size",
         )
+
+    if request.quality:
+        quality = request.quality.strip().lower()
+        if quality not in ALLOWED_IMAGE_QUALITIES:
+            raise ValidationException(
+                message=f"quality must be one of {sorted(ALLOWED_IMAGE_QUALITIES)}",
+                param="quality",
+                code="invalid_quality",
+            )
 
 
 def validate_generation_request(request: ImageGenerationRequest):
@@ -252,6 +268,16 @@ def _console_image_format(response_format: Optional[str]) -> str:
     return fmt
 
 
+def _console_image_quality(quality: Optional[str]) -> Optional[str]:
+    value = (quality or "").strip().lower()
+    if not value:
+        return None
+    normalized = CONSOLE_IMAGE_QUALITY_ALIASES.get(value, value)
+    if normalized in CONSOLE_IMAGE_QUALITIES:
+        return normalized
+    return None
+
+
 def _console_native_response(native: ConsoleNativeResponse) -> Response:
     return Response(
         content=native.body,
@@ -264,6 +290,11 @@ async def _console_image_generation(request: ImageGenerationRequest) -> Response
     payload = request.model_dump(exclude_none=True)
     payload["model"] = "grok-imagine-image"
     payload["response_format"] = response_format
+    quality = _console_image_quality(request.quality)
+    if quality is None:
+        payload.pop("quality", None)
+    else:
+        payload["quality"] = quality
     payload.pop("stream", None)
     result = await ConsoleNativeService.json_request(
         model_id="grok-imagine-image",

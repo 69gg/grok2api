@@ -46,6 +46,49 @@ def test_console_image_generation_uses_native_b64_json() -> None:
     assert call["model_id"] == "grok-imagine-image"
     assert call["path"] == "/v1/images/generations"
     assert call["payload"]["response_format"] == "b64_json"
+    assert call["payload"]["quality"] == "medium"
+
+
+def test_console_image_generation_maps_openai_quality_to_console() -> None:
+    app = create_app()
+    client = TestClient(app)
+    native = AsyncMock(return_value=_json_response())
+
+    with patch("grok2api.api.v1.image.ConsoleNativeService.json_request", new=native):
+        response = client.post(
+            "/v1/images/generations",
+            json={
+                "model": "grok-imagine-image",
+                "prompt": "red square",
+                "quality": "hd",
+            },
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 200
+    call = native.await_args.kwargs
+    assert call["payload"]["quality"] == "high"
+
+
+def test_console_image_generation_rejects_unknown_quality_before_upstream() -> None:
+    app = create_app()
+    client = TestClient(app)
+    native = AsyncMock(return_value=_json_response())
+
+    with patch("grok2api.api.v1.image.ConsoleNativeService.json_request", new=native):
+        response = client.post(
+            "/v1/images/generations",
+            json={
+                "model": "grok-imagine-image",
+                "prompt": "red square",
+                "quality": "ultra",
+            },
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "quality"
+    assert native.await_count == 0
 
 
 def test_console_image_edit_multipart_converts_to_native_json_data_uri() -> None:
