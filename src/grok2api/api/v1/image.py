@@ -337,7 +337,11 @@ async def create_image(request: ImageGenerationRequest):
 
     model_info = ModelService.get(request.model)
     if model_info and model_info.channel == Channel.CONSOLE_IMAGE:
-        return await _console_image_generation(request)
+        try:
+            return await _console_image_generation(request)
+        except Exception:
+            if request.stream:
+                raise
 
     # 获取 token 和模型信息
     token_mgr, token = await _get_token(request.model)
@@ -477,7 +481,11 @@ async def edit_image(
 
     model_info = ModelService.get(edit_request.model)
     if model_info and model_info.channel == Channel.CONSOLE_IMAGE:
-        return await _console_image_edit(edit_request, images)
+        try:
+            return await _console_image_edit(edit_request, images)
+        except Exception:
+            if edit_request.stream:
+                raise
 
     # 获取 token 和模型信息
     token_mgr, token = await _get_token(edit_request.model)

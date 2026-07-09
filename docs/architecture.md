@@ -29,7 +29,7 @@ Console 原生逆向请求复刻 Console 登录态路径：使用 SSO Cookie、`
 
 Console 原生响应返回给客户端时只透传 body 和必要的 content type；上游响应头只在内部 metadata 中保留脱敏版本，`set-cookie`、鉴权类 header 不会暴露给调用方。
 
-`grok-imagine-image` 属于 Console image 通道，`/v1/images/generations` 和 `/v1/images/edits` 会固定调用 Console 原生路径并透传 native body；Console 失败时直接暴露为上游错误，不再回退到 grok.com legacy 图片服务。
+`grok-imagine-image` 属于 Console image 通道，`/v1/images/generations` 和 `/v1/images/edits` 会优先调用 Console 原生路径并在成功时透传 native body；非流式 Console 失败时允许回退到 grok.com legacy 图片服务。
 
 Console 原生失败日志会记录 method、path、status、stream、content type、代理配置键、team id 是否存在、脱敏后的请求/响应 headers，以及截断后的请求体和响应体预览。请求体中的 token、cookie、secret、password、API key 等常见敏感字段会递归替换为 `<redacted>`。
 

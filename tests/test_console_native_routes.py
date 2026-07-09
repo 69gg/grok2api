@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 
 from grok2api.core.exceptions import UpstreamException
 from grok2api.main import create_app
+from grok2api.services.grok.services.image import ImageGenerationResult
+from grok2api.services.grok.services.image_edit import ImageEditResult
 from grok2api.services.reverse.console_native import (
     ConsoleNativeResponse,
     build_console_body_log_preview,
@@ -72,7 +74,7 @@ def test_console_image_edit_multipart_converts_to_native_json_data_uri() -> None
     assert payload["image"]["url"] == expected
 
 
-def test_console_image_generation_failure_does_not_fallback_to_legacy() -> None:
+def test_console_image_generation_failure_falls_back_to_legacy() -> None:
     app = create_app()
     client = TestClient(app)
     native = AsyncMock(
@@ -82,23 +84,36 @@ def test_console_image_generation_failure_does_not_fallback_to_legacy() -> None:
             status_code=502,
         )
     )
-    legacy = AsyncMock()
+    legacy = AsyncMock(
+        return_value=ImageGenerationResult(
+            stream=False,
+            data=["legacy-b64"],
+            usage_override=None,
+        )
+    )
+    get_token = AsyncMock(return_value=(object(), "legacy-token"))
 
     with (
         patch("grok2api.api.v1.image.ConsoleNativeService.json_request", new=native),
         patch("grok2api.api.v1.image.ImageGenerationService.generate", new=legacy),
+        patch("grok2api.api.v1.image._get_token", new=get_token),
     ):
         response = client.post(
             "/v1/images/generations",
-            json={"model": "grok-imagine-image", "prompt": "red square"},
+            json={
+                "model": "grok-imagine-image",
+                "prompt": "red square",
+                "response_format": "b64_json",
+            },
             headers={"Authorization": "Bearer test-key"},
         )
 
-    assert response.status_code == 502
-    assert legacy.await_count == 0
+    assert response.status_code == 200
+    assert response.json()["data"][0]["b64_json"] == "legacy-b64"
+    assert legacy.await_count == 1
 
 
-def test_console_image_edit_failure_does_not_fallback_to_legacy() -> None:
+def test_console_image_edit_failure_falls_back_to_legacy() -> None:
     app = create_app()
     client = TestClient(app)
     native = AsyncMock(
@@ -108,21 +123,33 @@ def test_console_image_edit_failure_does_not_fallback_to_legacy() -> None:
             status_code=502,
         )
     )
-    legacy = AsyncMock()
+    legacy = AsyncMock(
+        return_value=ImageEditResult(
+            stream=False,
+            data=["legacy-edit-b64"],
+        )
+    )
+    get_token = AsyncMock(return_value=(object(), "legacy-token"))
 
     with (
         patch("grok2api.api.v1.image.ConsoleNativeService.json_request", new=native),
         patch("grok2api.api.v1.image.ImageEditService.edit", new=legacy),
+        patch("grok2api.api.v1.image._get_token", new=get_token),
     ):
         response = client.post(
             "/v1/images/edits",
-            data={"model": "grok-imagine-image", "prompt": "make it blue"},
+            data={
+                "model": "grok-imagine-image",
+                "prompt": "make it blue",
+                "response_format": "b64_json",
+            },
             files={"image": ("input.jpg", b"\xff\xd8\xff", "image/jpeg")},
             headers={"Authorization": "Bearer test-key"},
         )
 
-    assert response.status_code == 502
-    assert legacy.await_count == 0
+    assert response.status_code == 200
+    assert response.json()["data"][0]["b64_json"] == "legacy-edit-b64"
+    assert legacy.await_count == 1
 
 
 def test_console_responses_route_uses_native_passthrough() -> None:
