@@ -5,7 +5,7 @@ Image Generation API 路由
 import base64
 import time
 from pathlib import Path
-from typing import List, Optional, Union, cast
+from typing import Any, Dict, List, Optional, Union, cast
 
 from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import StreamingResponse, JSONResponse, Response
@@ -47,6 +47,7 @@ CONSOLE_IMAGE_QUALITY_ALIASES = {
     "hd": "high",
 }
 CONSOLE_IMAGE_QUALITIES = {"low", "medium", "high"}
+CONSOLE_IMAGE_GENERATION_UNSUPPORTED_FIELDS = {"size", "style", "stream"}
 
 
 class ImageGenerationRequest(BaseModel):
@@ -278,6 +279,24 @@ def _console_image_quality(quality: Optional[str]) -> Optional[str]:
     return None
 
 
+def _console_image_generation_payload(
+    request: ImageGenerationRequest,
+    response_format: str,
+) -> Dict[str, Any]:
+    payload = request.model_dump(exclude_none=True)
+    payload["model"] = "grok-imagine-image"
+    payload["response_format"] = response_format
+    for field in CONSOLE_IMAGE_GENERATION_UNSUPPORTED_FIELDS:
+        payload.pop(field, None)
+
+    quality = _console_image_quality(request.quality)
+    if quality is None:
+        payload.pop("quality", None)
+    else:
+        payload["quality"] = quality
+    return payload
+
+
 def _console_native_response(native: ConsoleNativeResponse) -> Response:
     return Response(
         content=native.body,
@@ -287,15 +306,7 @@ def _console_native_response(native: ConsoleNativeResponse) -> Response:
 
 async def _console_image_generation(request: ImageGenerationRequest) -> Response:
     response_format = _console_image_format(request.response_format)
-    payload = request.model_dump(exclude_none=True)
-    payload["model"] = "grok-imagine-image"
-    payload["response_format"] = response_format
-    quality = _console_image_quality(request.quality)
-    if quality is None:
-        payload.pop("quality", None)
-    else:
-        payload["quality"] = quality
-    payload.pop("stream", None)
+    payload = _console_image_generation_payload(request, response_format)
     result = await ConsoleNativeService.json_request(
         model_id="grok-imagine-image",
         path="/v1/images/generations",

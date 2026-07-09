@@ -47,6 +47,8 @@ def test_console_image_generation_uses_native_b64_json() -> None:
     assert call["path"] == "/v1/images/generations"
     assert call["payload"]["response_format"] == "b64_json"
     assert call["payload"]["quality"] == "medium"
+    assert "size" not in call["payload"]
+    assert "stream" not in call["payload"]
 
 
 def test_console_image_generation_maps_openai_quality_to_console() -> None:
@@ -61,6 +63,8 @@ def test_console_image_generation_maps_openai_quality_to_console() -> None:
                 "model": "grok-imagine-image",
                 "prompt": "red square",
                 "quality": "hd",
+                "size": "1024x1024",
+                "style": "natural",
             },
             headers={"Authorization": "Bearer test-key"},
         )
@@ -68,6 +72,8 @@ def test_console_image_generation_maps_openai_quality_to_console() -> None:
     assert response.status_code == 200
     call = native.await_args.kwargs
     assert call["payload"]["quality"] == "high"
+    assert "size" not in call["payload"]
+    assert "style" not in call["payload"]
 
 
 def test_console_image_generation_rejects_unknown_quality_before_upstream() -> None:
