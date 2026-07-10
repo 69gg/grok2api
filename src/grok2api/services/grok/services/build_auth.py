@@ -211,45 +211,73 @@ class BuildAuthService:
         email: str = "",
         log: Optional[Callable[[str], None]] = None,
     ) -> TokenBundle:
-        """Attempt device-auth mint with browser SSO cookie inject (optional).
+        """Device-auth mint using SSO cookie over pure HTTP (no browser).
 
-        Protocol-first: request device_code + poll. Consent requires an authenticated
-        session — uses browser path when build.mint_allow_browser is true.
+        Flow (captured): device/code → device/verify → device/approve(action=allow)
+        → token poll. Browser is only a last-resort fallback if enabled.
         """
         log = log or (lambda m: logger.info("CLI mint: {}", m))
         proxy = BuildAuthService._proxy_url()
+        prefer_protocol = _as_bool(get_config("build.mint_prefer_protocol", True), True)
+        allow_browser = _as_bool(get_config("build.mint_allow_browser", False), False)
+
         session = await asyncio.to_thread(request_device_code, proxy=proxy)
         log(
             f"device_code ok user_code={session.user_code} "
             f"uri={session.verification_uri_complete}"
         )
 
-        allow_browser = _as_bool(get_config("build.mint_allow_browser", True), True)
-        if not allow_browser:
-            # Without consent automation we can only poll (will timeout unless external approve)
-            raise OAuthDeviceError(
-                "mint requires browser consent; set build.mint_allow_browser=true "
-                "or complete device consent externally"
+        consent_ok = False
+        protocol_err: Exception | None = None
+        if prefer_protocol:
+            try:
+                from grok2api.services.reverse.build_device_consent import (
+                    approve_device_with_sso_protocol,
+                )
+
+                await asyncio.to_thread(
+                    approve_device_with_sso_protocol,
+                    user_code=session.user_code,
+                    sso_token=sso_token,
+                    proxy=proxy,
+                    log=log,
+                    retries=3,
+                )
+                consent_ok = True
+            except Exception as exc:  # noqa: BLE001
+                protocol_err = exc
+                log(f"protocol consent failed: {exc}")
+
+        if not consent_ok and allow_browser:
+            log("falling back to browser consent")
+            from grok2api.services.grok.services.build_mint_browser import (
+                approve_device_with_sso,
             )
 
-        # Lazy import heavy browser stack
-        from grok2api.services.grok.services.build_mint_browser import (
-            approve_device_with_sso,
-        )
+            headless = _as_bool(get_config("build.mint_headless", False), False)
+            await asyncio.to_thread(
+                approve_device_with_sso,
+                verification_uri_complete=session.verification_uri_complete,
+                sso_token=sso_token,
+                email=email,
+                proxy=proxy,
+                headless=headless,
+                log=log,
+            )
+            consent_ok = True
 
-        await asyncio.to_thread(
-            approve_device_with_sso,
-            verification_uri_complete=session.verification_uri_complete,
-            sso_token=sso_token,
-            email=email,
-            proxy=proxy,
-            log=log,
-        )
+        if not consent_ok:
+            raise OAuthDeviceError(
+                f"device consent failed (protocol"
+                f"{'' if protocol_err is None else f': {protocol_err}'}"
+                f"; browser disabled)"
+            )
+
         bundle = await asyncio.to_thread(
             poll_device_token,
             session.device_code,
             interval=session.interval,
-            expires_in=session.expires_in,
+            expires_in=min(int(session.expires_in), 120),
             proxy=proxy,
             log=log,
         )

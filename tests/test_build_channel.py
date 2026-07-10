@@ -78,6 +78,16 @@ def test_pool_prefers_accounts_with_cli_auth() -> None:
     assert token_cli_selectable(with_auth)
 
 
+def test_device_consent_urls() -> None:
+    from grok2api.services.reverse.build_device_consent import (
+        DEVICE_APPROVE_URL,
+        DEVICE_VERIFY_URL,
+    )
+
+    assert DEVICE_VERIFY_URL.endswith("/oauth2/device/verify")
+    assert DEVICE_APPROVE_URL.endswith("/oauth2/device/approve")
+
+
 def test_free_usage_cooling_not_selectable() -> None:
     info = TokenInfo(
         token="cool",

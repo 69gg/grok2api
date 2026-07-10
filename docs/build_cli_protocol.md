@@ -14,7 +14,7 @@
 
 与现有 `register/runner.py` 一致：验证码正则 `>XXX-XXX<` 或 Subject 前缀；注册后 setup 浏览器拿 sso。
 
-## 2. OIDC device-auth（Grok Build / free 4.5）
+## 2. OIDC device-auth（Grok Build / free 4.5）— 纯协议
 
 ```
 POST https://auth.x.ai/oauth2/device/code
@@ -22,8 +22,17 @@ POST https://auth.x.ai/oauth2/device/code
   scope=openid profile email offline_access grok-cli:access api:access
 → device_code, user_code, verification_uri_complete
 
-浏览器（已登录会话）打开 verification_uri_complete
-  → 继续 → consent「允许」→ /oauth2/device/done「设备已授权」
+# Cookie: sso=<jwt>; sso-rw=<jwt>  （来自已有 ssoBasic 号）
+POST https://auth.x.ai/oauth2/device/verify
+  Content-Type: application/x-www-form-urlencoded
+  Origin/Referer: https://accounts.x.ai/
+  body: user_code=XXXX-XXXX
+→ 303 Location: https://accounts.x.ai/oauth2/device/consent?user_code=...
+
+POST https://auth.x.ai/oauth2/device/approve
+  body: user_code=XXXX-XXXX&action=allow&principal_type=User&principal_id=
+  Cookie: sso / sso-rw
+→ 303 Location: https://accounts.x.ai/oauth2/device/done
 
 POST https://auth.x.ai/oauth2/token
   grant_type=urn:ietf:params:oauth:grant-type:device_code
@@ -32,7 +41,8 @@ POST https://auth.x.ai/oauth2/token
 → access_token, refresh_token, expires_in=21600
 ```
 
-已登录时 **无需再输账密**；consent 页真实点击「允许」。
+**默认不走浏览器。** `build.mint_allow_browser` 仅作协议失败后的下策。
+TLS/代理失败对 device/token 请求默认多重试（见 `build_oauth._post_form`）。
 
 ## 3. Refresh（全自动、无浏览器）
 

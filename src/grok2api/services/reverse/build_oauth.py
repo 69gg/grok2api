@@ -85,33 +85,91 @@ class OAuthRefreshError(RuntimeError):
     pass
 
 
+def _normalize_proxy(proxy: str | None) -> str | None:
+    """Normalize proxy URL for curl_cffi / requests (socks5 → socks5h)."""
+    p = (proxy or "").strip()
+    if not p:
+        return None
+    if p.startswith("socks5://"):
+        return "socks5h://" + p[len("socks5://") :]
+    if p.startswith("socks4://"):
+        return "socks4a://" + p[len("socks4://") :]
+    return p
+
+
 def _post_form(
     url: str,
     form: dict[str, str],
     *,
     proxy: str | None = None,
     timeout: float = 30.0,
+    retries: int = 5,
 ) -> tuple[int, dict[str, Any] | str]:
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    try:
-        resp = requests.post(
-            url,
-            data=form,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-                "User-Agent": "grok2api-cli-oauth/1.0",
-            },
-            proxies=proxies,
-            timeout=timeout,
-        )
+    """POST application/x-www-form-urlencoded; prefer curl_cffi; multi-retry on SSL/net."""
+    proxy_url = _normalize_proxy(proxy)
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "User-Agent": "grok2api-cli-oauth/1.0",
+    }
+    last_err: BaseException | None = None
+    attempts = max(int(retries), 0) + 1
+    for i in range(attempts):
         try:
-            body: dict[str, Any] | str = resp.json()
-        except Exception:
-            body = resp.text
-        return int(resp.status_code), body
-    except requests.RequestException as exc:
-        raise OAuthRefreshError(f"token request failed: {exc}") from exc
+            # Prefer curl_cffi — same stack as reverse layer.
+            try:
+                from curl_cffi import requests as curl_requests
+
+                kwargs: dict[str, Any] = {
+                    "data": form,
+                    "headers": headers,
+                    "timeout": timeout,
+                    "impersonate": "chrome",
+                }
+                if proxy_url:
+                    kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+                resp = curl_requests.post(url, **kwargs)
+            except ImportError:
+                proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+                resp = requests.post(
+                    url,
+                    data=form,
+                    headers=headers,
+                    proxies=proxies,
+                    timeout=timeout,
+                )
+            try:
+                body: dict[str, Any] | str = resp.json()
+            except Exception:
+                body = getattr(resp, "text", "") or ""
+            # Retry soft upstream rate limits on device code endpoint
+            if int(resp.status_code) == 429 and i + 1 < attempts:
+                wait = 2.0 * (i + 1)
+                logger.warning(
+                    "OIDC HTTP 429 on {} — retry {}/{} in {}s",
+                    url,
+                    i + 1,
+                    attempts,
+                    wait,
+                )
+                time.sleep(wait)
+                continue
+            return int(resp.status_code), body
+        except Exception as exc:  # noqa: BLE001 — network/TLS blips
+            last_err = exc
+            wait = min(1.2 * (i + 1), 8.0)
+            logger.warning(
+                "OIDC request error on {} attempt {}/{}: {} — retry in {}s",
+                url,
+                i + 1,
+                attempts,
+                exc,
+                wait,
+            )
+            if i + 1 >= attempts:
+                break
+            time.sleep(wait)
+    raise OAuthRefreshError(f"token request failed: {last_err}") from last_err
 
 
 def request_device_code(
