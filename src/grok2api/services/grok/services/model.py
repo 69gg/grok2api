@@ -33,6 +33,7 @@ class Cost(str, Enum):
 
 class Channel(str, Enum):
     GROK = "grok"
+    CLI = "cli"
     CONSOLE = "console"
     CONSOLE_VOICE = "console_voice"
     CONSOLE_IMAGE = "console_image"
@@ -63,10 +64,13 @@ class ModelInfo(BaseModel):
     channel: Channel = Channel.GROK
     console_model: Optional[str] = None
     console_search: bool = False
+    cli_search: bool = False
     capabilities: Optional[ConsoleModelCapabilities] = None
 
     @property
     def owned_by(self) -> str:
+        if self.channel == Channel.CLI:
+            return _owned_by("xai-cli")
         if self.channel == Channel.CONSOLE:
             return _owned_by("xai-console")
         if self.channel == Channel.CONSOLE_VOICE:
@@ -196,6 +200,59 @@ _CONSOLE_IMAGE_MODELS = [
 CONSOLE_IMAGE_MODEL_IDS = {m.model_id for m in _CONSOLE_IMAGE_MODELS}
 
 
+def _cli_model(
+    model_id: str,
+    upstream_model: str,
+    *,
+    cli_search: bool = False,
+    display_name: Optional[str] = None,
+    description: str = "",
+) -> ModelInfo:
+    return ModelInfo(
+        model_id=model_id,
+        grok_model=upstream_model,
+        model_mode="CLI",
+        tier=Tier.BASIC,
+        cost=Cost.LOW,
+        display_name=display_name or model_id.upper(),
+        description=description or "Free Grok Build CLI (cli-chat-proxy)",
+        channel=Channel.CLI,
+        cli_search=cli_search,
+    )
+
+
+_CLI_MODELS = [
+    _cli_model(
+        "grok-4.5",
+        "grok-4.5",
+        display_name="GROK-4.5",
+        description="Free Grok 4.5 via cli-chat-proxy OIDC",
+    ),
+    _cli_model(
+        "grok-4.5-search",
+        "grok-4.5",
+        cli_search=True,
+        display_name="GROK-4.5-SEARCH",
+        description="Free Grok 4.5 with web_search tool injected",
+    ),
+    _cli_model(
+        "grok-composer-2.5-fast",
+        "grok-composer-2.5-fast",
+        display_name="GROK-COMPOSER-2.5-FAST",
+        description="Composer 2.5 Fast via cli-chat-proxy (availability varies)",
+    ),
+    _cli_model(
+        "grok-composer-2.5-fast-search",
+        "grok-composer-2.5-fast",
+        cli_search=True,
+        display_name="GROK-COMPOSER-2.5-FAST-SEARCH",
+        description="Composer 2.5 Fast with web_search tool injected",
+    ),
+]
+
+CLI_MODEL_IDS = {m.model_id for m in _CLI_MODELS}
+
+
 def _super_grok_model(
     model_id: str,
     *,
@@ -291,12 +348,15 @@ class ModelService:
 
     BASIC_MODEL_IDS = {
         "grok-4.3-fast",
+        *CLI_MODEL_IDS,
         *CONSOLE_MODEL_IDS,
         *CONSOLE_VOICE_MODEL_IDS,
         *CONSOLE_IMAGE_MODEL_IDS,
     }
 
+    # Priority: CLI > Console > Basic grok.app > Super (setdefault keeps first)
     MODELS = [
+        *_CLI_MODELS,
         *_CONSOLE_MODELS,
         *_CONSOLE_VOICE_MODELS,
         *_CONSOLE_IMAGE_MODELS,
@@ -341,6 +401,11 @@ class ModelService:
         return bool(model and model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE})
 
     @classmethod
+    def is_cli(cls, model_id: str) -> bool:
+        model = cls.get(model_id)
+        return bool(model and model.channel == Channel.CLI)
+
+    @classmethod
     def is_console_voice(cls, model_id: str) -> bool:
         model = cls.get(model_id)
         return bool(model and model.channel == Channel.CONSOLE_VOICE)
@@ -362,6 +427,8 @@ class ModelService:
     def pool_for_model(cls, model_id: str) -> str:
         """根据模型选择 Token 池"""
         model = cls.get(model_id)
+        if model and model.channel == Channel.CLI:
+            return "oidcBuild"
         if model and model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE, Channel.CONSOLE_IMAGE}:
             return "ssoBasic"
         if model and model.model_id not in cls.BASIC_MODEL_IDS:
@@ -374,6 +441,8 @@ class ModelService:
         model = cls.get(model_id)
         if not model:
             return ["ssoSuper"]
+        if model.channel == Channel.CLI:
+            return ["oidcBuild"]
         if (
             model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE, Channel.CONSOLE_IMAGE}
             or model.model_id in cls.BASIC_MODEL_IDS
@@ -386,6 +455,7 @@ class ModelService:
 
 __all__ = [
     "Channel",
+    "CLI_MODEL_IDS",
     "CONSOLE_MODEL_IDS",
     "CONSOLE_IMAGE_MODEL_IDS",
     "CONSOLE_VOICE_MODEL_IDS",

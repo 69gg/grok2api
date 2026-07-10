@@ -15,8 +15,9 @@ uv run granian --interface asgi grok2api.main:app --host 0.0.0.0 --port 8000
 - `config.toml`：本地运行配置，已加入 `.gitignore`。
 - `config.toml.example`：完整示例配置，提交到仓库。
 - 环境变量可覆盖少量路径和日志配置：`DATA_DIR`、`LOG_DIR`、`LOG_LEVEL`。
-- `proxy.console_proxy_url`：Console 通道专用代理，覆盖 `console.x.ai` 的 Chat/Responses/Messages、Images 与 Voice REST/WS；为空时回退 `proxy.base_proxy_url`。
+- `proxy.console_proxy_url`：Console 与 **Free CLI（cli-chat-proxy）** 共用代理；为空时回退 `proxy.base_proxy_url`。
 - `token.console_team_auto_init_enabled`：默认开启。服务会为缺少 `console_team_id` 的 `ssoBasic` 主动调用 Console `CreateTeam`，并把每号 team id 持久化到账号数据；请求命中缺字段账号时也会先补全再访问 Console。
+- `[build]`：Free Grok 4.5 / Composer CLI 通道，**默认全开**（pull 后无需改配置即可用）。后台会像 Console team 一样**静默**为已有 `ssoBasic` 账号铸 OIDC 到 `oidcBuild` 池；请求只轮询**已有 auth** 的号，并按需 `refresh_token` 续期。代理走 `console_proxy_url`。详见 `docs/build_cli_protocol.md`。
 
 ## Cloudflare Clearance
 
@@ -30,10 +31,13 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 
 ## 模型池规则
 
+- **`oidcBuild`（Free CLI）**：`grok-4.5`、`grok-4.5-search`、`grok-composer-2.5-fast`、`grok-composer-2.5-fast-search`。`owned_by` 为 `xai-cli<grok2api@69gg>`。上游 `cli-chat-proxy.grok.com`，OIDC Bearer（**不是**网页 SSO）。
 - `ssoBasic`：支持 `grok-4.3-fast`、`grok-imagine-1.0`、`grok-imagine-1.0-edit`、`grok-imagine-image`，以及全部 **Console Chat Playground** 与 **Console Voice（TTS/STT/translations + STT WS）** 模型（见下）。
 - `ssoSuper`：保持旧项目模型能力。
-- 模型目录与同名模型解析统一按 **Console > ssoBasic > ssoSuper > other** 优先级处理；例如 Console 与 grok.com/super 同名时优先走 Console 通道。
+- 模型目录与同名模型解析统一按 **CLI > Console > ssoBasic/grok.app > ssoSuper** 优先级处理。
+- CLI 请求只轮询 `oidcBuild` 中**已有 OIDC auth** 的账号；后台定时从 `ssoBasic` 静默补铸（`build.auto_init_from_sso_enabled`）；access 按需/定时 refresh。
 - Grok 与 Console Chat / Voice / Image 上游调用会按候选池顺序轮询可用 SSO 号；单次请求失败重试时会排除本请求已试过的号，再继续选下一个，429 会标记当前号 cooling 后换号重试。
+- CLI free-usage 耗尽：仅 cooling 该 OIDC 号约 24h，不影响同 SSO 的 Console 通道。
 - `grok-imagine-image` 是 Console 原生图片模型，支持 `/v1/images/generations` 与 `/v1/images/edits`；旧的 `grok-imagine-image-edit` 只保留为 legacy grok.com 路径。
 
 ## 图片输入（Vision）
@@ -84,6 +88,18 @@ Responses API 可直接传 `input_image`：
 - **裸 base64 字符串会被拒绝**，必须带 `data:` 前缀。
 - Console 通道不做本地上传，URL 原样转发 upstream；公网 HTTPS 最稳妥。
 - grok.com 通道（如 `grok-4.3-fast`）会下载 URL / 解析 data URI 后上传，需 SSO 号具备 upload 能力。
+
+## Free CLI 原生端点（Grok 4.5）
+
+CLI 模型只改 `Authorization` + Grok CLI 客户端头，body **透传**到 `https://cli-chat-proxy.grok.com/v1`：
+
+| 本地端点 | 上游 | 说明 |
+|---|---|---|
+| `POST /v1/chat/completions` | `/chat/completions` | 含 SSE |
+| `POST /v1/messages` | `/messages` | 含 SSE |
+| `POST /v1/responses` | `/responses` | Responses 透传 |
+
+`-search` 别名会在 body 中追加 `{"type":"web_search"}`。device-auth 人机失败时浏览器路径会**刷新页面重试**。
 
 ## Console 原生端点
 

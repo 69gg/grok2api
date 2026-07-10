@@ -111,17 +111,25 @@ def test_model_list_hides_super_only_models_without_super_tokens() -> None:
 
 def test_model_catalog_uses_channel_priority_order() -> None:
     models = ModelService.list(has_super_tokens=True)
+    # CLI > Console family > basic grok.app > super
     priority = {
-        Channel.CONSOLE: 0,
-        Channel.CONSOLE_VOICE: 0,
-        Channel.CONSOLE_IMAGE: 0,
-        Channel.GROK: 1,
+        Channel.CLI: 0,
+        Channel.CONSOLE: 1,
+        Channel.CONSOLE_VOICE: 1,
+        Channel.CONSOLE_IMAGE: 1,
+        Channel.GROK: 2,
     }
     ranks = [
         priority[model.channel]
         if model.model_id == "grok-4.3-fast"
-        or model.channel in {Channel.CONSOLE, Channel.CONSOLE_VOICE, Channel.CONSOLE_IMAGE}
-        else 2
+        or model.channel
+        in {
+            Channel.CLI,
+            Channel.CONSOLE,
+            Channel.CONSOLE_VOICE,
+            Channel.CONSOLE_IMAGE,
+        }
+        else 3
         for model in models
     ]
     assert ranks == sorted(ranks)

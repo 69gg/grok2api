@@ -1,0 +1,404 @@
+"""Background + on-demand OIDC acquisition for free CLI channel.
+
+Mirrors Console team id auto-init:
+- scan existing accounts (ssoBasic) that lack OIDC
+- mint access/refresh into oidcBuild (silent background)
+- requests only round-robin accounts that already have OIDC
+- access tokens are refreshed on demand / scheduled
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import Any, Callable, Optional
+
+from grok2api.core.config import get_config
+from grok2api.core.logger import logger
+from grok2api.services.reverse.build_constants import (
+    CLI_POOL_NAME,
+    DEFAULT_BASE_URL,
+    REFRESH_LEAD_SEC,
+    TOKEN_ENDPOINT,
+)
+from grok2api.services.reverse.build_native import BUILD_PROXY_KEYS
+from grok2api.services.reverse.build_oauth import (
+    OAuthDeviceError,
+    OAuthRefreshError,
+    TokenBundle,
+    poll_device_token,
+    refresh_tokens_async,
+    request_device_code,
+    sub_from_access_token,
+)
+from grok2api.services.reverse.utils.proxy import get_current_proxy_url_from
+from grok2api.services.token import get_token_manager
+from grok2api.services.token.models import TokenInfo, TokenStatus
+
+SSO_SOURCE_POOL = "ssoBasic"
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _as_int(value: Any, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(value))
+    except Exception:
+        return default
+
+
+def token_has_cli_auth(token_info: TokenInfo) -> bool:
+    """Whether this credential can serve CLI (has refresh or non-empty access)."""
+    if token_info.status not in {TokenStatus.ACTIVE, TokenStatus.COOLING}:
+        # cooling still "has auth" but not selectable for traffic
+        pass
+    if (token_info.refresh_token or "").strip():
+        return True
+    if (token_info.access_token or "").strip():
+        return True
+    return False
+
+
+def token_cli_selectable(token_info: TokenInfo) -> bool:
+    """Ready for request routing: active + has OIDC + not in free-usage cool window."""
+    if token_info.status != TokenStatus.ACTIVE:
+        return False
+    if not token_has_cli_auth(token_info):
+        return False
+    # free-usage cool: last_sync_at stores resume_at_ms when last_fail_reason is free-usage
+    if (token_info.last_fail_reason or "") == "free-usage-exhausted":
+        resume_at = int(token_info.last_sync_at or 0)
+        if resume_at and int(time.time() * 1000) < resume_at:
+            return False
+    return True
+
+
+class BuildAuthService:
+    """Mint / refresh OIDC for CLI channel."""
+
+    _mint_locks: dict[str, asyncio.Lock] = {}
+    _mint_locks_guard = asyncio.Lock()
+
+    @classmethod
+    async def _mint_lock(cls, key: str) -> asyncio.Lock:
+        async with cls._mint_locks_guard:
+            lock = cls._mint_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                cls._mint_locks[key] = lock
+            return lock
+
+    @staticmethod
+    def _proxy_url() -> Optional[str]:
+        _, proxy = get_current_proxy_url_from(*BUILD_PROXY_KEYS)
+        return proxy or None
+
+    @staticmethod
+    async def persist_bundle(
+        bundle: TokenBundle,
+        *,
+        email: str = "",
+        sso_source: str = "",
+        pool_name: str = CLI_POOL_NAME,
+    ) -> bool:
+        mgr = await get_token_manager()
+        account_id = (
+            (bundle.sub or "").strip()
+            or (email or "").strip()
+            or sub_from_access_token(bundle.access_token)
+            or bundle.access_token[:32]
+        )
+        return await mgr.add_cli_oidc(
+            account_id=account_id,
+            access_token=bundle.access_token,
+            refresh_token=bundle.refresh_token,
+            expired_at=bundle.expired_at_ms,
+            base_url=str(get_config("build.base_url", DEFAULT_BASE_URL) or DEFAULT_BASE_URL),
+            email=email,
+            oidc_sub=bundle.sub,
+            pool_name=pool_name,
+            sso_source=sso_source,
+        )
+
+    @staticmethod
+    async def refresh_token_info(
+        token_info: TokenInfo,
+        pool_name: str = CLI_POOL_NAME,
+        *,
+        force: bool = False,
+    ) -> TokenInfo:
+        lead = _as_int(get_config("build.refresh_lead_sec", REFRESH_LEAD_SEC), REFRESH_LEAD_SEC)
+        now_ms = int(time.time() * 1000)
+        expired_at = int(token_info.expired_at or 0)
+        if not force and expired_at and now_ms < expired_at - lead * 1000:
+            return token_info
+        refresh = (token_info.refresh_token or "").strip()
+        if not refresh:
+            return token_info
+        endpoint = str(get_config("build.token_endpoint", TOKEN_ENDPOINT) or TOKEN_ENDPOINT)
+        try:
+            bundle = await refresh_tokens_async(
+                refresh,
+                token_endpoint=endpoint,
+                proxy=BuildAuthService._proxy_url(),
+            )
+        except OAuthRefreshError as exc:
+            logger.warning("CLI OIDC refresh failed {}: {}", token_info.token[:16], exc)
+            raise
+        token_info.access_token = bundle.access_token
+        if bundle.refresh_token:
+            token_info.refresh_token = bundle.refresh_token
+        token_info.expired_at = bundle.expired_at_ms
+        token_info.last_refresh_at = now_ms
+        if bundle.sub:
+            token_info.oidc_sub = bundle.sub
+        mgr = await get_token_manager()
+        await mgr.update_token_fields(
+            pool_name,
+            token_info.token,
+            {
+                "access_token": token_info.access_token,
+                "refresh_token": token_info.refresh_token,
+                "expired_at": token_info.expired_at,
+                "last_refresh_at": token_info.last_refresh_at,
+                "oidc_sub": token_info.oidc_sub,
+            },
+        )
+        return token_info
+
+    @staticmethod
+    async def refresh_expiring_cli_tokens(
+        *,
+        max_tokens: int = 50,
+        pool_name: str = CLI_POOL_NAME,
+    ) -> int:
+        """Scheduled pass: refresh OIDC access tokens nearing expiry."""
+        mgr = await get_token_manager()
+        await mgr.reload_if_stale()
+        pool = mgr.pools.get(pool_name)
+        if not pool:
+            return 0
+        lead = _as_int(get_config("build.refresh_lead_sec", REFRESH_LEAD_SEC), REFRESH_LEAD_SEC)
+        now_ms = int(time.time() * 1000)
+        refreshed = 0
+        for info in list(pool.list()):
+            if refreshed >= max_tokens:
+                break
+            if not (info.refresh_token or "").strip():
+                continue
+            expired_at = int(info.expired_at or 0)
+            if expired_at and now_ms < expired_at - lead * 1000:
+                continue
+            try:
+                await BuildAuthService.refresh_token_info(info, pool_name, force=True)
+                refreshed += 1
+            except Exception as exc:
+                logger.warning("CLI scheduled refresh failed {}: {}", info.token[:16], exc)
+        if refreshed:
+            logger.info("CLI OIDC scheduled refresh: {} tokens", refreshed)
+        return refreshed
+
+    @staticmethod
+    async def mint_from_sso_protocol(
+        sso_token: str,
+        *,
+        email: str = "",
+        log: Optional[Callable[[str], None]] = None,
+    ) -> TokenBundle:
+        """Attempt device-auth mint with browser SSO cookie inject (optional).
+
+        Protocol-first: request device_code + poll. Consent requires an authenticated
+        session — uses browser path when build.mint_allow_browser is true.
+        """
+        log = log or (lambda m: logger.info("CLI mint: {}", m))
+        proxy = BuildAuthService._proxy_url()
+        session = await asyncio.to_thread(request_device_code, proxy=proxy)
+        log(
+            f"device_code ok user_code={session.user_code} "
+            f"uri={session.verification_uri_complete}"
+        )
+
+        allow_browser = _as_bool(get_config("build.mint_allow_browser", True), True)
+        if not allow_browser:
+            # Without consent automation we can only poll (will timeout unless external approve)
+            raise OAuthDeviceError(
+                "mint requires browser consent; set build.mint_allow_browser=true "
+                "or complete device consent externally"
+            )
+
+        # Lazy import heavy browser stack
+        from grok2api.services.grok.services.build_mint_browser import (
+            approve_device_with_sso,
+        )
+
+        await asyncio.to_thread(
+            approve_device_with_sso,
+            verification_uri_complete=session.verification_uri_complete,
+            sso_token=sso_token,
+            email=email,
+            proxy=proxy,
+            log=log,
+        )
+        bundle = await asyncio.to_thread(
+            poll_device_token,
+            session.device_code,
+            interval=session.interval,
+            expires_in=session.expires_in,
+            proxy=proxy,
+            log=log,
+        )
+        return bundle
+
+    @classmethod
+    async def ensure_oidc_for_sso(
+        cls,
+        sso_token: str,
+        *,
+        email: str = "",
+        trigger: str = "request",
+    ) -> Optional[TokenInfo]:
+        """Ensure oidcBuild has a credential derived from this SSO (mint if missing)."""
+        sso_token = sso_token[4:] if sso_token.startswith("sso=") else sso_token
+        if not sso_token:
+            return None
+        mgr = await get_token_manager()
+        pool = mgr.pools.get(CLI_POOL_NAME)
+        if pool:
+            for info in pool.list():
+                if (info.sso_source or "") == sso_token and token_has_cli_auth(info):
+                    return info
+
+        if not _as_bool(get_config("build.mint_enabled", True), True):
+            return None
+
+        lock = await cls._mint_lock(sso_token)
+        async with lock:
+            # re-check after lock
+            mgr = await get_token_manager()
+            pool = mgr.pools.get(CLI_POOL_NAME)
+            if pool:
+                for info in pool.list():
+                    if (info.sso_source or "") == sso_token and token_has_cli_auth(info):
+                        return info
+            try:
+                logger.info(
+                    "CLI OIDC mint start trigger={} sso={}...",
+                    trigger,
+                    sso_token[:12],
+                )
+                bundle = await cls.mint_from_sso_protocol(sso_token, email=email)
+                await cls.persist_bundle(
+                    bundle, email=email, sso_source=sso_token, pool_name=CLI_POOL_NAME
+                )
+                # reload info
+                mgr = await get_token_manager()
+                pool = mgr.pools.get(CLI_POOL_NAME)
+                if not pool:
+                    return None
+                for info in pool.list():
+                    if (info.sso_source or "") == sso_token or (
+                        bundle.sub and info.token == bundle.sub
+                    ):
+                        return info
+            except Exception as exc:
+                logger.warning(
+                    "CLI OIDC mint failed trigger={} sso={}... err={}",
+                    trigger,
+                    sso_token[:12],
+                    exc,
+                )
+                return None
+        return None
+
+    @classmethod
+    async def init_missing_cli_oidc(
+        cls,
+        *,
+        trigger: str = "scheduler",
+        max_tokens: int = 20,
+        concurrency: int = 2,
+        source_pool: str = SSO_SOURCE_POOL,
+    ) -> int:
+        """Background: for existing SSO accounts without OIDC, mint silently."""
+        if not _as_bool(get_config("build.enabled", True), True):
+            return 0
+        if not _as_bool(get_config("build.mint_enabled", True), True):
+            return 0
+        if not _as_bool(get_config("build.auto_init_from_sso_enabled", True), True):
+            return 0
+
+        mgr = await get_token_manager()
+        await mgr.reload_if_stale()
+        source = mgr.pools.get(source_pool)
+        if not source:
+            return 0
+        existing_sso: set[str] = set()
+        oidc_pool = mgr.pools.get(CLI_POOL_NAME)
+        if oidc_pool:
+            for info in oidc_pool.list():
+                if info.sso_source:
+                    existing_sso.add(info.sso_source)
+
+        candidates: list[TokenInfo] = []
+        for info in source.list():
+            if info.status != TokenStatus.ACTIVE:
+                continue
+            if info.token in existing_sso:
+                continue
+            # Already has OIDC fields on the SSO record itself (optional dual-write)
+            if token_has_cli_auth(info) and (info.refresh_token or "").strip():
+                # promote into oidcBuild if missing
+                if info.token not in existing_sso:
+                    await mgr.add_cli_oidc(
+                        account_id=info.oidc_sub or info.email or info.token[:32],
+                        access_token=info.access_token,
+                        refresh_token=info.refresh_token,
+                        expired_at=info.expired_at,
+                        base_url=info.base_url or DEFAULT_BASE_URL,
+                        email=info.email,
+                        oidc_sub=info.oidc_sub,
+                        sso_source=info.token,
+                    )
+                continue
+            candidates.append(info)
+            if len(candidates) >= max_tokens:
+                break
+
+        if not candidates:
+            return 0
+
+        logger.info(
+            "CLI OIDC auto-init: {} candidates trigger={} concurrency={}",
+            len(candidates),
+            trigger,
+            concurrency,
+        )
+        sem = asyncio.Semaphore(max(1, concurrency))
+        done = 0
+
+        async def _one(info: TokenInfo) -> None:
+            nonlocal done
+            async with sem:
+                result = await cls.ensure_oidc_for_sso(
+                    info.token, email=info.email or "", trigger=trigger
+                )
+                if result is not None:
+                    done += 1
+
+        await asyncio.gather(*[_one(c) for c in candidates])
+        logger.info("CLI OIDC auto-init done: {}/{} trigger={}", done, len(candidates), trigger)
+        return done
+
+
+__all__ = [
+    "BuildAuthService",
+    "SSO_SOURCE_POOL",
+    "token_cli_selectable",
+    "token_has_cli_auth",
+]

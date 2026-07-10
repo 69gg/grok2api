@@ -16,7 +16,9 @@ from grok2api.services.grok.services.console_capabilities import normalize_reaso
 from grok2api.services.grok.services.console_native import ConsoleNativeService
 from grok2api.services.grok.services.image import ImageGenerationService
 from grok2api.services.grok.services.image_edit import ImageEditService
+from grok2api.services.grok.services.build_channel import BuildChannelService
 from grok2api.services.grok.services.model import Channel, ModelService
+from grok2api.services.reverse.build_native import BuildNativeResponse
 from grok2api.services.grok.services.video import VideoService
 from grok2api.services.grok.utils.response import make_chat_response
 from grok2api.services.grok.utils.errors import no_token_error
@@ -713,6 +715,29 @@ async def _console_native_chat_response(request: ChatCompletionRequest) -> Respo
     )
 
 
+async def _cli_native_chat_response(request: ChatCompletionRequest) -> Response:
+    """Free CLI channel: header-only rewrite passthrough to cli-chat-proxy."""
+    payload = request.model_dump(exclude_none=True)
+    stream = bool(request.stream)
+    result = await BuildChannelService.json_request(
+        model_id=request.model,
+        path="/v1/chat/completions",
+        payload=payload,
+        stream=stream,
+    )
+    if stream:
+        return StreamingResponse(
+            cast(AsyncIterator[bytes], result),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    native = cast(BuildNativeResponse, result)
+    return Response(
+        content=native.body,
+        media_type=(native.content_type or "application/json").split(";")[0],
+    )
+
+
 @router.post("/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     """Chat Completions API - 兼容 OpenAI"""
@@ -922,6 +947,8 @@ async def chat_completions(request: ChatCompletionRequest):
             raise
     else:
         try:
+            if model_info and model_info.channel == Channel.CLI:
+                return await _cli_native_chat_response(request)
             if model_info and model_info.channel == Channel.CONSOLE:
                 return await _console_native_chat_response(request)
             else:

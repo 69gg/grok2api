@@ -15,9 +15,11 @@ from pydantic import BaseModel, Field
 from grok2api.core.streaming import safe_responses_stream
 from grok2api.core.exceptions import ValidationException
 from grok2api.services.grok.services.console_capabilities import normalize_reasoning_effort
+from grok2api.services.grok.services.build_channel import BuildChannelService
 from grok2api.services.grok.services.console_native import ConsoleNativeService
 from grok2api.services.grok.services.model import ModelService
 from grok2api.services.grok.services.responses import ResponsesService
+from grok2api.services.reverse.build_native import BuildNativeResponse
 from grok2api.services.reverse.console_native import ConsoleNativeResponse
 
 
@@ -46,6 +48,32 @@ async def _console_native_json_response(
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
     native = cast(ConsoleNativeResponse, result)
+    return Response(
+        content=native.body,
+        media_type=(native.content_type or "application/json").split(";")[0],
+    )
+
+
+async def _cli_native_json_response(
+    *,
+    model_id: str,
+    path: str,
+    payload: Dict[str, Any],
+    stream: bool,
+) -> Response:
+    result = await BuildChannelService.json_request(
+        model_id=model_id,
+        path=path,
+        payload=payload,
+        stream=stream,
+    )
+    if stream:
+        return StreamingResponse(
+            cast(AsyncIterator[bytes], result),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    native = cast(BuildNativeResponse, result)
     return Response(
         content=native.body,
         media_type=(native.content_type or "application/json").split(";")[0],
@@ -117,6 +145,14 @@ async def create_response(request: ResponseCreateRequest):
     if isinstance(reasoning, dict) and reasoning.get("effort"):
         reasoning = {**reasoning, "effort": normalize_reasoning_effort(reasoning.get("effort"))}
 
+    if ModelService.is_cli(request.model):
+        payload = request.model_dump(exclude_none=True)
+        return await _cli_native_json_response(
+            model_id=request.model,
+            path="/v1/responses",
+            payload=payload,
+            stream=bool(request.stream),
+        )
     if ModelService.is_console(request.model):
         payload = request.model_dump(exclude_none=True)
         return await _console_native_json_response(

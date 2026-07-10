@@ -24,10 +24,12 @@ from grok2api.core.exceptions import (
     ValidationException,
 )
 from grok2api.core.logger import logger
+from grok2api.services.grok.services.build_channel import BuildChannelService
 from grok2api.services.grok.services.chat import ChatService
 from grok2api.services.grok.services.console_native import ConsoleNativeService
 from grok2api.services.grok.services.model import ModelService
 from grok2api.services.grok.utils import process as proc_base
+from grok2api.services.reverse.build_native import BuildNativeResponse
 from grok2api.services.reverse.console_native import ConsoleNativeResponse
 
 
@@ -50,6 +52,27 @@ async def _console_native_messages_response(payload: AnthropicMessagesRequest) -
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
     native = cast(ConsoleNativeResponse, result)
+    return Response(
+        content=native.body,
+        media_type=(native.content_type or "application/json").split(";")[0],
+    )
+
+
+async def _cli_native_messages_response(payload: AnthropicMessagesRequest) -> Response:
+    stream = bool(payload.stream)
+    result = await BuildChannelService.json_request(
+        model_id=payload.model,
+        path="/v1/messages",
+        payload=payload.model_dump(exclude_none=True),
+        stream=stream,
+    )
+    if stream:
+        return StreamingResponse(
+            cast(AsyncIterator[bytes], result),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    native = cast(BuildNativeResponse, result)
     return Response(
         content=native.body,
         media_type=(native.content_type or "application/json").split(";")[0],
@@ -928,6 +951,8 @@ async def create_message(request: Request, payload: AnthropicMessagesRequest):
         if not internal_messages:
             return _anthropic_json_error("messages cannot be empty")
 
+        if ModelService.is_cli(payload.model):
+            return await _cli_native_messages_response(payload)
         if ModelService.is_console(payload.model):
             return await _console_native_messages_response(payload)
 

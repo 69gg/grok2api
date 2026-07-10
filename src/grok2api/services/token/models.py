@@ -77,6 +77,17 @@ class TokenInfo(BaseModel):
     console_team_id: str = ""
     console_team_name: str = ""
 
+    # Free CLI Build OIDC (cli-chat-proxy)
+    access_token: str = ""
+    refresh_token: str = ""
+    expired_at: Optional[int] = None  # unix ms
+    base_url: str = ""
+    email: str = ""
+    oidc_sub: str = ""
+    last_refresh_at: Optional[int] = None
+    # SSO that was used to mint this OIDC entry (console-team-style linkage)
+    sso_source: str = ""
+
     @field_validator("token", mode="before")
     @classmethod
     def _normalize_token(cls, value):

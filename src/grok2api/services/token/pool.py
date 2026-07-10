@@ -51,7 +51,10 @@ class TokenPool:
         *,
         exclude: Optional[Set[str]] = None,
         prefer_tags: Optional[Set[str]] = None,
+        require_cli_auth: bool = False,
     ) -> List[TokenInfo]:
+        import time
+
         consumed_mode = self._is_consumed_mode()
         excluded = self._normalize_exclude(exclude)
         available = [
@@ -63,6 +66,25 @@ class TokenPool:
         if not available:
             return []
 
+        if require_cli_auth:
+            # Prefer accounts that already have OIDC auth (CLI channel).
+            now_ms = int(time.time() * 1000)
+
+            def _has_auth(t: TokenInfo) -> bool:
+                if not ((t.refresh_token or "").strip() or (t.access_token or "").strip()):
+                    return False
+                if (t.last_fail_reason or "") == "free-usage-exhausted":
+                    resume_at = int(t.last_sync_at or 0)
+                    if resume_at and now_ms < resume_at:
+                        return False
+                return True
+
+            with_auth = [t for t in available if _has_auth(t)]
+            if with_auth:
+                available = with_auth
+            else:
+                return []
+
         if prefer_tags:
             preferred = [t for t in available if prefer_tags.issubset(set(t.tags or []))]
             if preferred:
@@ -70,7 +92,10 @@ class TokenPool:
         return available
 
     def select(
-        self, exclude: Optional[Set[str]] = None, prefer_tags: Optional[Set[str]] = None
+        self,
+        exclude: Optional[Set[str]] = None,
+        prefer_tags: Optional[Set[str]] = None,
+        require_cli_auth: bool = False,
     ) -> Optional[TokenInfo]:
         """
         选择一个可用 Token
@@ -86,8 +111,13 @@ class TokenPool:
         Args:
             exclude: 需要排除的 token 字符串集合
             prefer_tags: 优先选择包含这些 tag 的 token（若存在则仅在其子集中选择）
+            require_cli_auth: 仅选择已有 OIDC auth 的账号（CLI 通道）
         """
-        available = self._available_tokens(exclude=exclude, prefer_tags=prefer_tags)
+        available = self._available_tokens(
+            exclude=exclude,
+            prefer_tags=prefer_tags,
+            require_cli_auth=require_cli_auth,
+        )
         if not available:
             return None
         return random.choice(available)
@@ -96,9 +126,14 @@ class TokenPool:
         self,
         exclude: Optional[Set[str]] = None,
         prefer_tags: Optional[Set[str]] = None,
+        require_cli_auth: bool = False,
     ) -> Optional[TokenInfo]:
         """按池内顺序轮询选择可用 Token，并在每次选择后推进游标。"""
-        available = self._available_tokens(exclude=exclude, prefer_tags=prefer_tags)
+        available = self._available_tokens(
+            exclude=exclude,
+            prefer_tags=prefer_tags,
+            require_cli_auth=require_cli_auth,
+        )
         if not available:
             return None
 

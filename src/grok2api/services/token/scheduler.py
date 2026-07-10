@@ -17,6 +17,9 @@ CF_CLEARANCE_LOCK_SECONDS = 35 * 60
 CF_CLEARANCE_STOP_TIMEOUT_SECONDS = 25.0
 CONSOLE_TEAM_DEFAULT_INTERVAL_SECONDS = 60
 CONSOLE_TEAM_LOCK_SECONDS = 10 * 60
+CLI_OIDC_DEFAULT_INTERVAL_SECONDS = 60
+CLI_OIDC_LOCK_SECONDS = 10 * 60
+CLI_OIDC_REFRESH_DEFAULT_INTERVAL_SECONDS = 120
 LOCAL_SOLVER_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 
@@ -51,6 +54,25 @@ def _console_team_init_interval_seconds() -> int:
         ),
         CONSOLE_TEAM_DEFAULT_INTERVAL_SECONDS,
         minimum=10,
+    )
+
+
+def _cli_oidc_init_interval_seconds() -> int:
+    return _as_int(
+        get_config("build.auto_init_interval_sec", CLI_OIDC_DEFAULT_INTERVAL_SECONDS),
+        CLI_OIDC_DEFAULT_INTERVAL_SECONDS,
+        minimum=10,
+    )
+
+
+def _cli_oidc_refresh_interval_seconds() -> int:
+    return _as_int(
+        get_config(
+            "build.auto_refresh_interval_sec",
+            CLI_OIDC_REFRESH_DEFAULT_INTERVAL_SECONDS,
+        ),
+        CLI_OIDC_REFRESH_DEFAULT_INTERVAL_SECONDS,
+        minimum=30,
     )
 
 
@@ -131,6 +153,8 @@ class TokenRefreshScheduler:
         self._task: Optional[asyncio.Task] = None
         self._cf_task: Optional[asyncio.Task] = None
         self._console_team_task: Optional[asyncio.Task] = None
+        self._cli_oidc_task: Optional[asyncio.Task] = None
+        self._cli_refresh_task: Optional[asyncio.Task] = None
         self._cf_solver: TurnstileSolverProcess | None = None
         self._cf_stop_event: threading.Event | None = None
         self._running = False
@@ -355,12 +379,84 @@ class TokenRefreshScheduler:
         except asyncio.CancelledError:
             raise
 
+    async def _run_cli_oidc_init_with_lock(self) -> None:
+        """Silently mint OIDC for existing SSO accounts (console-team style)."""
+        storage = get_storage()
+        try:
+            async with storage.acquire_lock("cli_oidc_init", timeout=1):
+                from grok2api.services.grok.services.build_auth import BuildAuthService
+
+                await BuildAuthService.init_missing_cli_oidc(
+                    trigger="scheduler",
+                    max_tokens=_as_int(
+                        get_config("build.auto_init_batch_size", 20), 20
+                    ),
+                    concurrency=_as_int(
+                        get_config("build.auto_init_concurrency", 2), 2
+                    ),
+                )
+        except StorageError:
+            logger.info("CLI OIDC init: skipped (lock not acquired)")
+
+    async def _cli_oidc_init_loop(self) -> None:
+        interval_seconds = _cli_oidc_init_interval_seconds()
+        logger.info(
+            "Scheduler: CLI OIDC auto-init loop started (interval: {}s)",
+            interval_seconds,
+        )
+        try:
+            while self._running:
+                try:
+                    await self._run_cli_oidc_init_with_lock()
+                except Exception as e:
+                    logger.warning(f"Scheduler: CLI OIDC init error - {e}")
+                deadline = asyncio.get_running_loop().time() + interval_seconds
+                while self._running:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(1.0, remaining))
+        except asyncio.CancelledError:
+            raise
+
+    async def _cli_oidc_refresh_loop(self) -> None:
+        interval_seconds = _cli_oidc_refresh_interval_seconds()
+        logger.info(
+            "Scheduler: CLI OIDC refresh loop started (interval: {}s)",
+            interval_seconds,
+        )
+        try:
+            while self._running:
+                try:
+                    if _as_bool(get_config("build.auto_refresh_enabled", True), True):
+                        from grok2api.services.grok.services.build_auth import (
+                            BuildAuthService,
+                        )
+
+                        await BuildAuthService.refresh_expiring_cli_tokens(
+                            max_tokens=_as_int(
+                                get_config("build.auto_refresh_max_tokens", 50), 50
+                            )
+                        )
+                except Exception as e:
+                    logger.warning(f"Scheduler: CLI OIDC refresh error - {e}")
+                deadline = asyncio.get_running_loop().time() + interval_seconds
+                while self._running:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(1.0, remaining))
+        except asyncio.CancelledError:
+            raise
+
     def start(
         self,
         *,
         token_refresh_enabled: bool = True,
         cf_refresh_enabled: bool | None = None,
         console_team_init_enabled: bool | None = None,
+        cli_oidc_init_enabled: bool | None = None,
+        cli_oidc_refresh_enabled: bool | None = None,
     ) -> None:
         """启动调度器"""
         if self._running:
@@ -374,6 +470,14 @@ class TokenRefreshScheduler:
                 get_config("token.console_team_auto_init_enabled", True),
                 True,
             )
+        if cli_oidc_init_enabled is None:
+            cli_oidc_init_enabled = _as_bool(
+                get_config("build.enabled", True), True
+            ) and _as_bool(get_config("build.auto_init_from_sso_enabled", True), True)
+        if cli_oidc_refresh_enabled is None:
+            cli_oidc_refresh_enabled = _as_bool(
+                get_config("build.enabled", True), True
+            ) and _as_bool(get_config("build.auto_refresh_enabled", True), True)
 
         self._running = True
         if token_refresh_enabled:
@@ -385,6 +489,10 @@ class TokenRefreshScheduler:
             self._console_team_task = asyncio.create_task(
                 self._console_team_init_loop()
             )
+        if cli_oidc_init_enabled:
+            self._cli_oidc_task = asyncio.create_task(self._cli_oidc_init_loop())
+        if cli_oidc_refresh_enabled:
+            self._cli_refresh_task = asyncio.create_task(self._cli_oidc_refresh_loop())
         logger.info("Scheduler: enabled")
 
     async def stop(self) -> None:
@@ -403,6 +511,12 @@ class TokenRefreshScheduler:
         if self._console_team_task:
             self._console_team_task.cancel()
             tasks.append(self._console_team_task)
+        if self._cli_oidc_task:
+            self._cli_oidc_task.cancel()
+            tasks.append(self._cli_oidc_task)
+        if self._cli_refresh_task:
+            self._cli_refresh_task.cancel()
+            tasks.append(self._cli_refresh_task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -419,6 +533,8 @@ class TokenRefreshScheduler:
         await self._stop_cf_solver()
         self._task = None
         self._console_team_task = None
+        self._cli_oidc_task = None
+        self._cli_refresh_task = None
         self._cf_task = None
         self._cf_stop_event = None
         logger.info("Scheduler: stopped")

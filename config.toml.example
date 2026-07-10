@@ -47,6 +47,7 @@ url = ""
 # 基础代理地址（代理到 Grok 官网）
 base_proxy_url = ""
 # Console 专用代理地址（代理到 console.x.ai；为空时回退 base_proxy_url；支持逗号分隔多个代理）
+# Free CLI（cli-chat-proxy / Grok 4.5）与 Console 共用此代理，无需单独配置
 console_proxy_url = ""
 # 资源代理地址（代理静态资源如图片/视频）
 asset_proxy_url = ""
@@ -122,6 +123,33 @@ console_team_name_prefix = "Grok2API team"
 console_team_init_timeout = 120
 # 启用消耗模式（试验性功能，默认关闭）
 consumed_mode_enabled = false
+
+
+# ==================== Free CLI Build（Grok 4.5 / Composer，OIDC） ====================
+# 默认全开：pull 后无需改配置即可用（代理与 Console 共用 proxy.console_proxy_url）
+# 上游: https://cli-chat-proxy.grok.com/v1 ；凭证池 oidcBuild
+# 后台静默为已有 ssoBasic 铸 OIDC；请求只轮询已有 auth 的号；按需 refresh
+[build]
+enabled = true
+base_url = "https://cli-chat-proxy.grok.com/v1"
+token_endpoint = "https://auth.x.ai/oauth2/token"
+client_id = "b1a00492-073a-47ea-816f-4c329264a828"
+refresh_lead_sec = 300
+auto_refresh_enabled = true
+auto_refresh_interval_sec = 120
+auto_refresh_max_tokens = 50
+# 后台从 ssoBasic 静默补 OIDC（console team 风格）
+auto_init_from_sso_enabled = true
+auto_init_interval_sec = 60
+auto_init_batch_size = 20
+auto_init_concurrency = 2
+# device-auth mint（默认开；有头浏览器 consent，Turnstile 失败会刷新重试）
+mint_enabled = true
+mint_prefer_protocol = true
+mint_allow_browser = true
+free_usage_cooldown_sec = 86400
+default_web_search = false
+timeout_sec = 300
 
 # ==================== 自动注册配置 ====================
 [register]

@@ -375,6 +375,7 @@ class TokenManager:
         pool_name: str = "ssoBasic",
         exclude: Optional[Set[str]] = None,
         prefer_tags: Optional[Set[str]] = None,
+        require_cli_auth: bool | None = None,
     ) -> Optional[str]:
         """
         按池内顺序轮询获取可用 Token。
@@ -383,6 +384,7 @@ class TokenManager:
             pool_name: Token 池名称
             exclude: 需要排除的 token 字符串集合
             prefer_tags: 优先选择包含这些 tag 的 token
+            require_cli_auth: 仅选择已有 OIDC 的账号；oidcBuild 池默认 True
 
         Returns:
             Token 字符串或 None
@@ -392,7 +394,13 @@ class TokenManager:
             logger.debug(f"Pool '{pool_name}' not found")
             return None
 
-        token_info = pool.select_round_robin(exclude=exclude, prefer_tags=prefer_tags)
+        if require_cli_auth is None:
+            require_cli_auth = pool_name == "oidcBuild"
+        token_info = pool.select_round_robin(
+            exclude=exclude,
+            prefer_tags=prefer_tags,
+            require_cli_auth=require_cli_auth,
+        )
         if not token_info:
             logger.debug(f"No available token in pool '{pool_name}'")
             return None
@@ -404,6 +412,7 @@ class TokenManager:
         pool_name: str = "ssoBasic",
         exclude: Optional[Set[str]] = None,
         prefer_tags: Optional[Set[str]] = None,
+        require_cli_auth: bool | None = None,
     ) -> Optional["TokenInfo"]:
         """按池内顺序轮询获取可用 TokenInfo。"""
         pool = self.pools.get(pool_name)
@@ -411,7 +420,13 @@ class TokenManager:
             logger.debug(f"Pool '{pool_name}' not found")
             return None
 
-        token_info = pool.select_round_robin(exclude=exclude, prefer_tags=prefer_tags)
+        if require_cli_auth is None:
+            require_cli_auth = pool_name == "oidcBuild"
+        token_info = pool.select_round_robin(
+            exclude=exclude,
+            prefer_tags=prefer_tags,
+            require_cli_auth=require_cli_auth,
+        )
         if not token_info:
             logger.debug(f"No available token in pool '{pool_name}'")
             return None
@@ -766,6 +781,98 @@ class TokenManager:
         return False
 
     # ========== 管理功能 ==========
+
+    async def update_token_fields(
+        self,
+        pool_name: str,
+        token: str,
+        fields: Dict[str, object],
+    ) -> bool:
+        """Update selected fields on a token and schedule save."""
+        raw_token = token[4:] if token.startswith("sso=") else token
+        pool = self.pools.get(pool_name)
+        if not pool:
+            return False
+        info = pool.get(raw_token)
+        if not info:
+            return False
+        for key, value in fields.items():
+            if hasattr(info, key):
+                setattr(info, key, value)
+        self._track_token_change(info, pool_name, "state")
+        self._schedule_save()
+        return True
+
+    async def add_cli_oidc(
+        self,
+        *,
+        account_id: str,
+        access_token: str,
+        refresh_token: str,
+        expired_at: Optional[int] = None,
+        base_url: str = "",
+        email: str = "",
+        oidc_sub: str = "",
+        pool_name: str = "oidcBuild",
+        sso_source: str = "",
+    ) -> bool:
+        """Insert or update a free CLI OIDC credential (prefer accounts that already have auth)."""
+        from grok2api.services.reverse.build_constants import DEFAULT_BASE_URL
+        from grok2api.services.reverse.build_oauth import expired_ms_from_access_token
+
+        account_id = (account_id or oidc_sub or email or access_token[:32]).strip()
+        if not account_id or not access_token or not refresh_token:
+            return False
+        if pool_name not in self.pools:
+            self.pools[pool_name] = TokenPool(pool_name)
+            logger.info(f"Pool '{pool_name}': created")
+        pool = self.pools[pool_name]
+        # Prefer stable key by sso_source if this SSO already minted once
+        sso_source = (sso_source or "").strip()
+        existing = pool.get(account_id)
+        if existing is None and sso_source:
+            for info in pool.list():
+                if (info.sso_source or "") == sso_source:
+                    existing = info
+                    account_id = info.token
+                    break
+        if expired_at is None:
+            try:
+                expired_at = expired_ms_from_access_token(access_token)
+            except Exception:
+                expired_at = None
+        if existing:
+            existing.access_token = access_token
+            existing.refresh_token = refresh_token
+            existing.expired_at = expired_at
+            existing.base_url = base_url or existing.base_url or DEFAULT_BASE_URL
+            existing.email = email or existing.email
+            existing.oidc_sub = oidc_sub or existing.oidc_sub
+            if sso_source:
+                existing.sso_source = sso_source
+            existing.status = TokenStatus.ACTIVE
+            existing.last_fail_reason = None
+            existing.last_refresh_at = int(datetime.now().timestamp() * 1000)
+            self._track_token_change(existing, pool_name, "state")
+        else:
+            info = TokenInfo(
+                token=account_id,
+                status=TokenStatus.ACTIVE,
+                quota=_default_quota_for_pool(pool_name),
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expired_at=expired_at,
+                base_url=base_url or DEFAULT_BASE_URL,
+                email=email,
+                oidc_sub=oidc_sub,
+                sso_source=sso_source,
+                last_refresh_at=int(datetime.now().timestamp() * 1000),
+            )
+            pool.add(info)
+            self._track_token_change(info, pool_name, "state")
+        await self._save(force=True)
+        logger.info(f"Pool '{pool_name}': CLI OIDC credential upserted for {account_id[:24]}")
+        return True
 
     async def add(self, token: str, pool_name: str = "ssoBasic") -> bool:
         """

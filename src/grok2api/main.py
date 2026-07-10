@@ -61,8 +61,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     console_team_init_enabled = bool(
         get_config("token.console_team_auto_init_enabled", True)
     )
+    cli_build_enabled = bool(get_config("build.enabled", True))
+    cli_oidc_init_enabled = cli_build_enabled and bool(
+        get_config("build.auto_init_from_sso_enabled", True)
+    )
+    cli_oidc_refresh_enabled = cli_build_enabled and bool(
+        get_config("build.auto_refresh_enabled", True)
+    )
     scheduler = None
-    if token_refresh_enabled or cf_refresh_enabled or console_team_init_enabled:
+    if (
+        token_refresh_enabled
+        or cf_refresh_enabled
+        or console_team_init_enabled
+        or cli_oidc_init_enabled
+        or cli_oidc_refresh_enabled
+    ):
         basic_interval = float(get_config("token.refresh_interval_hours", 8) or 8)
         super_interval = float(get_config("token.super_refresh_interval_hours", 2) or 2)
         scheduler = get_scheduler(min(basic_interval, super_interval))
@@ -70,6 +83,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             token_refresh_enabled=token_refresh_enabled,
             cf_refresh_enabled=cf_refresh_enabled,
             console_team_init_enabled=console_team_init_enabled,
+            cli_oidc_init_enabled=cli_oidc_init_enabled,
+            cli_oidc_refresh_enabled=cli_oidc_refresh_enabled,
         )
 
     logger.info("Application startup complete.")

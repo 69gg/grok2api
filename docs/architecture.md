@@ -13,9 +13,21 @@
 
 ## Token 选择
 
-模型目录和同名模型解析按固定优先级处理：Console Chat / Voice / Image 优先，其次是 Basic grok.com app，再到 ssoSuper，最后是其他模型。这个顺序同时影响 `GET /v1/models` 的返回顺序和 `ModelService.get()` 对同名 `model_id` 的解析。
+模型目录和同名模型解析按固定优先级处理：**CLI（free Grok 4.5 / Composer）> Console Chat / Voice / Image > Basic grok.com app > ssoSuper**。这个顺序同时影响 `GET /v1/models` 的返回顺序和 `ModelService.get()` 对同名 `model_id` 的解析。
 
 Grok 与 Console Chat / Voice / Image 通道都使用进程内轮询游标：每次上游调用都会在候选池中推进到下一个可用 SSO 号。单次请求内的失败重试会排除已尝试的号，继续轮询后续可用号；grok.com 通道的 429 会标记当前号为 cooling 后换号重试，Console 通道的 429 只在当前请求内换号。
+
+### Free CLI Build 通道（`Channel.CLI` / 池 `oidcBuild`）
+
+- 上游：`cli-chat-proxy.grok.com/v1`，OpenAI chat / Anthropic messages / Responses **header 透传**（仅改 Bearer 与 Grok CLI 客户端头）。
+- 凭证：OIDC `access_token` + `refresh_token`（**不是**网页 SSO JWT）。SSO ≠ OIDC。
+- **代理**：与 Console 共用 `proxy.console_proxy_url`（空则 `base_proxy_url`），无独立 build 代理项。
+- **默认开启**：`[build]` 全开，pull 后无需改配置即可用。
+- **后台静默铸 OIDC**（对齐 Console `console_team_id`）：定时扫描 `ssoBasic` 中尚未关联 OIDC 的账号，device-auth mint 后写入 `oidcBuild`（`sso_source` 关联）。
+- **按需刷新**：请求前若 access 将过期则 `refresh_token` 换新；调度器也周期刷新。
+- **请求轮询**：只从**已有 auth** 的 `oidcBuild` 账号 round-robin；无可用号时才触发 on-demand mint。
+- 额度耗尽（`free-usage-exhausted`）：该 OIDC 号 cooling 约 24h，不影响同号 Console/SSO 其它通道。
+- 协议细节见 `docs/build_cli_protocol.md`。
 
 Console 通道对上游失败做更细的账号状态区分：429、普通 403 和 Cloudflare HTML challenge 只在当前请求内换下一个号重试，不禁用账号；只有明确的 blocked-user 响应（例如 `unauthorized:blocked-user` / `User is blocked`）才会立即标记该 Console 号失效。这个规则同时适用于 Console 原生请求和缺失 `console_team_id` 时的 `CreateTeam` 初始化请求。
 

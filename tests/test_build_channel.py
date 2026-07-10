@@ -1,0 +1,91 @@
+"""Tests for free CLI Build channel (models, payload, pool preference)."""
+
+from __future__ import annotations
+
+import time
+
+from grok2api.services.grok.services.build_channel import (
+    inject_web_search_tools,
+    is_free_usage_exhausted,
+    prepare_cli_payload,
+)
+from grok2api.services.grok.services.model import Channel, ModelService
+from grok2api.core.exceptions import UpstreamException
+from grok2api.services.token.models import TokenInfo, TokenStatus
+from grok2api.services.token.pool import TokenPool
+from grok2api.services.grok.services.build_auth import token_cli_selectable, token_has_cli_auth
+
+
+def test_cli_models_registered_and_priority() -> None:
+    ids = {
+        "grok-4.5",
+        "grok-4.5-search",
+        "grok-composer-2.5-fast",
+        "grok-composer-2.5-fast-search",
+    }
+    for mid in ids:
+        m = ModelService.get(mid)
+        assert m is not None
+        assert m.channel == Channel.CLI
+        assert m.owned_by == "xai-cli<grok2api@69gg>"
+        assert ModelService.pool_for_model(mid) == "oidcBuild"
+        assert ModelService.pool_candidates_for_model(mid) == ["oidcBuild"]
+        assert ModelService.is_cli(mid)
+
+    listed = [m.model_id for m in ModelService.list()]
+    # CLI models appear before console models
+    assert listed.index("grok-4.5") < listed.index("grok-4.3")
+
+
+def test_search_alias_injects_web_search() -> None:
+    payload = prepare_cli_payload("grok-4.5-search", {"model": "x", "input": "hi"})
+    assert payload["model"] == "grok-4.5"
+    tools = payload.get("tools") or []
+    assert any(isinstance(t, dict) and t.get("type") == "web_search" for t in tools)
+
+    payload2 = inject_web_search_tools({"tools": [{"type": "web_search"}]})
+    assert len(payload2["tools"]) == 1
+
+
+def test_free_usage_exhausted_detection() -> None:
+    exc = UpstreamException(
+        message="rate",
+        details={
+            "status": 429,
+            "body": '{"code":"subscription:free-usage-exhausted","error":"included free usage"}',
+        },
+    )
+    assert is_free_usage_exhausted(exc)
+
+
+def test_pool_prefers_accounts_with_cli_auth() -> None:
+    pool = TokenPool("oidcBuild")
+    bare = TokenInfo(token="bare", status=TokenStatus.ACTIVE, quota=10)
+    with_auth = TokenInfo(
+        token="auth1",
+        status=TokenStatus.ACTIVE,
+        quota=10,
+        access_token="access",
+        refresh_token="refresh",
+    )
+    pool.add(bare)
+    pool.add(with_auth)
+    picked = pool.select_round_robin(require_cli_auth=True)
+    assert picked is not None
+    assert picked.token == "auth1"
+    assert token_has_cli_auth(with_auth)
+    assert not token_has_cli_auth(bare)
+    assert token_cli_selectable(with_auth)
+
+
+def test_free_usage_cooling_not_selectable() -> None:
+    info = TokenInfo(
+        token="cool",
+        status=TokenStatus.ACTIVE,
+        quota=10,
+        access_token="a",
+        refresh_token="r",
+        last_fail_reason="free-usage-exhausted",
+        last_sync_at=int(time.time() * 1000) + 3600_000,
+    )
+    assert not token_cli_selectable(info)
