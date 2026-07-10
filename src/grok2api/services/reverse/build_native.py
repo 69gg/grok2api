@@ -6,6 +6,7 @@ import inspect
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, Mapping, Optional
 
+import orjson
 from curl_cffi.requests import AsyncSession
 
 from grok2api.core.config import get_config
@@ -26,6 +27,14 @@ from grok2api.services.reverse.utils.retry import extract_status_for_retry
 BUILD_PROXY_KEYS = CONSOLE_PROXY_KEYS
 BUILD_TIMEOUT = 300.0
 BUILD_TRANSPORT_MAX_RETRY = 3
+_BODY_LOG_PREVIEW_CHARS = 6000
+_SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+    "x-api-key",
+}
 
 
 @dataclass(frozen=True)
@@ -53,11 +62,76 @@ def _sanitize_headers(headers: Optional[Mapping[str, Any]]) -> Dict[str, str]:
     safe: Dict[str, str] = {}
     for key, value in headers.items():
         key_str = str(key)
-        if key_str.lower() in _SENSITIVE_RESPONSE_HEADER_NAMES:
-            safe[key_str] = "<redacted>"
+        if key_str.lower() in _SENSITIVE_RESPONSE_HEADER_NAMES | _SENSITIVE_HEADER_NAMES:
+            # Keep scheme only for Authorization so 400 debugging can still see auth mode
+            if key_str.lower() == "authorization":
+                raw = str(value)
+                if raw.lower().startswith("bearer "):
+                    token = raw[7:].strip()
+                    safe[key_str] = f"Bearer <redacted len={len(token)} prefix={token[:12]}...>"
+                else:
+                    safe[key_str] = "<redacted>"
+            else:
+                safe[key_str] = "<redacted>"
         else:
             safe[key_str] = str(value)
     return safe
+
+
+def _truncate_for_log(value: str, limit: int = _BODY_LOG_PREVIEW_CHARS) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated {len(value) - limit} chars>"
+
+
+def _body_log_preview(body: bytes | None, content_type: Optional[str] = None) -> str:
+    if not body:
+        return "<empty>"
+    text = body.decode("utf-8", errors="replace")
+    ct = (content_type or "").lower()
+    if "json" in ct or text.lstrip()[:1] in {"{", "["}:
+        try:
+            parsed = orjson.loads(body)
+            text = orjson.dumps(parsed, option=orjson.OPT_INDENT_2).decode("utf-8")
+        except Exception:
+            pass
+    return _truncate_for_log(text)
+
+
+def _log_upstream_400(
+    *,
+    method: str,
+    url: str,
+    path: str,
+    request_headers: Dict[str, str],
+    request_body: bytes | None,
+    content_type: Optional[str],
+    status: int,
+    response_headers: Mapping[str, Any] | None,
+    response_body: bytes | None,
+    proxy_key: Optional[str],
+    stream: bool,
+) -> None:
+    """Verbose request/response dump for upstream 400 diagnostics."""
+    req_headers = _sanitize_headers(request_headers)
+    resp_headers = _sanitize_headers(response_headers)
+    logger.error(
+        "BuildNativeReverse HTTP {} detail: method={} url={} path={} stream={} "
+        "proxy_key={} request_headers={} request_body={} response_headers={} response_body={}",
+        status,
+        method,
+        url,
+        path,
+        stream,
+        proxy_key,
+        req_headers,
+        _body_log_preview(request_body, content_type),
+        resp_headers,
+        _body_log_preview(
+            response_body,
+            str((response_headers or {}).get("content-type") or ""),
+        ),
+    )
 
 
 def resolve_build_base_url() -> str:
@@ -217,13 +291,28 @@ class BuildNativeReverse:
                 body_bytes = await BuildNativeReverse._read_body(response)
                 text = body_bytes.decode("utf-8", errors="ignore")
                 await session.close()
-                logger.error(
-                    "BuildNativeReverse upstream failure: method={} path={} status={} body={}",
-                    request_method,
-                    path,
-                    status,
-                    text[:1000],
-                )
+                if status == 400:
+                    _log_upstream_400(
+                        method=request_method,
+                        url=url,
+                        path=path,
+                        request_headers=headers,
+                        request_body=body,
+                        content_type=content_type,
+                        status=status,
+                        response_headers=response.headers,
+                        response_body=body_bytes,
+                        proxy_key=active_proxy_key,
+                        stream=stream,
+                    )
+                else:
+                    logger.error(
+                        "BuildNativeReverse upstream failure: method={} path={} status={} body={}",
+                        request_method,
+                        path,
+                        status,
+                        text[:1000],
+                    )
                 raise UpstreamException(
                     message=f"BuildNativeReverse: request failed, {status}",
                     details={
