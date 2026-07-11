@@ -138,6 +138,10 @@ refresh_lead_sec = 300
 auto_refresh_enabled = true
 auto_refresh_interval_sec = 120
 auto_refresh_max_tokens = 50
+# refresh_token 被吊销（invalid_grant）时，用 sso_source 自动重新 device mint
+remint_on_revoked = true
+# remint 失败后的冷却（秒），避免对失效 SSO 死循环 mint
+remint_cooldown_sec = 300
 # 后台从 ssoBasic 静默补 OIDC（console team 风格）
 auto_init_from_sso_enabled = true
 auto_init_interval_sec = 60

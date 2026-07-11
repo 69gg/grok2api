@@ -79,6 +79,18 @@ def token_cli_selectable(token_info: TokenInfo) -> bool:
     return True
 
 
+def is_oidc_refresh_revoked_error(exc: BaseException) -> bool:
+    """Whether refresh failed permanently (invalid_grant / revoked refresh token)."""
+    msg = str(exc).lower()
+    if "invalid_grant" in msg:
+        return True
+    if "revoked" in msg and "refresh" in msg:
+        return True
+    if "refresh token has been revoked" in msg:
+        return True
+    return False
+
+
 class BuildAuthService:
     """Mint / refresh OIDC for CLI channel."""
 
@@ -127,6 +139,125 @@ class BuildAuthService:
         )
 
     @staticmethod
+    async def _invalidate_dead_oidc(
+        token_info: TokenInfo,
+        pool_name: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Drop revoked OIDC secrets so schedulers stop thrashing refresh."""
+        now_ms = int(time.time() * 1000)
+        token_info.access_token = ""
+        token_info.refresh_token = ""
+        token_info.last_fail_reason = reason
+        token_info.last_fail_at = now_ms
+        mgr = await get_token_manager()
+        await mgr.update_token_fields(
+            pool_name,
+            token_info.token,
+            {
+                "access_token": "",
+                "refresh_token": "",
+                "last_fail_reason": reason,
+                "last_fail_at": now_ms,
+            },
+        )
+
+    @classmethod
+    async def remint_oidc_for_token_info(
+        cls,
+        token_info: TokenInfo,
+        pool_name: str = CLI_POOL_NAME,
+        *,
+        trigger: str = "refresh_revoked",
+    ) -> Optional[TokenInfo]:
+        """Re-run device mint using linked sso_source after refresh_token is dead."""
+        if not _as_bool(get_config("build.mint_enabled", True), True):
+            return None
+        if not _as_bool(get_config("build.remint_on_revoked", True), True):
+            return None
+
+        sso = (token_info.sso_source or "").strip()
+        if not sso:
+            logger.warning(
+                "CLI OIDC remint skipped {}: no sso_source (cannot re-device-auth)",
+                token_info.token[:16],
+            )
+            await cls._invalidate_dead_oidc(
+                token_info, pool_name, reason="oidc_refresh_revoked_no_sso"
+            )
+            return None
+
+        email = (token_info.email or "").strip()
+        dead_refresh = (token_info.refresh_token or "").strip()
+        lock = await cls._mint_lock(sso)
+        async with lock:
+            mgr = await get_token_manager()
+            pool = mgr.pools.get(pool_name)
+            current = pool.get(token_info.token) if pool else None
+            if current is None and pool:
+                for info in pool.list():
+                    if (info.sso_source or "") == sso:
+                        current = info
+                        break
+            if current is not None:
+                cur_refresh = (current.refresh_token or "").strip()
+                # Another task already replaced the revoked refresh token.
+                if (
+                    cur_refresh
+                    and dead_refresh
+                    and cur_refresh != dead_refresh
+                    and token_has_cli_auth(current)
+                ):
+                    logger.info(
+                        "CLI OIDC remint skipped {}: already reminted by peer",
+                        token_info.token[:16],
+                    )
+                    return current
+
+            try:
+                logger.info(
+                    "CLI OIDC remint start trigger={} token={} sso={}...",
+                    trigger,
+                    token_info.token[:16],
+                    sso[:12],
+                )
+                bundle = await cls.mint_from_sso_protocol(sso, email=email)
+                await cls.persist_bundle(
+                    bundle,
+                    email=email,
+                    sso_source=sso,
+                    pool_name=pool_name,
+                )
+                mgr = await get_token_manager()
+                pool = mgr.pools.get(pool_name)
+                if not pool:
+                    return None
+                for info in pool.list():
+                    if (info.sso_source or "") == sso or (
+                        bundle.sub and info.token == bundle.sub
+                    ):
+                        logger.info(
+                            "CLI OIDC remint ok trigger={} token={}",
+                            trigger,
+                            info.token[:16],
+                        )
+                        return info
+                return None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "CLI OIDC remint failed trigger={} token={} sso={}... err={}",
+                    trigger,
+                    token_info.token[:16],
+                    sso[:12],
+                    exc,
+                )
+                await cls._invalidate_dead_oidc(
+                    token_info, pool_name, reason="oidc_refresh_revoked"
+                )
+                return None
+
+    @staticmethod
     async def refresh_token_info(
         token_info: TokenInfo,
         pool_name: str = CLI_POOL_NAME,
@@ -140,6 +271,15 @@ class BuildAuthService:
             return token_info
         refresh = (token_info.refresh_token or "").strip()
         if not refresh:
+            # Dead credential with linked SSO: force path remints after cooldown.
+            if force and (token_info.sso_source or "").strip():
+                if BuildAuthService._remint_in_cooldown(token_info):
+                    return token_info
+                reminted = await BuildAuthService.remint_oidc_for_token_info(
+                    token_info, pool_name, trigger="empty_refresh"
+                )
+                if reminted is not None:
+                    return reminted
             return token_info
         endpoint = str(get_config("build.token_endpoint", TOKEN_ENDPOINT) or TOKEN_ENDPOINT)
         try:
@@ -150,6 +290,13 @@ class BuildAuthService:
             )
         except OAuthRefreshError as exc:
             logger.warning("CLI OIDC refresh failed {}: {}", token_info.token[:16], exc)
+            if is_oidc_refresh_revoked_error(exc):
+                if not BuildAuthService._remint_in_cooldown(token_info):
+                    reminted = await BuildAuthService.remint_oidc_for_token_info(
+                        token_info, pool_name, trigger="refresh_revoked"
+                    )
+                    if reminted is not None:
+                        return reminted
             raise
         token_info.access_token = bundle.access_token
         if bundle.refresh_token:
@@ -168,9 +315,24 @@ class BuildAuthService:
                 "expired_at": token_info.expired_at,
                 "last_refresh_at": token_info.last_refresh_at,
                 "oidc_sub": token_info.oidc_sub,
+                "last_fail_reason": None,
             },
         )
         return token_info
+
+    @staticmethod
+    def _remint_in_cooldown(token_info: TokenInfo) -> bool:
+        """Avoid hammering device-auth when SSO mint keeps failing."""
+        reason = (token_info.last_fail_reason or "").strip()
+        if not reason.startswith("oidc_refresh_revoked"):
+            return False
+        cooldown = _as_int(get_config("build.remint_cooldown_sec", 300), 300, minimum=0)
+        if cooldown <= 0:
+            return False
+        last_fail = int(token_info.last_fail_at or 0)
+        if not last_fail:
+            return False
+        return int(time.time() * 1000) - last_fail < cooldown * 1000
 
     @staticmethod
     async def refresh_expiring_cli_tokens(
@@ -178,7 +340,10 @@ class BuildAuthService:
         max_tokens: int = 50,
         pool_name: str = CLI_POOL_NAME,
     ) -> int:
-        """Scheduled pass: refresh OIDC access tokens nearing expiry."""
+        """Scheduled pass: refresh OIDC access tokens nearing expiry.
+
+        Permanently revoked refresh tokens are reminted via linked sso_source.
+        """
         mgr = await get_token_manager()
         await mgr.reload_if_stale()
         pool = mgr.pools.get(pool_name)
@@ -190,15 +355,25 @@ class BuildAuthService:
         for info in list(pool.list()):
             if refreshed >= max_tokens:
                 break
-            if not (info.refresh_token or "").strip():
+            has_refresh = bool((info.refresh_token or "").strip())
+            needs_remint_only = (
+                not has_refresh
+                and bool((info.sso_source or "").strip())
+                and (info.last_fail_reason or "").startswith("oidc_refresh_revoked")
+            )
+            if not has_refresh and not needs_remint_only:
                 continue
             expired_at = int(info.expired_at or 0)
-            if expired_at and now_ms < expired_at - lead * 1000:
+            if has_refresh and expired_at and now_ms < expired_at - lead * 1000:
                 continue
             try:
-                await BuildAuthService.refresh_token_info(info, pool_name, force=True)
-                refreshed += 1
+                updated = await BuildAuthService.refresh_token_info(
+                    info, pool_name, force=True
+                )
+                if token_has_cli_auth(updated):
+                    refreshed += 1
             except Exception as exc:
+                # refresh_token_info already attempted remint on revoked; still log.
                 logger.warning("CLI scheduled refresh failed {}: {}", info.token[:16], exc)
         if refreshed:
             logger.info("CLI OIDC scheduled refresh: {} tokens", refreshed)
@@ -398,7 +573,9 @@ class BuildAuthService:
         oidc_pool = mgr.pools.get(CLI_POOL_NAME)
         if oidc_pool:
             for info in oidc_pool.list():
-                if info.sso_source:
+                # Only treat still-usable OIDC rows as covering this SSO.
+                # Dead rows (revoked refresh cleared) should be reminted.
+                if info.sso_source and token_has_cli_auth(info):
                     existing_sso.add(info.sso_source)
 
         candidates: list[TokenInfo] = []
@@ -455,6 +632,7 @@ class BuildAuthService:
 __all__ = [
     "BuildAuthService",
     "SSO_SOURCE_POOL",
+    "is_oidc_refresh_revoked_error",
     "token_cli_selectable",
     "token_has_cli_auth",
 ]

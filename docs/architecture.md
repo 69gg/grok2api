@@ -36,6 +36,7 @@ Grok 与 Console Chat / Voice / Image 通道都使用进程内轮询游标：每
 - **默认开启**：`[build]` 全开，pull 后无需改配置即可用。
 - **后台静默铸 OIDC**（对齐 Console `console_team_id`）：定时扫描 `ssoBasic` 中尚未关联 OIDC 的账号，device-auth mint 后写入 `oidcBuild`（`sso_source` 关联）。
 - **按需刷新**：请求前若 access 将过期则 `refresh_token` 换新；调度器也周期刷新。
+- **refresh 被吊销**：`invalid_grant` / `Refresh token has been revoked` 时，若有 `sso_source` 则自动 device-auth **重新 mint**（`build.remint_on_revoked`，默认开）；失败则清空该号 OIDC 密钥并按 `build.remint_cooldown_sec`（默认 300s）退避，避免死循环。
 - **请求轮询**：只从**已有 auth** 的 `oidcBuild` 账号 round-robin；无可用号时才触发 on-demand mint。
 - 额度耗尽（`free-usage-exhausted`）：该 OIDC 号 cooling 约 24h，不影响同号 Console/SSO 其它通道。
 - 协议细节见 `docs/build_cli_protocol.md`。

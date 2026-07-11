@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import time
+from typing import Any
+
+import pytest
 
 from grok2api.services.grok.services.build_channel import (
     inject_web_search_tools,
@@ -190,6 +193,84 @@ def test_permanent_device_consent_errors() -> None:
         RuntimeError("Connection reset by peer")
     )
     assert not is_permanent_device_consent_error(RuntimeError("HTTP 429 rate limited"))
+
+
+def test_oidc_refresh_revoked_detection() -> None:
+    from grok2api.services.grok.services.build_auth import (
+        is_oidc_refresh_revoked_error,
+    )
+    from grok2api.services.reverse.build_oauth import OAuthRefreshError
+
+    assert is_oidc_refresh_revoked_error(
+        OAuthRefreshError(
+            "refresh failed HTTP 400: {'error': 'invalid_grant', "
+            "'error_description': 'Refresh token has been revoked'}"
+        )
+    )
+    assert is_oidc_refresh_revoked_error(
+        OAuthRefreshError("invalid_grant: token revoked")
+    )
+    assert not is_oidc_refresh_revoked_error(
+        OAuthRefreshError("refresh failed HTTP 503: upstream")
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_revoked_triggers_remint(monkeypatch: pytest.MonkeyPatch) -> None:
+    from grok2api.services.grok.services import build_auth as ba
+    from grok2api.services.reverse.build_oauth import OAuthRefreshError, TokenBundle
+
+    info = TokenInfo(
+        token="acct-1",
+        status=TokenStatus.ACTIVE,
+        quota=10,
+        access_token="old-access",
+        refresh_token="dead-refresh",
+        expired_at=1,
+        sso_source="sso-jwt-value",
+        email="a@b.c",
+    )
+    reminted = TokenInfo(
+        token="acct-1",
+        status=TokenStatus.ACTIVE,
+        quota=10,
+        access_token="new-access",
+        refresh_token="new-refresh",
+        expired_at=int(time.time() * 1000) + 3600_000,
+        sso_source="sso-jwt-value",
+        email="a@b.c",
+    )
+    calls: dict[str, Any] = {"remint": 0}
+
+    async def boom_refresh(*_a: object, **_k: object) -> TokenBundle:
+        raise OAuthRefreshError(
+            "refresh failed HTTP 400: {'error': 'invalid_grant', "
+            "'error_description': 'Refresh token has been revoked'}"
+        )
+
+    async def fake_remint(
+        cls: type,
+        token_info: TokenInfo,
+        pool_name: str = "oidcBuild",
+        *,
+        trigger: str = "refresh_revoked",
+    ) -> TokenInfo:
+        calls["remint"] += 1
+        assert token_info.token == "acct-1"
+        assert trigger == "refresh_revoked"
+        return reminted
+
+    monkeypatch.setattr(ba, "refresh_tokens_async", boom_refresh)
+    monkeypatch.setattr(
+        ba.BuildAuthService,
+        "remint_oidc_for_token_info",
+        classmethod(fake_remint),
+    )
+
+    out = await ba.BuildAuthService.refresh_token_info(info, force=True)
+    assert calls["remint"] == 1
+    assert out.access_token == "new-access"
+    assert out.refresh_token == "new-refresh"
 
 
 def test_free_usage_cooling_not_selectable() -> None:

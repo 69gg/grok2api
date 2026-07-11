@@ -59,6 +59,8 @@ POST https://auth.x.ai/oauth2/token
   refresh_token=...
 ```
 
+若返回 `invalid_grant` / refresh revoked：用该号 `sso_source` 重走 §2 device mint 覆盖 `oidcBuild`（`build.remint_on_revoked=true` 默认）。无 `sso_source` 或 mint 失败则清空 access/refresh 并冷却（`build.remint_cooldown_sec`）。
+
 ## 4. 上游 API（cli-chat-proxy）
 
 Base: `https://cli-chat-proxy.grok.com/v1`
