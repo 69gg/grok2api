@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, AsyncIterator, Dict, Optional, Set, Tuple, cast
+from typing import Any, AsyncIterator, Dict, Optional, Set
 
 import orjson
 
@@ -59,12 +59,83 @@ def inject_web_search_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {**payload, "tools": [*tools, dict(WEB_SEARCH_TOOL)]}
 
 
+def sanitize_cli_responses_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop fields that free cli-chat-proxy often rejects (CPA-aligned).
+
+    - reasoning items: remove null ``content``; drop unusable ``encrypted_content``
+    - function_call: strip null ``namespace``
+    - drop empty-string / null tool fields that break validation
+    """
+    out = dict(payload)
+    raw_input = out.get("input")
+    if not isinstance(raw_input, list):
+        return out
+
+    cleaned: list[Any] = []
+    for item in raw_input:
+        if not isinstance(item, dict):
+            cleaned.append(item)
+            continue
+        item_type = str(item.get("type") or "").strip()
+        next_item = dict(item)
+
+        if item_type == "reasoning":
+            # null content is invalid JSON shape for some validators
+            if next_item.get("content", "__missing__") is None:
+                next_item.pop("content", None)
+            enc = next_item.get("encrypted_content", "__missing__")
+            if enc is None or enc == "":
+                next_item.pop("encrypted_content", None)
+            # Keep string encrypted_content as-is; upstream may still reject
+            # foreign/expired blobs — that surfaces as 400 with body after fix.
+
+        if item_type in {"function_call", "custom_tool_call"}:
+            if next_item.get("namespace", "__missing__") is None:
+                next_item.pop("namespace", None)
+            if next_item.get("id") is None:
+                next_item.pop("id", None)
+
+        if item_type == "function_call_output":
+            # ensure output is a string when present
+            if next_item.get("output") is not None and not isinstance(
+                next_item.get("output"), str
+            ):
+                next_item["output"] = orjson.dumps(next_item["output"]).decode("utf-8")
+
+        cleaned.append(next_item)
+
+    out["input"] = cleaned
+
+    # tool_choice without tools is rejected by xAI
+    tools = out.get("tools")
+    has_tools = isinstance(tools, list) and len(tools) > 0
+    if not has_tools:
+        out.pop("tool_choice", None)
+        out.pop("parallel_tool_calls", None)
+        if tools is not None and isinstance(tools, list) and len(tools) == 0:
+            out.pop("tools", None)
+
+    # null reasoning.effort etc.
+    reasoning = out.get("reasoning")
+    if isinstance(reasoning, dict):
+        cleaned_r = {k: v for k, v in reasoning.items() if v is not None}
+        if cleaned_r:
+            out["reasoning"] = cleaned_r
+        else:
+            out.pop("reasoning", None)
+
+    return out
+
+
 def prepare_cli_payload(model_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Rewrite model id to upstream and optionally inject web_search."""
     out = dict(payload)
     out["model"] = _upstream_model_id(model_id)
     if _wants_web_search(model_id) or bool(get_config("build.default_web_search", False)):
         out = inject_web_search_tools(out)
+    # Always sanitize Responses-shaped payloads (input array / tools / reasoning)
+    if isinstance(out.get("input"), list) or "tools" in out or "reasoning" in out:
+        out = sanitize_cli_responses_payload(out)
     return out
 
 

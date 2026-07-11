@@ -176,6 +176,22 @@ class BuildNativeReverse:
 
     @staticmethod
     async def _read_body(response: Any) -> bytes:
+        # Prefer streaming iterators first: curl_cffi stream=True responses often
+        # leave .content/.text empty until chunks are consumed.
+        aiter = getattr(response, "aiter_content", None)
+        if aiter is not None:
+            try:
+                chunks: list[bytes] = []
+                async for chunk in aiter():
+                    if not chunk:
+                        continue
+                    chunks.append(
+                        chunk if isinstance(chunk, bytes) else str(chunk).encode()
+                    )
+                if chunks:
+                    return b"".join(chunks)
+            except Exception:
+                pass
         for attr_name in ("content", "read", "aread"):
             attr = getattr(response, attr_name, None)
             if attr is None:

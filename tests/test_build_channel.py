@@ -78,6 +78,42 @@ def test_pool_prefers_accounts_with_cli_auth() -> None:
     assert token_cli_selectable(with_auth)
 
 
+def test_sanitize_cli_responses_payload() -> None:
+    from grok2api.services.grok.services.build_channel import sanitize_cli_responses_payload
+
+    payload = {
+        "model": "grok-4.5",
+        "input": [
+            {
+                "type": "reasoning",
+                "content": None,
+                "encrypted_content": None,
+            },
+            {
+                "type": "function_call",
+                "name": "end",
+                "call_id": "c1",
+                "arguments": "{}",
+                "namespace": None,
+                "id": None,
+            },
+        ],
+        "tools": [],
+        "tool_choice": "auto",
+        "reasoning": {"effort": None},
+    }
+    out = sanitize_cli_responses_payload(payload)
+    reasoning = out["input"][0]
+    assert "content" not in reasoning
+    assert "encrypted_content" not in reasoning
+    fc = out["input"][1]
+    assert "namespace" not in fc
+    assert "id" not in fc
+    assert "tools" not in out
+    assert "tool_choice" not in out
+    assert "reasoning" not in out
+
+
 def test_device_consent_urls() -> None:
     from grok2api.services.reverse.build_device_consent import (
         DEVICE_APPROVE_URL,
