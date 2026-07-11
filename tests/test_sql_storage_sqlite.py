@@ -125,3 +125,70 @@ async def test_retry_on_sqlite_lock_retries(sqlite_url: str) -> None:
         assert calls["n"] == 3
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_lock_hold_not_bound_by_acquire_timeout(sqlite_url: str) -> None:
+    """Holding a lock longer than timeout must not cancel the critical section."""
+    from grok2api.core.storage import StorageError
+
+    storage = SQLStorage(sqlite_url)
+    try:
+        async with storage.acquire_lock("long_job", timeout=1):
+            await asyncio.sleep(1.2)
+            done = True
+        assert done is True
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_different_lock_names_do_not_block(sqlite_url: str) -> None:
+    """Unrelated named locks must not serialize on a global process lock."""
+    storage = SQLStorage(sqlite_url)
+    try:
+        order: list[str] = []
+        started = asyncio.Event()
+
+        async def hold_a() -> None:
+            async with storage.acquire_lock("cf_clearance_refresh", timeout=1):
+                order.append("a_enter")
+                started.set()
+                await asyncio.sleep(0.3)
+                order.append("a_exit")
+
+        async def take_b() -> None:
+            await started.wait()
+            async with storage.acquire_lock("cli_oidc_init", timeout=1):
+                order.append("b")
+
+        await asyncio.wait_for(asyncio.gather(hold_a(), take_b()), timeout=2.0)
+        assert "b" in order
+        # b should interleave before a finishes (not wait for a)
+        assert order.index("b") < order.index("a_exit")
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_same_lock_name_times_out(sqlite_url: str) -> None:
+    from grok2api.core.storage import StorageError
+
+    storage = SQLStorage(sqlite_url)
+    try:
+        started = asyncio.Event()
+
+        async def holder() -> None:
+            async with storage.acquire_lock("cli_oidc_init", timeout=5):
+                started.set()
+                await asyncio.sleep(0.5)
+
+        async def waiter() -> None:
+            await started.wait()
+            with pytest.raises(StorageError, match="cli_oidc_init"):
+                async with storage.acquire_lock("cli_oidc_init", timeout=0.2):
+                    pass
+
+        await asyncio.gather(holder(), waiter())
+    finally:
+        await storage.close()

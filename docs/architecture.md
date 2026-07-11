@@ -17,7 +17,7 @@
 
 - `PRAGMA journal_mode=WAL`（读写并发更友好）
 - `PRAGMA busy_timeout=30000`（短暂锁等待，而不是立刻 `database is locked`）
-- `NullPool` + 进程内 `asyncio.Lock` / `fcntl` 文件锁（`acquire_lock`，多进程写保护）
+- `NullPool` + **按锁名**的进程内 `asyncio.Lock` / `fcntl` 文件锁（`acquire_lock`；超时只作用于抢锁阶段，不取消已持有的临界区）
 - `load_tokens` / `save_tokens_delta` 对短暂 `database is locked` 自动退避重试
 
 高并发多 worker 场景仍建议使用 MySQL/PostgreSQL 或 Redis。

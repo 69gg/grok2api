@@ -178,58 +178,76 @@ class LocalStorage(BaseStorage):
     """
     本地文件存储
     - 使用 aiofiles 进行异步 I/O
-    - 使用 asyncio.Lock 进行进程内并发控制
+    - 按锁名使用 asyncio.Lock 做进程内并发控制
     - 如果需要多进程安全，需要系统级文件锁 (fcntl)
     """
 
     def __init__(self):
-        self._lock = asyncio.Lock()
+        self._lock_guard = asyncio.Lock()
+        self._named_locks: dict[str, asyncio.Lock] = {}
+
+    async def _get_named_lock(self, name: str) -> asyncio.Lock:
+        async with self._lock_guard:
+            lock = self._named_locks.get(name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._named_locks[name] = lock
+            return lock
 
     @asynccontextmanager
     async def acquire_lock(self, name: str, timeout: int = 10):
-        if fcntl is None:
-            try:
-                async with asyncio.timeout(timeout):
-                    async with self._lock:
-                        yield
-            except asyncio.TimeoutError:
-                logger.warning(f"LocalStorage: 获取锁 '{name}' 超时 ({timeout}s)")
-                raise StorageError(f"无法获取锁 '{name}'")
-            return
-
-        lock_path = LOCK_DIR / f"{name}.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        named_lock = await self._get_named_lock(name)
+        acquired_local = False
         fd = None
-        locked = False
+        flocked = False
         start = time.monotonic()
-
-        async with self._lock:
+        try:
             try:
+                await asyncio.wait_for(named_lock.acquire(), timeout=max(timeout, 0))
+                acquired_local = True
+            except asyncio.TimeoutError:
+                if float(timeout) <= 2:
+                    logger.debug(f"LocalStorage: 获取锁 '{name}' 超时 ({timeout}s)")
+                else:
+                    logger.warning(f"LocalStorage: 获取锁 '{name}' 超时 ({timeout}s)")
+                raise StorageError(f"无法获取锁 '{name}'")
+
+            if fcntl is not None:
+                lock_path = LOCK_DIR / f"{name}.lock"
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
                 fd = open(lock_path, "a+")
                 while True:
                     try:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        locked = True
+                        flocked = True
                         break
                     except BlockingIOError:
                         if time.monotonic() - start >= timeout:
+                            if float(timeout) <= 2:
+                                logger.debug(
+                                    f"LocalStorage: 获取锁 '{name}' 超时 ({timeout}s)"
+                                )
+                            else:
+                                logger.warning(
+                                    f"LocalStorage: 获取锁 '{name}' 超时 ({timeout}s)"
+                                )
                             raise StorageError(f"无法获取锁 '{name}'")
                         await asyncio.sleep(0.05)
-                yield
-            except StorageError:
-                logger.warning(f"LocalStorage: 获取锁 '{name}' 超时 ({timeout}s)")
-                raise
-            finally:
-                if fd:
-                    if locked:
-                        try:
-                            fcntl.flock(fd, fcntl.LOCK_UN)
-                        except Exception:
-                            pass
-                    try:
-                        fd.close()
-                    except Exception:
-                        pass
+
+            yield
+        finally:
+            if flocked and fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            if fd is not None:
+                try:
+                    fd.close()
+                except Exception:
+                    pass
+            if acquired_local:
+                named_lock.release()
 
     async def load_config(self) -> Dict[str, Any]:
         if not CONFIG_FILE.exists():
@@ -596,7 +614,10 @@ class SQLStorage(BaseStorage):
             )
 
         self.dialect = url.split(":", 1)[0].split("+", 1)[0].lower()
-        self._sqlite_lock = asyncio.Lock()
+        # Per-name process-local locks. A single global lock would serialize unrelated
+        # scheduler jobs (cf_clearance / console_team / cli_oidc) and trip timeout=1.
+        self._sqlite_lock_guard = asyncio.Lock()
+        self._sqlite_named_locks: dict[str, asyncio.Lock] = {}
 
         engine_kwargs: dict[str, Any] = {"echo": False}
         if self.dialect == "sqlite":
@@ -997,57 +1018,72 @@ class SQLStorage(BaseStorage):
                     except Exception:
                         pass
         elif self.dialect == "sqlite":
-            if fcntl is None:
-                try:
-                    async with asyncio.timeout(timeout):
-                        async with self._sqlite_lock:
-                            yield
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"SQLStorage: 获取锁 '{name}' 超时 ({timeout}s)"
-                    )
-                    raise StorageError(f"SQLStorage: 无法获取锁 '{name}'")
-                return
-
-            lock_path = LOCK_DIR / f"sqlite_{name}.lock"
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            # Timeout applies only to *acquiring* the lock, not holding it.
+            # Holding asyncio.timeout() across yield cancelled long jobs after 1s
+            # and made scheduler think "lock not acquired".
+            named_lock = await self._get_sqlite_named_lock(name)
+            acquired_local = False
             fd = None
-            locked = False
+            flocked = False
             start = time.monotonic()
             try:
-                async with asyncio.timeout(timeout):
-                    async with self._sqlite_lock:
-                        fd = open(lock_path, "a+")
-                        while True:
-                            try:
-                                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                                locked = True
-                                break
-                            except BlockingIOError:
-                                if time.monotonic() - start >= timeout:
-                                    raise StorageError(
-                                        f"SQLStorage: 无法获取锁 '{name}'"
-                                    )
-                                await asyncio.sleep(0.05)
+                try:
+                    await asyncio.wait_for(named_lock.acquire(), timeout=max(timeout, 0))
+                    acquired_local = True
+                except asyncio.TimeoutError:
+                    self._log_lock_timeout(name, timeout)
+                    raise StorageError(f"SQLStorage: 无法获取锁 '{name}'")
+
+                if fcntl is not None:
+                    lock_path = LOCK_DIR / f"sqlite_{name}.lock"
+                    lock_path.parent.mkdir(parents=True, exist_ok=True)
+                    fd = open(lock_path, "a+")
+                    while True:
                         try:
-                            yield
-                        finally:
-                            if locked and fd is not None:
-                                try:
-                                    fcntl.flock(fd, fcntl.LOCK_UN)
-                                except Exception:
-                                    pass
-            except asyncio.TimeoutError:
-                logger.warning(f"SQLStorage: 获取锁 '{name}' 超时 ({timeout}s)")
-                raise StorageError(f"SQLStorage: 无法获取锁 '{name}'")
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            flocked = True
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() - start >= timeout:
+                                self._log_lock_timeout(name, timeout)
+                                raise StorageError(
+                                    f"SQLStorage: 无法获取锁 '{name}'"
+                                )
+                            await asyncio.sleep(0.05)
+
+                yield
             finally:
+                if flocked and fd is not None:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except Exception:
+                        pass
                 if fd is not None:
                     try:
                         fd.close()
                     except Exception:
                         pass
+                if acquired_local:
+                    named_lock.release()
         else:
             yield
+
+    async def _get_sqlite_named_lock(self, name: str) -> asyncio.Lock:
+        async with self._sqlite_lock_guard:
+            lock = self._sqlite_named_locks.get(name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._sqlite_named_locks[name] = lock
+            return lock
+
+    @staticmethod
+    def _log_lock_timeout(name: str, timeout: int | float) -> None:
+        # Scheduler uses timeout=1 as non-blocking multi-worker skip; keep quiet.
+        msg = f"SQLStorage: 获取锁 '{name}' 超时 ({timeout}s)"
+        if float(timeout) <= 2:
+            logger.debug(msg)
+        else:
+            logger.warning(msg)
 
     async def load_config(self) -> Dict[str, Any]:
         await self._ensure_schema()
