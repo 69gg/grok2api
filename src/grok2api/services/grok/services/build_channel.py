@@ -139,8 +139,27 @@ def prepare_cli_payload(model_id: str, payload: Dict[str, Any]) -> Dict[str, Any
     return out
 
 
+def payload_has_encrypted_content(payload: Dict[str, Any]) -> bool:
+    """True if any input reasoning/compaction item carries encrypted_content."""
+    raw_input = payload.get("input")
+    if not isinstance(raw_input, list):
+        return False
+    for item in raw_input:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip()
+        if item_type not in {"reasoning", "compaction"}:
+            continue
+        enc = item.get("encrypted_content")
+        if isinstance(enc, str) and enc.strip():
+            return True
+        if enc is not None and not isinstance(enc, str):
+            return True
+    return False
+
+
 def payload_has_reasoning_content(payload: Dict[str, Any]) -> bool:
-    """True if payload carries reasoning content / encrypted_content blobs."""
+    """True if payload carries reasoning.content (plaintext summary/content)."""
     reasoning = payload.get("reasoning")
     if isinstance(reasoning, dict) and reasoning.get("content") is not None:
         return True
@@ -154,14 +173,40 @@ def payload_has_reasoning_content(payload: Dict[str, Any]) -> bool:
             continue
         if "content" in item and item.get("content") is not None:
             return True
-        enc = item.get("encrypted_content")
-        if isinstance(enc, str) and enc.strip():
-            return True
     return False
 
 
+def drop_encrypted_content(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip only encrypted_content from reasoning/compaction input items."""
+    out = dict(payload)
+    raw_input = out.get("input")
+    if not isinstance(raw_input, list):
+        return out
+
+    cleaned_input: list[Any] = []
+    for item in raw_input:
+        if not isinstance(item, dict):
+            cleaned_input.append(item)
+            continue
+        item_type = str(item.get("type") or "").strip()
+        if item_type not in {"reasoning", "compaction"}:
+            cleaned_input.append(item)
+            continue
+        next_item = dict(item)
+        next_item.pop("encrypted_content", None)
+        remaining_keys = {
+            k for k in next_item.keys() if k not in {"type", "id", "status"}
+        }
+        # compaction that only had encrypted_content → drop whole item
+        if item_type == "compaction" and not remaining_keys:
+            continue
+        cleaned_input.append(next_item)
+    out["input"] = cleaned_input
+    return out
+
+
 def drop_reasoning_content(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Strip reasoning.content / encrypted_content for free-path retry."""
+    """Strip reasoning.content (after encrypted_content already dropped if needed)."""
     out = dict(payload)
     reasoning = out.get("reasoning")
     if isinstance(reasoning, dict) and "content" in reasoning:
@@ -185,7 +230,6 @@ def drop_reasoning_content(payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
         next_item = dict(item)
         next_item.pop("content", None)
-        next_item.pop("encrypted_content", None)
         # Drop empty reasoning shells that only had content blobs
         remaining_keys = {
             k for k in next_item.keys() if k not in {"type", "id", "status"}
@@ -197,18 +241,35 @@ def drop_reasoning_content(payload: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _body_drop_reasoning_content(body: bytes | None) -> tuple[bytes | None, bool]:
-    """Return (new_body, changed)."""
+def _body_apply_transform(
+    body: bytes | None,
+    *,
+    has_fn: Any,
+    drop_fn: Any,
+) -> tuple[bytes | None, bool]:
+    """Return (new_body, changed) after applying drop_fn when has_fn is true."""
     if not body:
         return body, False
     try:
         parsed = orjson.loads(body)
     except orjson.JSONDecodeError:
         return body, False
-    if not isinstance(parsed, dict) or not payload_has_reasoning_content(parsed):
+    if not isinstance(parsed, dict) or not has_fn(parsed):
         return body, False
-    stripped = drop_reasoning_content(parsed)
+    stripped = drop_fn(parsed)
     return orjson.dumps(stripped), True
+
+
+def _body_drop_encrypted_content(body: bytes | None) -> tuple[bytes | None, bool]:
+    return _body_apply_transform(
+        body, has_fn=payload_has_encrypted_content, drop_fn=drop_encrypted_content
+    )
+
+
+def _body_drop_reasoning_content(body: bytes | None) -> tuple[bytes | None, bool]:
+    return _body_apply_transform(
+        body, has_fn=payload_has_reasoning_content, drop_fn=drop_reasoning_content
+    )
 
 
 def is_free_usage_exhausted(exc: UpstreamException) -> bool:
@@ -389,15 +450,24 @@ class BuildChannelService:
                 last_error = exc
                 status = (exc.details or {}).get("status")
 
-                # If upstream rejects payloads with reasoning.content / encrypted
-                # blobs, strip them and retry once on the same credential.
+                # Staged strip+retry on same credential for free-path validation errors:
+                # 1) drop encrypted_content only
+                # 2) if still failing, drop reasoning.content
                 if status in {400, 422}:
-                    stripped_body, changed = _body_drop_reasoning_content(request_body)
-                    if changed and stripped_body is not None:
+                    current_body = request_body
+                    for stage_name, drop_fn in (
+                        ("encrypted_content", _body_drop_encrypted_content),
+                        ("reasoning.content", _body_drop_reasoning_content),
+                    ):
+                        if status not in {400, 422}:
+                            break
+                        stripped_body, changed = drop_fn(current_body)
+                        if not changed or stripped_body is None:
+                            continue
                         logger.warning(
-                            "CLI upstream {} with reasoning content — "
-                            "dropping reasoning.content/encrypted_content and retrying",
+                            "CLI upstream {} — dropping {} and retrying same auth",
                             status,
+                            stage_name,
                         )
                         try:
                             return await BuildNativeReverse.request(
@@ -413,10 +483,9 @@ class BuildChannelService:
                         except UpstreamException as retry_exc:
                             last_error = retry_exc
                             status = (retry_exc.details or {}).get("status")
-                            # continue into normal failure handling with retry error
                             exc = retry_exc
-                        else:
-                            pass
+                            current_body = stripped_body
+                            continue
 
                 # try refresh once on 401
                 if status == 401 and (token_info.refresh_token or "").strip():

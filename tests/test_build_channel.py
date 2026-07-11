@@ -78,10 +78,13 @@ def test_pool_prefers_accounts_with_cli_auth() -> None:
     assert token_cli_selectable(with_auth)
 
 
-def test_drop_reasoning_content_for_retry() -> None:
+def test_staged_drop_encrypted_then_reasoning_content() -> None:
     from grok2api.services.grok.services.build_channel import (
+        drop_encrypted_content,
         drop_reasoning_content,
+        payload_has_encrypted_content,
         payload_has_reasoning_content,
+        _body_drop_encrypted_content,
         _body_drop_reasoning_content,
     )
     import orjson
@@ -98,18 +101,29 @@ def test_drop_reasoning_content_for_retry() -> None:
         ],
         "reasoning": {"effort": "low", "content": "x"},
     }
+    assert payload_has_encrypted_content(payload)
     assert payload_has_reasoning_content(payload)
-    stripped = drop_reasoning_content(payload)
-    assert not payload_has_reasoning_content(stripped)
-    assert stripped["input"][0]["type"] == "message"
-    # empty reasoning shell dropped
-    assert all(i.get("type") != "reasoning" for i in stripped["input"])
-    assert "content" not in (stripped.get("reasoning") or {})
 
-    body, changed = _body_drop_reasoning_content(orjson.dumps(payload))
-    assert changed
-    assert body is not None
-    assert not payload_has_reasoning_content(orjson.loads(body))
+    # Stage 1: drop encrypted only
+    stage1 = drop_encrypted_content(payload)
+    assert not payload_has_encrypted_content(stage1)
+    assert payload_has_reasoning_content(stage1)
+    reasoning_item = next(i for i in stage1["input"] if i.get("type") == "reasoning")
+    assert reasoning_item.get("content") is not None
+    assert "encrypted_content" not in reasoning_item
+
+    # Stage 2: drop reasoning.content
+    stage2 = drop_reasoning_content(stage1)
+    assert not payload_has_reasoning_content(stage2)
+    assert all(i.get("type") != "reasoning" for i in stage2["input"])
+    assert "content" not in (stage2.get("reasoning") or {})
+
+    body1, changed1 = _body_drop_encrypted_content(orjson.dumps(payload))
+    assert changed1 and body1 is not None
+    body2, changed2 = _body_drop_reasoning_content(body1)
+    assert changed2 and body2 is not None
+    assert not payload_has_encrypted_content(orjson.loads(body2))
+    assert not payload_has_reasoning_content(orjson.loads(body2))
 
 
 def test_sanitize_cli_responses_payload() -> None:
