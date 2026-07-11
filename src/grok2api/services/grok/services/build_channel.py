@@ -139,6 +139,78 @@ def prepare_cli_payload(model_id: str, payload: Dict[str, Any]) -> Dict[str, Any
     return out
 
 
+def payload_has_reasoning_content(payload: Dict[str, Any]) -> bool:
+    """True if payload carries reasoning content / encrypted_content blobs."""
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("content") is not None:
+        return True
+    raw_input = payload.get("input")
+    if not isinstance(raw_input, list):
+        return False
+    for item in raw_input:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "").strip() != "reasoning":
+            continue
+        if "content" in item and item.get("content") is not None:
+            return True
+        enc = item.get("encrypted_content")
+        if isinstance(enc, str) and enc.strip():
+            return True
+    return False
+
+
+def drop_reasoning_content(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip reasoning.content / encrypted_content for free-path retry."""
+    out = dict(payload)
+    reasoning = out.get("reasoning")
+    if isinstance(reasoning, dict) and "content" in reasoning:
+        cleaned = {k: v for k, v in reasoning.items() if k != "content"}
+        if cleaned:
+            out["reasoning"] = cleaned
+        else:
+            out.pop("reasoning", None)
+
+    raw_input = out.get("input")
+    if not isinstance(raw_input, list):
+        return out
+
+    cleaned_input: list[Any] = []
+    for item in raw_input:
+        if not isinstance(item, dict):
+            cleaned_input.append(item)
+            continue
+        if str(item.get("type") or "").strip() != "reasoning":
+            cleaned_input.append(item)
+            continue
+        next_item = dict(item)
+        next_item.pop("content", None)
+        next_item.pop("encrypted_content", None)
+        # Drop empty reasoning shells that only had content blobs
+        remaining_keys = {
+            k for k in next_item.keys() if k not in {"type", "id", "status"}
+        }
+        if not remaining_keys:
+            continue
+        cleaned_input.append(next_item)
+    out["input"] = cleaned_input
+    return out
+
+
+def _body_drop_reasoning_content(body: bytes | None) -> tuple[bytes | None, bool]:
+    """Return (new_body, changed)."""
+    if not body:
+        return body, False
+    try:
+        parsed = orjson.loads(body)
+    except orjson.JSONDecodeError:
+        return body, False
+    if not isinstance(parsed, dict) or not payload_has_reasoning_content(parsed):
+        return body, False
+    stripped = drop_reasoning_content(parsed)
+    return orjson.dumps(stripped), True
+
+
 def is_free_usage_exhausted(exc: UpstreamException) -> bool:
     details = exc.details or {}
     body = str(details.get("body") or "")
@@ -301,12 +373,13 @@ class BuildChannelService:
             if not access:
                 continue
             base_url = (token_info.base_url or "").strip() or None
+            request_body = body
             try:
                 return await BuildNativeReverse.request(
                     access_token=access,
                     method=method,
                     path=path,
-                    body=body,
+                    body=request_body,
                     content_type=content_type,
                     stream=stream,
                     conv_id=conv_id,
@@ -314,8 +387,38 @@ class BuildChannelService:
                 )
             except UpstreamException as exc:
                 last_error = exc
-                # try refresh once on 401
                 status = (exc.details or {}).get("status")
+
+                # If upstream rejects payloads with reasoning.content / encrypted
+                # blobs, strip them and retry once on the same credential.
+                if status in {400, 422}:
+                    stripped_body, changed = _body_drop_reasoning_content(request_body)
+                    if changed and stripped_body is not None:
+                        logger.warning(
+                            "CLI upstream {} with reasoning content — "
+                            "dropping reasoning.content/encrypted_content and retrying",
+                            status,
+                        )
+                        try:
+                            return await BuildNativeReverse.request(
+                                access_token=access,
+                                method=method,
+                                path=path,
+                                body=stripped_body,
+                                content_type=content_type,
+                                stream=stream,
+                                conv_id=conv_id,
+                                base_url=base_url,
+                            )
+                        except UpstreamException as retry_exc:
+                            last_error = retry_exc
+                            status = (retry_exc.details or {}).get("status")
+                            # continue into normal failure handling with retry error
+                            exc = retry_exc
+                        else:
+                            pass
+
+                # try refresh once on 401
                 if status == 401 and (token_info.refresh_token or "").strip():
                     try:
                         # force refresh by clearing expired_at
@@ -328,7 +431,7 @@ class BuildChannelService:
                             access_token=access,
                             method=method,
                             path=path,
-                            body=body,
+                            body=request_body,
                             content_type=content_type,
                             stream=stream,
                             conv_id=conv_id,
