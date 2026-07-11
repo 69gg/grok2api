@@ -172,6 +172,26 @@ def test_device_consent_urls() -> None:
     assert DEVICE_APPROVE_URL.endswith("/oauth2/device/approve")
 
 
+def test_permanent_device_consent_errors() -> None:
+    from grok2api.services.reverse.build_device_consent import (
+        is_permanent_device_consent_error,
+    )
+
+    assert is_permanent_device_consent_error(
+        RuntimeError("device approve failed HTTP 400: Invalid or expired code")
+    )
+    assert is_permanent_device_consent_error(
+        RuntimeError("SSO cookie rejected (redirected to sign-in)")
+    )
+    assert is_permanent_device_consent_error(
+        RuntimeError("device verify requires login (SSO invalid)")
+    )
+    assert not is_permanent_device_consent_error(
+        RuntimeError("Connection reset by peer")
+    )
+    assert not is_permanent_device_consent_error(RuntimeError("HTTP 429 rate limited"))
+
+
 def test_free_usage_cooling_not_selectable() -> None:
     info = TokenInfo(
         token="cool",

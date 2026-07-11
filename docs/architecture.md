@@ -11,6 +11,17 @@
 
 运行数据默认落到 `data/grok2api.db`。根目录 `config.toml` 是本地配置，不提交。
 
+### SQLite 并发
+
+默认 SQLite 后端会在连接时启用：
+
+- `PRAGMA journal_mode=WAL`（读写并发更友好）
+- `PRAGMA busy_timeout=30000`（短暂锁等待，而不是立刻 `database is locked`）
+- `NullPool` + 进程内 `asyncio.Lock` / `fcntl` 文件锁（`acquire_lock`，多进程写保护）
+- `load_tokens` / `save_tokens_delta` 对短暂 `database is locked` 自动退避重试
+
+高并发多 worker 场景仍建议使用 MySQL/PostgreSQL 或 Redis。
+
 ## Token 选择
 
 模型目录和同名模型解析按固定优先级处理：**CLI（free Grok 4.5 / Composer）> Console Chat / Voice / Image > Basic grok.com app > ssoSuper**。这个顺序同时影响 `GET /v1/models` 的返回顺序和 `ModelService.get()` 对同名 `model_id` 的解析。

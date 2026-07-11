@@ -215,26 +215,36 @@ class BuildAuthService:
 
         Flow (captured): device/code → device/verify → device/approve(action=allow)
         → token poll. Browser is only a last-resort fallback if enabled.
+
+        Permanent consent errors (invalid/expired user_code) trigger a fresh
+        device_code request rather than replaying the same code.
         """
         log = log or (lambda m: logger.info("CLI mint: {}", m))
         proxy = BuildAuthService._proxy_url()
         prefer_protocol = _as_bool(get_config("build.mint_prefer_protocol", True), True)
         allow_browser = _as_bool(get_config("build.mint_allow_browser", False), False)
+        max_rounds = _as_int(get_config("build.mint_protocol_rounds", 2), 2, minimum=1)
 
-        session = await asyncio.to_thread(request_device_code, proxy=proxy)
-        log(
-            f"device_code ok user_code={session.user_code} "
-            f"uri={session.verification_uri_complete}"
+        from grok2api.services.reverse.build_device_consent import (
+            approve_device_with_sso_protocol,
+            is_permanent_device_consent_error,
         )
 
-        consent_ok = False
         protocol_err: Exception | None = None
-        if prefer_protocol:
-            try:
-                from grok2api.services.reverse.build_device_consent import (
-                    approve_device_with_sso_protocol,
-                )
+        session = None
 
+        for round_idx in range(max_rounds):
+            session = await asyncio.to_thread(request_device_code, proxy=proxy)
+            log(
+                f"device_code ok user_code={session.user_code} "
+                f"uri={session.verification_uri_complete} "
+                f"(round {round_idx + 1}/{max_rounds})"
+            )
+
+            if not prefer_protocol:
+                break
+
+            try:
                 await asyncio.to_thread(
                     approve_device_with_sso_protocol,
                     user_code=session.user_code,
@@ -243,10 +253,27 @@ class BuildAuthService:
                     log=log,
                     retries=3,
                 )
-                consent_ok = True
+                protocol_err = None
+                break
             except Exception as exc:  # noqa: BLE001
                 protocol_err = exc
                 log(f"protocol consent failed: {exc}")
+                # Permanent errors need a brand-new device_code; transient ones
+                # already exhausted inner retries.
+                if (
+                    is_permanent_device_consent_error(exc)
+                    and round_idx + 1 < max_rounds
+                ):
+                    log("requesting fresh device_code after permanent consent error")
+                    continue
+                break
+
+        if session is None:
+            raise OAuthDeviceError("device code request produced no session")
+
+        consent_ok = protocol_err is None and prefer_protocol
+        if not prefer_protocol:
+            consent_ok = False
 
         if not consent_ok and allow_browser:
             log("falling back to browser consent")
@@ -265,6 +292,7 @@ class BuildAuthService:
                 log=log,
             )
             consent_ok = True
+            protocol_err = None
 
         if not consent_ok:
             raise OAuthDeviceError(

@@ -16,10 +16,7 @@ Captured 2026-07-10 (empty Chrome profile → login → device-auth):
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
-from urllib.parse import urlparse
-
-from grok2api.core.logger import logger
+from typing import Any, Callable
 
 LogFn = Callable[[str], None]
 
@@ -73,6 +70,26 @@ def _set_sso_cookies(sess: Any, sso_token: str) -> None:
             pass
 
 
+def is_permanent_device_consent_error(exc: BaseException) -> bool:
+    """Errors that must not be retried with the same user_code."""
+    msg = str(exc).lower()
+    permanent_markers = (
+        "invalid or expired code",
+        "invalid_grant",
+        "expired code",
+        "sso cookie rejected",
+        "sso invalid",
+        "requires login",
+        "user_code and sso_token required",
+    )
+    if any(m in msg for m in permanent_markers):
+        return True
+    # Client HTTP errors (except rate limit) are not fixed by replaying the same code.
+    if "http 4" in msg and "http 429" not in msg:
+        return True
+    return False
+
+
 def approve_device_with_sso_protocol(
     *,
     user_code: str,
@@ -82,7 +99,12 @@ def approve_device_with_sso_protocol(
     log: LogFn | None = None,
     retries: int = 3,
 ) -> None:
-    """Complete device consent via HTTP only (SSO cookie). Raises on failure."""
+    """Complete device consent via HTTP only (SSO cookie). Raises on failure.
+
+    Retries only cover transient network/5xx failures. Permanent errors such as
+    "Invalid or expired code" fail immediately — the caller must mint a fresh
+    device_code/user_code pair.
+    """
     log = log or _noop
     user_code = (user_code or "").strip()
     sso = _normalize_sso(sso_token)
@@ -163,6 +185,9 @@ def approve_device_with_sso_protocol(
         except Exception as exc:  # noqa: BLE001
             last_err = exc
             log(f"protocol consent attempt {attempt + 1}/{retries} failed: {exc}")
+            if is_permanent_device_consent_error(exc):
+                # Same user_code will never work again; surface immediately.
+                break
             if attempt + 1 >= retries:
                 break
             import time
@@ -176,4 +201,5 @@ __all__ = [
     "DEVICE_APPROVE_URL",
     "DEVICE_VERIFY_URL",
     "approve_device_with_sso_protocol",
+    "is_permanent_device_consent_error",
 ]

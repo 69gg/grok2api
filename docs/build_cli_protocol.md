@@ -44,6 +44,12 @@ POST https://auth.x.ai/oauth2/token
 **默认不走浏览器。** `build.mint_allow_browser` 仅作协议失败后的下策。
 TLS/代理失败对 device/token 请求默认多重试（见 `build_oauth._post_form`）。
 
+**Consent 重试策略：**
+
+- 同一 `user_code` 仅对网络/5xx 等短暂错误做内层重试。
+- `Invalid or expired code` / SSO 失效等永久错误**不会**重放同一 code（重放必失败）。
+- 外层 `build.mint_protocol_rounds`（默认 2）会重新 `device/code` 再 consent。
+
 ## 3. Refresh（全自动、无浏览器）
 
 ```

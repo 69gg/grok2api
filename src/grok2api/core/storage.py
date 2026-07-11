@@ -577,11 +577,15 @@ class RedisStorage(BaseStorage):
 
 class SQLStorage(BaseStorage):
     """
-    SQL 数据库存储 (MySQL/PgSQL)
+    SQL 数据库存储 (SQLite/MySQL/PgSQL)
     - 使用 SQLAlchemy 异步引擎
     - 自动 Schema 初始化
-    - 内置连接池 (QueuePool)
+    - MySQL/PG 使用 QueuePool；SQLite 启用 WAL + busy_timeout 并做进程内/文件锁
     """
+
+    # aiosqlite busy timeout (seconds). Without this, concurrent writers raise
+    # "database is locked" immediately under default busy_timeout=0.
+    _SQLITE_BUSY_TIMEOUT_SEC = 30.0
 
     def __init__(self, url: str, connect_args: dict | None = None):
         try:
@@ -592,13 +596,25 @@ class SQLStorage(BaseStorage):
             )
 
         self.dialect = url.split(":", 1)[0].split("+", 1)[0].lower()
+        self._sqlite_lock = asyncio.Lock()
 
         engine_kwargs: dict[str, Any] = {"echo": False}
         if self.dialect == "sqlite":
-            engine_kwargs["connect_args"] = {
+            # Prefer waiting on locks over failing fast; keep user overrides.
+            sqlite_connect_args: dict[str, Any] = {
                 "check_same_thread": False,
-                **(connect_args or {}),
+                "timeout": self._SQLITE_BUSY_TIMEOUT_SEC,
             }
+            if connect_args:
+                sqlite_connect_args.update(connect_args)
+            engine_kwargs["connect_args"] = sqlite_connect_args
+            # Single writer-friendly pool: avoid many simultaneous SQLite connections.
+            try:
+                from sqlalchemy.pool import NullPool
+
+                engine_kwargs["poolclass"] = NullPool
+            except ImportError:  # pragma: no cover
+                pass
         else:
             engine_kwargs.update(
                 {
@@ -612,8 +628,53 @@ class SQLStorage(BaseStorage):
                 engine_kwargs["connect_args"] = connect_args
 
         self.engine = create_async_engine(url, **engine_kwargs)
+        if self.dialect == "sqlite":
+            self._install_sqlite_pragmas()
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
         self._initialized = False
+
+    def _install_sqlite_pragmas(self) -> None:
+        """Enable WAL + busy_timeout on every new SQLite connection."""
+        from sqlalchemy import event
+
+        busy_ms = int(self._SQLITE_BUSY_TIMEOUT_SEC * 1000)
+
+        @event.listens_for(self.engine.sync_engine, "connect")
+        def _set_sqlite_pragma(dbapi_connection: Any, _connection_record: Any) -> None:
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute(f"PRAGMA busy_timeout={busy_ms}")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.execute("PRAGMA foreign_keys=ON")
+            finally:
+                cursor.close()
+
+    @staticmethod
+    def _is_sqlite_locked_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "database is locked" in msg or "database is busy" in msg
+
+    async def _retry_on_sqlite_lock(
+        self, op_name: str, coro_factory: Any, *, attempts: int = 5
+    ) -> Any:
+        """Retry a SQLite operation when the DB is briefly locked."""
+        last_err: BaseException | None = None
+        for attempt in range(max(attempts, 1)):
+            try:
+                return await coro_factory()
+            except Exception as exc:
+                if self.dialect != "sqlite" or not self._is_sqlite_locked_error(exc):
+                    raise
+                last_err = exc
+                wait = min(0.05 * (2**attempt), 1.0)
+                logger.warning(
+                    f"SQLStorage: {op_name} locked, retry {attempt + 1}/{attempts} "
+                    f"in {wait:.2f}s"
+                )
+                await asyncio.sleep(wait)
+        assert last_err is not None
+        raise last_err
 
     async def _ensure_schema(self):
         """确保数据库表存在"""
@@ -935,6 +996,56 @@ class SQLStorage(BaseStorage):
                         await session.commit()
                     except Exception:
                         pass
+        elif self.dialect == "sqlite":
+            if fcntl is None:
+                try:
+                    async with asyncio.timeout(timeout):
+                        async with self._sqlite_lock:
+                            yield
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"SQLStorage: 获取锁 '{name}' 超时 ({timeout}s)"
+                    )
+                    raise StorageError(f"SQLStorage: 无法获取锁 '{name}'")
+                return
+
+            lock_path = LOCK_DIR / f"sqlite_{name}.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = None
+            locked = False
+            start = time.monotonic()
+            try:
+                async with asyncio.timeout(timeout):
+                    async with self._sqlite_lock:
+                        fd = open(lock_path, "a+")
+                        while True:
+                            try:
+                                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                locked = True
+                                break
+                            except BlockingIOError:
+                                if time.monotonic() - start >= timeout:
+                                    raise StorageError(
+                                        f"SQLStorage: 无法获取锁 '{name}'"
+                                    )
+                                await asyncio.sleep(0.05)
+                        try:
+                            yield
+                        finally:
+                            if locked and fd is not None:
+                                try:
+                                    fcntl.flock(fd, fcntl.LOCK_UN)
+                                except Exception:
+                                    pass
+            except asyncio.TimeoutError:
+                logger.warning(f"SQLStorage: 获取锁 '{name}' 超时 ({timeout}s)")
+                raise StorageError(f"SQLStorage: 无法获取锁 '{name}'")
+            finally:
+                if fd is not None:
+                    try:
+                        fd.close()
+                    except Exception:
+                        pass
         else:
             yield
 
@@ -998,92 +1109,96 @@ class SQLStorage(BaseStorage):
             logger.error(f"SQLStorage: 保存配置失败: {e}")
             raise
 
-    async def load_tokens(self) -> Dict[str, Any]:
-        await self._ensure_schema()
+    async def _load_tokens_once(self) -> Dict[str, Any]:
         from sqlalchemy import text
 
-        try:
-            async with self.async_session() as session:
-                res = await session.execute(
-                    text(
-                        "SELECT token, pool_name, status, quota, created_at, "
-                        "last_used_at, use_count, fail_count, last_fail_at, "
-                        "last_fail_reason, last_sync_at, tags, note, "
-                        "last_asset_clear_at, data "
-                        "FROM tokens"
-                    )
+        async with self.async_session() as session:
+            res = await session.execute(
+                text(
+                    "SELECT token, pool_name, status, quota, created_at, "
+                    "last_used_at, use_count, fail_count, last_fail_at, "
+                    "last_fail_reason, last_sync_at, tags, note, "
+                    "last_asset_clear_at, data "
+                    "FROM tokens"
                 )
-                rows = res.fetchall()
-                if not rows:
-                    return None
+            )
+            rows = res.fetchall()
+            if not rows:
+                return None
 
-                pools = {}
-                for (
-                    token_str,
-                    pool_name,
-                    status,
-                    quota,
-                    created_at,
-                    last_used_at,
-                    use_count,
-                    fail_count,
-                    last_fail_at,
-                    last_fail_reason,
-                    last_sync_at,
-                    tags,
-                    note,
-                    last_asset_clear_at,
-                    data_json,
-                ) in rows:
-                    if pool_name not in pools:
-                        pools[pool_name] = []
+            pools = {}
+            for (
+                token_str,
+                pool_name,
+                status,
+                quota,
+                created_at,
+                last_used_at,
+                use_count,
+                fail_count,
+                last_fail_at,
+                last_fail_reason,
+                last_sync_at,
+                tags,
+                note,
+                last_asset_clear_at,
+                data_json,
+            ) in rows:
+                if pool_name not in pools:
+                    pools[pool_name] = []
 
-                    try:
-                        token_data = {}
-                        if token_str:
-                            token_data["token"] = token_str
-                        if status is not None:
-                            token_data["status"] = self._normalize_status(status)
-                        if quota is not None:
-                            token_data["quota"] = int(quota)
-                        if created_at is not None:
-                            token_data["created_at"] = int(created_at)
-                        if last_used_at is not None:
-                            token_data["last_used_at"] = int(last_used_at)
-                        if use_count is not None:
-                            token_data["use_count"] = int(use_count)
-                        if fail_count is not None:
-                            token_data["fail_count"] = int(fail_count)
-                        if last_fail_at is not None:
-                            token_data["last_fail_at"] = int(last_fail_at)
-                        if last_fail_reason is not None:
-                            token_data["last_fail_reason"] = last_fail_reason
-                        if last_sync_at is not None:
-                            token_data["last_sync_at"] = int(last_sync_at)
-                        if tags is not None:
-                            token_data["tags"] = self._parse_tags(tags)
-                        if note is not None:
-                            token_data["note"] = note
-                        if last_asset_clear_at is not None:
-                            token_data["last_asset_clear_at"] = int(
-                                last_asset_clear_at
-                            )
+                try:
+                    token_data = {}
+                    if token_str:
+                        token_data["token"] = token_str
+                    if status is not None:
+                        token_data["status"] = self._normalize_status(status)
+                    if quota is not None:
+                        token_data["quota"] = int(quota)
+                    if created_at is not None:
+                        token_data["created_at"] = int(created_at)
+                    if last_used_at is not None:
+                        token_data["last_used_at"] = int(last_used_at)
+                    if use_count is not None:
+                        token_data["use_count"] = int(use_count)
+                    if fail_count is not None:
+                        token_data["fail_count"] = int(fail_count)
+                    if last_fail_at is not None:
+                        token_data["last_fail_at"] = int(last_fail_at)
+                    if last_fail_reason is not None:
+                        token_data["last_fail_reason"] = last_fail_reason
+                    if last_sync_at is not None:
+                        token_data["last_sync_at"] = int(last_sync_at)
+                    if tags is not None:
+                        token_data["tags"] = self._parse_tags(tags)
+                    if note is not None:
+                        token_data["note"] = note
+                    if last_asset_clear_at is not None:
+                        token_data["last_asset_clear_at"] = int(last_asset_clear_at)
 
-                        stored_data = None
-                        if data_json:
-                            if isinstance(data_json, str):
-                                stored_data = json_loads(data_json)
-                            else:
-                                stored_data = data_json
-                        if isinstance(stored_data, dict):
-                            for key, val in stored_data.items():
-                                if key not in token_data or token_data[key] is None:
-                                    token_data[key] = val
+                    stored_data = None
+                    if data_json:
+                        if isinstance(data_json, str):
+                            stored_data = json_loads(data_json)
+                        else:
+                            stored_data = data_json
+                    if isinstance(stored_data, dict):
+                        for key, val in stored_data.items():
+                            if key not in token_data or token_data[key] is None:
+                                token_data[key] = val
 
-                        pools[pool_name].append(token_data)
-                    except Exception:
-                        pass
-                return pools
+                    pools[pool_name].append(token_data)
+                except Exception:
+                    pass
+            return pools
+
+    async def load_tokens(self) -> Dict[str, Any]:
+        await self._ensure_schema()
+
+        try:
+            return await self._retry_on_sqlite_lock(
+                "load_tokens", self._load_tokens_once
+            )
         except Exception as e:
             logger.error(f"SQLStorage: 加载 Token 失败: {e}")
             return None
@@ -1138,10 +1253,22 @@ class SQLStorage(BaseStorage):
         self, updated: list[Dict[str, Any]], deleted: Optional[list[str]] = None
     ):
         await self._ensure_schema()
-        from sqlalchemy import bindparam, text
+
+        async def _once() -> None:
+            await self._save_tokens_delta_once(updated, deleted)
 
         try:
-            async with self.async_session() as session:
+            await self._retry_on_sqlite_lock("save_tokens_delta", _once)
+        except Exception as e:
+            logger.error(f"SQLStorage: 增量保存 Token 失败: {e}")
+            raise
+
+    async def _save_tokens_delta_once(
+        self, updated: list[Dict[str, Any]], deleted: Optional[list[str]] = None
+    ) -> None:
+        from sqlalchemy import bindparam, text
+
+        async with self.async_session() as session:
                 deleted_set = set(deleted or [])
                 if deleted_set:
                     delete_stmt = text(
@@ -1356,9 +1483,6 @@ class SQLStorage(BaseStorage):
                     await session.execute(usage_stmt, usage_updates)
 
                 await session.commit()
-        except Exception as e:
-            logger.error(f"SQLStorage: 增量保存 Token 失败: {e}")
-            raise
 
     async def close(self):
         await self.engine.dispose()
