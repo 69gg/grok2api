@@ -37,7 +37,7 @@ solver 运行依赖已放入默认依赖，仍然只使用 uv 安装和启动。
 - 模型目录与同名模型解析统一按 **CLI > Console > ssoBasic/grok.app > ssoSuper** 优先级处理。
 - CLI 请求只轮询 `oidcBuild` 中**已有 OIDC auth** 的账号；后台定时从 `ssoBasic` 静默补铸（`build.auto_init_from_sso_enabled`）；access 按需/定时 refresh。
 - Grok 与 Console Chat / Voice / Image 上游调用会按候选池顺序轮询可用 SSO 号；单次请求失败重试时会排除本请求已试过的号，再继续选下一个，429 会标记当前号 cooling 后换号重试。
-- CLI free-usage 耗尽：仅 cooling 该 OIDC 号约 24h，不影响同 SSO 的 Console 通道。
+- CLI free-usage / spending-limit 耗尽：仅 cooling 该 OIDC 号约 24h，不影响同 SSO 的 Console 通道。
 - `grok-imagine-image` 是 Console 原生图片模型，支持 `/v1/images/generations` 与 `/v1/images/edits`；旧的 `grok-imagine-image-edit` 只保留为 legacy grok.com 路径。
 
 ## 图片输入（Vision）

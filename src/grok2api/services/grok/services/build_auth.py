@@ -66,16 +66,23 @@ def token_has_cli_auth(token_info: TokenInfo) -> bool:
 
 
 def token_cli_selectable(token_info: TokenInfo) -> bool:
-    """Ready for request routing: active + has OIDC + not in free-usage cool window."""
-    if token_info.status != TokenStatus.ACTIVE:
-        return False
+    """Ready for request routing: has OIDC + not in free-usage cool window.
+
+    Free-usage / spending-limit cooling keeps status=COOLING with resume_at in
+    ``last_sync_at``; after the cool window the account is selectable again.
+    """
     if not token_has_cli_auth(token_info):
         return False
     # free-usage cool: last_sync_at stores resume_at_ms when last_fail_reason is free-usage
     if (token_info.last_fail_reason or "") == "free-usage-exhausted":
         resume_at = int(token_info.last_sync_at or 0)
-        if resume_at and int(time.time() * 1000) < resume_at:
+        now_ms = int(time.time() * 1000)
+        if resume_at and now_ms < resume_at:
             return False
+        # Cool window elapsed (or no resume marker): allow ACTIVE/COOLING again.
+        return token_info.status in {TokenStatus.ACTIVE, TokenStatus.COOLING}
+    if token_info.status != TokenStatus.ACTIVE:
+        return False
     return True
 
 

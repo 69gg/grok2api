@@ -57,30 +57,49 @@ class TokenPool:
 
         consumed_mode = self._is_consumed_mode()
         excluded = self._normalize_exclude(exclude)
+        now_ms = int(time.time() * 1000)
+
+        def _past_free_usage_cool(t: TokenInfo) -> bool:
+            """COOLING free-usage/spending-limit accounts re-enter after resume_at."""
+            if t.status != TokenStatus.COOLING:
+                return False
+            if (t.last_fail_reason or "") != "free-usage-exhausted":
+                return False
+            resume_at = int(t.last_sync_at or 0)
+            return bool(resume_at) and now_ms >= resume_at
+
         available = [
             t
             for t in self._tokens.values()
-            if t.is_available(consumed_mode=consumed_mode)
-            and (not excluded or t.token not in excluded)
+            if (not excluded or t.token not in excluded)
+            and (
+                t.is_available(consumed_mode=consumed_mode)
+                or (require_cli_auth and _past_free_usage_cool(t))
+            )
         ]
         if not available:
             return []
 
         if require_cli_auth:
             # Prefer accounts that already have OIDC auth (CLI channel).
-            now_ms = int(time.time() * 1000)
 
             def _has_auth(t: TokenInfo) -> bool:
                 if not ((t.refresh_token or "").strip() or (t.access_token or "").strip()):
                     return False
                 if (t.last_fail_reason or "") == "free-usage-exhausted":
                     resume_at = int(t.last_sync_at or 0)
+                    # Still in cool window → not selectable.
                     if resume_at and now_ms < resume_at:
                         return False
                 return True
 
             with_auth = [t for t in available if _has_auth(t)]
             if with_auth:
+                # Lazy recover free-usage cool that already elapsed.
+                for t in with_auth:
+                    if _past_free_usage_cool(t):
+                        t.recover_active()
+                        t.last_fail_reason = None
                 available = with_auth
             else:
                 return []

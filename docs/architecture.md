@@ -41,7 +41,7 @@ Grok 与 Console Chat / Voice / Image 通道都使用进程内轮询游标：每
 - **按需刷新**：请求前若 access 将过期则 `refresh_token` 换新；调度器也周期刷新。
 - **refresh 被吊销**：`invalid_grant` / `Refresh token has been revoked` 时，若有 `sso_source` 则自动 device-auth **重新 mint**（`build.remint_on_revoked`，默认开）；失败则清空该号 OIDC 密钥并按 `build.remint_cooldown_sec`（默认 300s）退避，避免死循环。
 - **请求轮询**：只从**已有 auth** 的 `oidcBuild` 账号 round-robin；无可用号时才触发 on-demand mint。
-- 额度耗尽（`free-usage-exhausted`）：该 OIDC 号 cooling 约 24h，不影响同号 Console/SSO 其它通道。
+- 额度耗尽（`free-usage-exhausted` / `personal-team-blocked:spending-limit` / run out of credits）：该 OIDC 号 cooling 约 24h（`build.free_usage_cooldown_sec`），不影响同号 Console/SSO 其它通道。
 - 协议细节见 `docs/build_cli_protocol.md`。
 
 Console 通道对上游失败做更细的账号状态区分：429、普通 403 和 Cloudflare HTML challenge 只在当前请求内换下一个号重试，不禁用账号；只有明确的 blocked-user 响应（例如 `unauthorized:blocked-user` / `User is blocked`）才会立即标记该 Console 号失效。这个规则同时适用于 Console 原生请求和缺失 `console_team_id` 时的 `CreateTeam` 初始化请求。

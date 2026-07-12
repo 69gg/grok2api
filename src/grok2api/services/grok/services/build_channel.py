@@ -273,17 +273,19 @@ def _body_drop_reasoning_content(body: bytes | None) -> tuple[bytes | None, bool
 
 
 def is_free_usage_exhausted(exc: UpstreamException) -> bool:
+    """True when upstream reports CLI free/credits quota exhausted (cool the OIDC account).
+
+    Matches free-usage codes and personal-team spending-limit (403 credits gate).
+    """
     details = exc.details or {}
     body = str(details.get("body") or "")
-    status = details.get("status")
-    if status != 429 and "free-usage" not in body.lower():
-        # still check body for code string
-        pass
     lowered = body.lower()
     return (
         "free-usage-exhausted" in lowered
         or "included free usage" in lowered
         or "subscription:free-usage-exhausted" in lowered
+        or "personal-team-blocked:spending-limit" in lowered
+        or "run out of credits" in lowered
     )
 
 
@@ -321,7 +323,7 @@ class BuildChannelService:
             token_info.status = TokenStatus.COOLING
             token_info.last_fail_reason = "free-usage-exhausted"
             token_info.last_fail_at = int(time.time() * 1000)
-            # store cooling until as note metadata in last_sync_at for reuse
+            # store cooling-until ms in last_sync_at (resume gate for pool / selectable)
             token_info.last_sync_at = int(time.time() * 1000) + cooldown * 1000
             await token_mgr.update_token_fields(
                 pool_name,
@@ -334,7 +336,8 @@ class BuildChannelService:
                 },
             )
             logger.warning(
-                "CLI token {} free usage exhausted; cooling {}s",
+                "CLI token {} free usage/spending-limit exhausted; "
+                "cooling {}s and switching account",
                 token_key[:16],
                 cooldown,
             )
@@ -450,6 +453,20 @@ class BuildChannelService:
                 last_error = exc
                 status = (exc.details or {}).get("status")
 
+                # Quota / spending-limit: cool this OIDC account and immediately try next.
+                if is_free_usage_exhausted(exc):
+                    await BuildChannelService._handle_failure(
+                        token_mgr, token_info, pool_name, exc
+                    )
+                    logger.warning(
+                        "CLI free-usage/spending-limit on token={}... "
+                        "attempt={}/{}, retrying with next account",
+                        token_info.token[:10],
+                        attempt + 1,
+                        max_retries,
+                    )
+                    continue
+
                 # Staged strip+retry on same credential for free-path validation errors:
                 # 1) drop encrypted_content only
                 # 2) if still failing, drop reasoning.content
@@ -485,7 +502,14 @@ class BuildChannelService:
                             status = (retry_exc.details or {}).get("status")
                             exc = retry_exc
                             current_body = stripped_body
+                            if is_free_usage_exhausted(retry_exc):
+                                break
                             continue
+                    if is_free_usage_exhausted(exc):
+                        await BuildChannelService._handle_failure(
+                            token_mgr, token_info, pool_name, exc
+                        )
+                        continue
 
                 # try refresh once on 401
                 if status == 401 and (token_info.refresh_token or "").strip():

@@ -60,6 +60,25 @@ def test_free_usage_exhausted_detection() -> None:
     )
     assert is_free_usage_exhausted(exc)
 
+    spending = UpstreamException(
+        message="BuildNativeReverse: request failed, 403",
+        details={
+            "status": 403,
+            "body": (
+                '{"code":"personal-team-blocked:spending-limit",'
+                '"error":"You have run out of credits or need a Grok subscription. '
+                'Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok."}'
+            ),
+        },
+    )
+    assert is_free_usage_exhausted(spending)
+
+    other_403 = UpstreamException(
+        message="forbidden",
+        details={"status": 403, "body": '{"code":"unauthorized:blocked-user"}'},
+    )
+    assert not is_free_usage_exhausted(other_403)
+
 
 def test_pool_prefers_accounts_with_cli_auth() -> None:
     pool = TokenPool("oidcBuild")
@@ -284,3 +303,156 @@ def test_free_usage_cooling_not_selectable() -> None:
         last_sync_at=int(time.time() * 1000) + 3600_000,
     )
     assert not token_cli_selectable(info)
+
+    cooling = TokenInfo(
+        token="cool2",
+        status=TokenStatus.COOLING,
+        quota=10,
+        access_token="a",
+        refresh_token="r",
+        last_fail_reason="free-usage-exhausted",
+        last_sync_at=int(time.time() * 1000) + 3600_000,
+    )
+    assert not token_cli_selectable(cooling)
+
+    recovered = TokenInfo(
+        token="cool3",
+        status=TokenStatus.COOLING,
+        quota=10,
+        access_token="a",
+        refresh_token="r",
+        last_fail_reason="free-usage-exhausted",
+        last_sync_at=int(time.time() * 1000) - 1000,
+    )
+    assert token_cli_selectable(recovered)
+
+
+@pytest.mark.asyncio
+async def test_spending_limit_cools_and_retries_next_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """403 personal-team-blocked:spending-limit cools the account and switches."""
+    from grok2api.services.grok.services import build_channel as bc
+    from grok2api.services.reverse.build_native import BuildNativeResponse
+    from grok2api.services.token.manager import TokenManager
+
+    manager = TokenManager()
+    manager.initialized = True
+    manager.pools["oidcBuild"] = TokenPool("oidcBuild")
+    tok_a = TokenInfo(
+        token="token-a",
+        status=TokenStatus.ACTIVE,
+        quota=10,
+        access_token="access-a",
+        refresh_token="refresh-a",
+        expired_at=int(time.time() * 1000) + 3600_000,
+    )
+    tok_b = TokenInfo(
+        token="token-b",
+        status=TokenStatus.ACTIVE,
+        quota=10,
+        access_token="access-b",
+        refresh_token="refresh-b",
+        expired_at=int(time.time() * 1000) + 3600_000,
+    )
+    manager.pools["oidcBuild"].add(tok_a)
+    manager.pools["oidcBuild"].add(tok_b)
+
+    used_access: list[str] = []
+    fail_first = True
+
+    async def fake_get_token_manager() -> TokenManager:
+        return manager
+
+    async def fake_reload_if_stale() -> None:
+        return None
+
+    async def fake_update_token_fields(
+        pool_name: str, token: str, fields: dict[str, Any]
+    ) -> None:
+        info = manager.pools[pool_name].get(token)
+        if info:
+            for k, v in fields.items():
+                if k == "status":
+                    info.status = TokenStatus(v)
+                else:
+                    setattr(info, k, v)
+
+    async def fake_request(
+        *,
+        access_token: str,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        content_type: str | None = None,
+        stream: bool = False,
+        conv_id: str | None = None,
+        base_url: str | None = None,
+    ) -> BuildNativeResponse:
+        nonlocal fail_first
+        used_access.append(access_token)
+        if fail_first:
+            fail_first = False
+            raise UpstreamException(
+                message="BuildNativeReverse: request failed, 403",
+                details={
+                    "status": 403,
+                    "body": (
+                        '{"code":"personal-team-blocked:spending-limit",'
+                        '"error":"You have run out of credits or need a Grok subscription."}'
+                    ),
+                },
+            )
+        return BuildNativeResponse(
+            body=b'{"ok":true}',
+            status_code=200,
+            content_type="application/json",
+            headers={},
+        )
+
+    async def fake_ensure(
+        token_info: TokenInfo, pool_name: str
+    ) -> TokenInfo:
+        return token_info
+
+    def fake_get_config(key: str, default: object = None) -> object:
+        if key == "retry.max_retry":
+            return 3
+        if key == "build.enabled":
+            return True
+        if key == "build.free_usage_cooldown_sec":
+            return 86400
+        if key == "build.default_web_search":
+            return False
+        return default
+
+    monkeypatch.setattr(bc, "get_token_manager", fake_get_token_manager)
+    monkeypatch.setattr(manager, "reload_if_stale", fake_reload_if_stale)
+    monkeypatch.setattr(manager, "update_token_fields", fake_update_token_fields)
+    monkeypatch.setattr(bc, "get_config", fake_get_config)
+    monkeypatch.setattr(bc.BuildNativeReverse, "request", staticmethod(fake_request))
+    monkeypatch.setattr(
+        bc.BuildChannelService, "ensure_fresh_access", staticmethod(fake_ensure)
+    )
+
+    result = await bc.BuildChannelService.proxy(
+        model_id="grok-4.5",
+        method="POST",
+        path="/v1/messages",
+        payload={"model": "grok-4.5", "messages": [{"role": "user", "content": "hi"}]},
+        stream=False,
+    )
+
+    # First account fails with spending-limit, second succeeds.
+    assert len(used_access) == 2
+    assert used_access[0] != used_access[1]
+    assert isinstance(result, BuildNativeResponse)
+    assert result.status_code == 200
+
+    cooled = [t for t in (tok_a, tok_b) if t.status == TokenStatus.COOLING]
+    active = [t for t in (tok_a, tok_b) if t.status == TokenStatus.ACTIVE]
+    assert len(cooled) == 1
+    assert cooled[0].last_fail_reason == "free-usage-exhausted"
+    assert not token_cli_selectable(cooled[0])
+    assert len(active) == 1
+    assert token_cli_selectable(active[0])
