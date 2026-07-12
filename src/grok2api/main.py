@@ -95,7 +95,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             from grok2api.services.register import get_auto_register_manager
 
-            await get_auto_register_manager().stop_job()
+            await get_auto_register_manager().stop_job(stop_solver=True)
         except Exception:
             pass
 

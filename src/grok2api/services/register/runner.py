@@ -323,25 +323,36 @@ class RegisterRunner:
     def _register_single_thread(self) -> None:
         time.sleep(random.uniform(0, 5))
 
-        try:
-            email_service = EmailService()
-            turnstile_service = TurnstileService()
-            user_agreement_service = UserAgreementService()
-            grok_setup_service = GrokSetupService()
-        except Exception as exc:
-            self._record_error(f"service init failed: {exc}")
-            return
+        email_service: Optional[EmailService] = None
+        turnstile_service: Optional[TurnstileService] = None
+        user_agreement_service: Optional[UserAgreementService] = None
+        grok_setup_service: Optional[GrokSetupService] = None
 
-        final_action_id = self._config.get("action_id")
-        if not final_action_id:
-            self._record_error("missing action id")
-            return
-
+        # Keep retrying forever until target is met or stop_event is set.
         while not self.stop_event.is_set():
             try:
+                if email_service is None:
+                    email_service = EmailService()
+                    turnstile_service = TurnstileService()
+                    user_agreement_service = UserAgreementService()
+                    grok_setup_service = GrokSetupService()
+
+                final_action_id = self._config.get("action_id")
+                if not final_action_id:
+                    self._record_error("missing action id")
+                    time.sleep(5)
+                    continue
+
+                assert turnstile_service is not None
+                assert user_agreement_service is not None
+                assert grok_setup_service is not None
+
                 impersonate_fingerprint, account_user_agent = _random_chrome_profile()
 
-                with curl_requests.Session(impersonate=impersonate_fingerprint, proxies=get_proxies_dict() or {}) as session:
+                with curl_requests.Session(
+                    impersonate=impersonate_fingerprint,
+                    proxies=get_proxies_dict() or {},
+                ) as session:
                     try:
                         session.get(SITE_URL, timeout=10)
                     except Exception:
@@ -385,21 +396,29 @@ class RegisterRunner:
                         time.sleep(3)
                         continue
 
-                    for _ in range(3):
+                    registered = False
+                    for _ in range(5):
                         if self.stop_event.is_set():
                             return
 
                         try:
-                            task_id = turnstile_service.create_task(f"{SITE_URL}/sign-up", self._config["site_key"] or "")
+                            task_id = turnstile_service.create_task(
+                                f"{SITE_URL}/sign-up",
+                                self._config["site_key"] or "",
+                            )
                         except Exception as exc:
                             self._record_error(f"turnstile create_task failed: {exc}")
                             time.sleep(2)
                             continue
 
-                        token = turnstile_service.get_response(task_id, stop_event=self.stop_event)
+                        token = turnstile_service.get_response(
+                            task_id, stop_event=self.stop_event
+                        )
 
                         if not token:
-                            self._record_error(f"turnstile failed: {turnstile_service.last_error or 'no token'}")
+                            self._record_error(
+                                f"turnstile failed: {turnstile_service.last_error or 'no token'}"
+                            )
                             time.sleep(2)
                             continue
 
@@ -446,10 +465,13 @@ class RegisterRunner:
                             time.sleep(3)
                             continue
 
-                        match = re.search(r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', res.text)
+                        match = re.search(
+                            r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', res.text
+                        )
                         if not match:
                             self._record_error("sign_up missing set-cookie redirect")
-                            break
+                            time.sleep(2)
+                            continue
 
                         verify_url = match.group(1)
                         logger.info("Register: verify_url={}", verify_url[:80])
@@ -467,7 +489,8 @@ class RegisterRunner:
                         sso_rw = setup_result.get("sso_rw", "")
                         if not sso:
                             self._record_error("grok_setup: no sso cookie from browser")
-                            break
+                            time.sleep(2)
+                            continue
 
                         logger.info("Register: browser sso ok, len={}", len(sso))
 
@@ -484,14 +507,27 @@ class RegisterRunner:
                             user_agent=account_user_agent,
                         )
                         if not tos_result.get("ok") or not tos_result.get("hex_reply"):
-                            self._record_error(f"accept_tos failed: {tos_result.get('error') or 'unknown'}")
-                            break
+                            self._record_error(
+                                f"accept_tos failed: {tos_result.get('error') or 'unknown'}"
+                            )
+                            time.sleep(2)
+                            continue
 
                         self._record_success(email, password, sso)
+                        registered = True
                         break
 
+                    if not registered and not self.stop_event.is_set():
+                        # Exhausted turnstile/sign-up attempts for this email; try another.
+                        time.sleep(2)
+
             except Exception as exc:
-                self._record_error(f"thread error: {str(exc)[:80]}")
+                # Transient service/network failures: recreate services next loop.
+                email_service = None
+                turnstile_service = None
+                user_agreement_service = None
+                grok_setup_service = None
+                self._record_error(f"thread error: {str(exc)[:120]}")
                 time.sleep(3)
 
     def run(self, *, skip_init: bool = False) -> List[str]:

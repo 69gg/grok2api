@@ -116,32 +116,36 @@ class AutoRegisterManager:
             return {"status": "not_found"}
         return self._job.to_dict()
 
-    async def stop_job(self) -> None:
-        """Best-effort stop for the current job (used on shutdown)."""
+    async def stop_job(self, *, stop_solver: bool = False) -> None:
+        """Stop the current registration job.
+
+        Args:
+            stop_solver: When True (app shutdown), also terminate the local solver
+                process. Normal stop / job completion leaves the solver running for reuse.
+        """
         async with self._lock:
             job = self._job
             task = self._task
             solver = self._solver
 
-            if not job or job.status not in {"starting", "running"}:
-                return
-            job.status = "stopping"
-            job.stop_event.set()
+            if job and job.status in {"starting", "running"}:
+                job.status = "stopping"
+                job.stop_event.set()
 
-        # Stop solver first to avoid noisy retries.
-        if solver:
+        if task and not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except Exception:
+                # Don't block caller; worker may still wind down.
+                pass
+
+        if stop_solver and solver:
             try:
                 await asyncio.to_thread(solver.stop)
             except Exception:
                 pass
-
-        # Give the runner a short grace period to exit.
-        if task:
-            try:
-                await asyncio.wait_for(task, timeout=5.0)
-            except Exception:
-                # Don't block shutdown; the process is exiting anyway.
-                pass
+            if self._solver is solver:
+                self._solver = None
 
     async def _run_job(self, job: RegisterJob) -> None:
         job.status = "starting"
@@ -204,15 +208,14 @@ class AutoRegisterManager:
             auto_start_solver = False
             solver.config.auto_start = False
 
-        # Safety limits to avoid endless loops when upstream is broken.
+        # Optional safety limits. Default (0) = keep retrying until target or user stop.
         max_errors = get_config("register.max_errors", 0)
         try:
             max_errors = int(max_errors)
         except Exception:
             max_errors = 0
-        if max_errors <= 0:
-            # Default: allow retries, but stop instead of looping "forever".
-            max_errors = max(30, int(job.total) * 5)
+        if max_errors < 0:
+            max_errors = 0
 
         max_runtime_minutes = get_config("register.max_runtime_minutes", 0)
         try:
@@ -241,7 +244,9 @@ class AutoRegisterManager:
 
         def _on_error(msg: str) -> None:
             job.record_error(msg)
-            # Called from worker threads; keep it simple and thread-safe.
+            # Optional circuit breaker only when max_errors > 0.
+            if max_errors <= 0:
+                return
             with job._lock:
                 if job.status in {"starting", "running"} and job.errors >= max_errors:
                     job.status = "error"
@@ -280,7 +285,13 @@ class AutoRegisterManager:
                 ),
                 on_error=_on_error,
             )
-            logger.info("Register job {}: initializing action config before solver", job.job_id)
+            logger.info(
+                "Register job {}: init then run until target={} (max_errors={}, max_runtime_min={})",
+                job.job_id,
+                job.total,
+                max_errors or "unlimited",
+                max_runtime_minutes or "unlimited",
+            )
             await asyncio.to_thread(runner._init_config)
 
             if auto_start_solver:
@@ -303,14 +314,15 @@ class AutoRegisterManager:
             if job.status == "stopping":
                 job.status = "stopped"
             elif job.status != "error":
-                # If we returned without reaching the target, treat it as a failure.
-                # This makes issues like "TOS/BirthDate/NSFW not enabled" visible to the UI as a failed job.
-                if job.completed < job.total:
+                if job.completed >= job.total:
+                    job.status = "completed"
+                elif job.stop_event.is_set():
+                    job.status = "stopped"
+                else:
+                    # Workers exited without target and without stop — treat as error.
                     job.status = "error"
                     suffix = f" Last error: {job.last_error}" if job.last_error else ""
                     job.error = f"Registration ended early ({job.completed}/{job.total}).{suffix}".strip()
-                else:
-                    job.status = "completed"
         except Exception as exc:
             job.status = "error"
             job.error = str(exc)
@@ -336,13 +348,15 @@ class AutoRegisterManager:
                     watchdog_task.cancel()
             except Exception:
                 pass
-            self._solver = None
-            if auto_start_solver:
-                try:
-                    await asyncio.to_thread(solver.stop)
-                except Exception:
-                    pass
-
+            # Keep local solver alive across jobs; only app shutdown stops it.
+            logger.info(
+                "Register job {} finished status={} completed={}/{} (solver left running={})",
+                job.job_id,
+                job.status,
+                job.completed,
+                job.total,
+                bool(self._solver and auto_start_solver),
+            )
 
 def get_auto_register_manager() -> AutoRegisterManager:
     if AutoRegisterManager._instance is None:
