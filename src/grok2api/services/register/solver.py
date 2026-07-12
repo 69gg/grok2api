@@ -35,6 +35,8 @@ class SolverConfig:
     debug: bool = False
     auto_start: bool = True
     proxy_url: str = ""
+    # True = headless browsers; False = headed (needs DISPLAY), often better vs CF.
+    headless: bool = True
 
 
 class TurnstileSolverProcess:
@@ -219,6 +221,8 @@ class TurnstileSolverProcess:
             cmd += ["--proxy-url", self.config.proxy_url]
         if self.config.debug:
             cmd.append("--debug")
+        if not self.config.headless:
+            cmd.append("--no-headless")
         cmd += ["--host", host, "--port", str(port)]
         return cmd
 
@@ -238,7 +242,18 @@ class TurnstileSolverProcess:
 
             cmd = self._build_command(host, port)
 
-            logger.info("Starting Turnstile solver: {}", " ".join(cmd))
+            logger.info(
+                "Starting Turnstile solver: {} (debug={} browser_type={} threads={})",
+                " ".join(cmd),
+                self.config.debug,
+                self._actual_browser_type,
+                self.config.threads,
+            )
+            if self.config.debug:
+                logger.info(
+                    "Turnstile solver debug enabled: expect detailed CAPTCHA page snapshots "
+                    "and create/poll logs from the solver process"
+                )
             kwargs = {
                 "cwd": str(script.parent),
             }

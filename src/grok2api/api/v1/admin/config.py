@@ -22,6 +22,8 @@ REGISTER_DEFAULTS = {
     "default_count": 100,
     "auto_start_solver": True,
     "solver_debug": False,
+    "solver_headless": True,
+    "solver_proxy_url": "",
     "max_errors": 0,
     "max_runtime_minutes": 0,
 }

@@ -171,9 +171,20 @@ class AutoRegisterManager:
         if not isinstance(solver_debug, bool):
             solver_debug = str(solver_debug).lower() in {"1", "true", "yes", "on"}
 
+        solver_headless = get_config("register.solver_headless", True)
+        if not isinstance(solver_headless, bool):
+            solver_headless = str(solver_headless).lower() in {"1", "true", "yes", "on"}
+
         browser_type = str(get_config("register.solver_browser_type", "chromium") or "chromium").strip().lower()
         if browser_type not in {"chromium", "chrome", "msedge", "camoufox"}:
             browser_type = "chromium"
+
+        # Solver-only proxy (optional). Empty keeps direct; does not change app base_proxy_url.
+        solver_proxy = str(
+            get_config("register.solver_proxy_url", "")
+            or get_config("proxy.base_proxy_url", "")
+            or ""
+        ).strip()
 
         solver_cfg = SolverConfig(
             url=str(solver_url or "http://127.0.0.1:5072"),
@@ -181,6 +192,8 @@ class AutoRegisterManager:
             browser_type=browser_type,
             debug=solver_debug,
             auto_start=auto_start_solver,
+            proxy_url=solver_proxy,
+            headless=solver_headless,
         )
         solver = TurnstileSolverProcess(solver_cfg)
         self._solver = solver
@@ -252,7 +265,24 @@ class AutoRegisterManager:
                             job.stop_event.set()
                     return
 
+        runner: Optional[RegisterRunner] = None
         try:
+            # Fetch action_id / sitekey *before* launching camoufox/chromium browsers.
+            # Concurrent SSL stacks (curl_cffi + browser) can trigger intermittent
+            # curl 35 OPENSSL_internal TLS failures during init.
+            runner = RegisterRunner(
+                target_count=job.total,
+                thread_count=job.register_threads,
+                stop_event=job.stop_event,
+                on_success=lambda _email, _password, token, _done, _total: (
+                    job.record_success(token),
+                    token_queue.put(token),
+                ),
+                on_error=_on_error,
+            )
+            logger.info("Register job {}: initializing action config before solver", job.job_id)
+            await asyncio.to_thread(runner._init_config)
+
             if auto_start_solver:
                 try:
                     await asyncio.to_thread(solver.start)
@@ -264,18 +294,8 @@ class AutoRegisterManager:
             job.status = "running"
             watchdog_task = asyncio.create_task(_watchdog())
             consumer_task = asyncio.create_task(_consume_tokens())
-            runner = RegisterRunner(
-                target_count=job.total,
-                thread_count=job.register_threads,
-                stop_event=job.stop_event,
-                on_success=lambda _email, _password, token, _done, _total: (
-                    job.record_success(token),
-                    token_queue.put(token),
-                ),
-                on_error=_on_error,
-            )
 
-            await asyncio.to_thread(runner.run)
+            await asyncio.to_thread(runner.run, skip_init=True)
 
             # Drain token consumer.
             token_queue.put(sentinel)
@@ -294,6 +314,7 @@ class AutoRegisterManager:
         except Exception as exc:
             job.status = "error"
             job.error = str(exc)
+            job.record_error(str(exc))
             logger.exception("Auto registration failed")
         finally:
             job.finished_at = time.time()

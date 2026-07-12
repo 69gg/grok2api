@@ -31,9 +31,21 @@ CHROME_PROFILES = [
     {"impersonate": "chrome110", "version": "110.0.0.0", "brand": "chrome"},
     {"impersonate": "chrome119", "version": "119.0.0.0", "brand": "chrome"},
     {"impersonate": "chrome120", "version": "120.0.0.0", "brand": "chrome"},
+    {"impersonate": "chrome131", "version": "131.0.0.0", "brand": "chrome"},
+    {"impersonate": "chrome136", "version": "136.0.0.0", "brand": "chrome"},
     {"impersonate": "edge99", "version": "99.0.1150.36", "brand": "edge"},
     {"impersonate": "edge101", "version": "101.0.1210.47", "brand": "edge"},
 ]
+
+# curl_cffi impersonate 候选（init 失败时轮换，规避偶发 TLS / CF 拦截）
+_INIT_IMPERSONATES: Tuple[str, ...] = (
+    "chrome120",
+    "chrome131",
+    "chrome136",
+    "chrome119",
+    "chrome110",
+    "edge101",
+)
 
 
 def _random_chrome_profile() -> Tuple[str, str]:
@@ -110,6 +122,7 @@ class RegisterRunner:
             "action_id": None,
             "state_tree": "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D",
         }
+        self._config_ready: bool = False
 
     @property
     def success_count(self) -> int:
@@ -160,12 +173,29 @@ class RegisterRunner:
             except Exception:
                 pass
 
-    def _init_config(self) -> None:
-        logger.info("Register: initializing action config...")
+    def _init_config_once(self, impersonate: str) -> None:
+        """Single attempt to fetch sitekey / state_tree / action_id from sign-up page."""
         start_url = f"{SITE_URL}/sign-up"
+        proxies = get_proxies_dict()
+        session_kwargs: Dict[str, object] = {"impersonate": impersonate}
+        if proxies:
+            session_kwargs["proxies"] = proxies
 
-        with curl_requests.Session(impersonate=DEFAULT_IMPERSONATE, proxies=get_proxies_dict() or {}) as session:
-            html = session.get(start_url, timeout=15).text
+        with curl_requests.Session(**session_kwargs) as session:  # type: ignore[arg-type]
+            resp = session.get(start_url, timeout=20)
+            status = getattr(resp, "status_code", None)
+            html = resp.text or ""
+            logger.debug(
+                "Register init page impersonate={} status={} html_len={} proxy={}",
+                impersonate,
+                status,
+                len(html),
+                bool(proxies),
+            )
+            if status and int(status) >= 400:
+                raise RuntimeError(f"sign-up HTTP {status} (html_len={len(html)})")
+            if len(html) < 500:
+                raise RuntimeError(f"sign-up page too short (status={status}, html_len={len(html)})")
 
             key_match = re.search(r'sitekey":"(0x4[a-zA-Z0-9_-]+)"', html)
             if key_match:
@@ -181,17 +211,81 @@ class RegisterRunner:
                 for script in soup.find_all("script", src=True)
                 if "_next/static" in script["src"]
             ]
+            if not js_urls:
+                raise RuntimeError("no Next.js static scripts found on sign-up page")
+
             for js_url in js_urls:
-                js_content = session.get(js_url, timeout=15).text
+                if self.stop_event.is_set():
+                    raise RuntimeError("stopped during init")
+                try:
+                    js_content = session.get(js_url, timeout=20).text or ""
+                except Exception as exc:
+                    logger.debug("Register init JS fetch failed url={} err={}", js_url, exc)
+                    continue
                 match = re.search(r"7f[a-fA-F0-9]{40}", js_content)
                 if match:
                     self._config["action_id"] = match.group(0)
-                    logger.info("Register: Action ID found: {}", self._config["action_id"])
+                    logger.info(
+                        "Register: Action ID found: {} (impersonate={})",
+                        self._config["action_id"],
+                        impersonate,
+                    )
                     break
 
         if not self._config.get("action_id"):
-            raise RuntimeError("Register init failed: missing action_id")
+            raise RuntimeError("missing action_id after parsing sign-up assets")
 
+    def _init_config(self, max_attempts: int = 6) -> None:
+        """Fetch registration action config with retries / fingerprint rotation.
+
+        curl_cffi can hit intermittent TLS errors (curl 35 OPENSSL_internal) especially
+        when heavy browser processes are also starting. Retries + impersonate rotation
+        make init resilient; callers should prefer running this *before* starting solver.
+        """
+        if self._config_ready and self._config.get("action_id"):
+            logger.debug("Register: action config already ready, skip init")
+            return
+
+        logger.info("Register: initializing action config (max_attempts={})...", max_attempts)
+        last_error: Optional[BaseException] = None
+
+        for attempt in range(1, max_attempts + 1):
+            if self.stop_event.is_set():
+                raise RuntimeError("Register stopped during init")
+
+            impersonate = _INIT_IMPERSONATES[(attempt - 1) % len(_INIT_IMPERSONATES)]
+            try:
+                self._init_config_once(impersonate)
+                self._config_ready = True
+                logger.info(
+                    "Register: action config ready (attempt={}/{}, site_key={}, action_id={})",
+                    attempt,
+                    max_attempts,
+                    (self._config.get("site_key") or "")[:20],
+                    self._config.get("action_id"),
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                self._config["action_id"] = None
+                self._config_ready = False
+                logger.warning(
+                    "Register init attempt {}/{} failed (impersonate={}): {}",
+                    attempt,
+                    max_attempts,
+                    impersonate,
+                    exc,
+                )
+                # Backoff; keep solver/browser load from racing TLS retries too hard.
+                delay = min(1.5 * attempt, 8.0)
+                for _ in range(int(delay * 10)):
+                    if self.stop_event.is_set():
+                        raise RuntimeError("Register stopped during init backoff")
+                    time.sleep(0.1)
+
+        raise RuntimeError(
+            f"Register init failed after {max_attempts} attempts: {last_error}"
+        )
     def _send_email_code(self, session: curl_requests.Session, email: str) -> bool:
         url = f"{SITE_URL}/auth_mgmt.AuthManagement/CreateEmailValidationCode"
         data = _encode_grpc_message(1, email)
@@ -400,9 +494,15 @@ class RegisterRunner:
                 self._record_error(f"thread error: {str(exc)[:80]}")
                 time.sleep(3)
 
-    def run(self) -> List[str]:
-        """Run the registration process and return collected tokens."""
-        self._init_config()
+    def run(self, *, skip_init: bool = False) -> List[str]:
+        """Run the registration process and return collected tokens.
+
+        Args:
+            skip_init: When True, assume `_init_config()` was already called successfully
+                (e.g. manager fetched action config before starting the local solver).
+        """
+        if not skip_init or not self._config_ready:
+            self._init_config()
         self._start_time = time.time()
 
         logger.info("Register: starting {} threads, target {}", self.thread_count, self.target_count)

@@ -22,7 +22,18 @@ async def save_result(task_id: str, task_type: str, data: dict[str, Any] | str) 
     payload["updatedAt"] = time.time()
     results_db[task_id] = payload
     await cleanup_old_results()
-    print(f"[系统] 任务 {task_id} 状态更新: {payload.get('value', '正在处理')}")
+    value = payload.get("value", "正在处理")
+    status = payload.get("status")
+    elapsed = payload.get("elapsed_time")
+    extra = payload.get("error") or payload.get("debug")
+    parts = [f"[系统] 任务 {task_id} type={task_type} 状态更新: {value}"]
+    if status and status != value:
+        parts.append(f"status={status}")
+    if elapsed is not None:
+        parts.append(f"elapsed={elapsed}s")
+    if extra:
+        parts.append(f"detail={extra}")
+    print(" ".join(parts))
 
 
 async def load_result(task_id: str) -> dict[str, Any] | None:

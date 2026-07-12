@@ -5,6 +5,8 @@
 - `src/grok2api/api`：FastAPI router 和接口 schema。
 - `src/grok2api/services`：业务编排、token、注册、Grok 服务。
 - `src/grok2api/services/register`：自动注册、Turnstile solver 进程管理和注册后账号初始化。
+  - 本地 Turnstile 解码调试：`register.solver_debug = true` 会给 solver 传 `--debug`，并在主进程 `TurnstileService` 打印 create/poll/CAPTCHA_FAIL 详情；solver 进程会输出页面快照（url/title/iframe/token 长度/console error）及失败原因。
+  - 注册 init：先抓 `accounts.x.ai/sign-up` 解析 action_id（带 impersonate 轮换与重试），**再**启动本地 solver，避免 curl_cffi 与 camoufox 并发时偶发 `curl 35 OPENSSL_internal` 直接整 job 失败。
 - `src/grok2api/services/reverse`：Grok 上游反向调用细节。
 - `src/grok2api/core`：配置、日志、认证、异常、存储和路径。
 - `scripts/turnstile_solver`：本地 solver HTTP 服务，提供 `/turnstile`、`/grok_setup`、`/cf_clearance` 和 `/result`。

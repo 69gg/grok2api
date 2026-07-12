@@ -43,6 +43,24 @@ def test_build_command_with_proxy_url_uses_explicit_proxy() -> None:
     assert cmd[cmd.index("--proxy-url") + 1] == proxy_url
 
 
+def test_build_command_no_headless_flag() -> None:
+    process = TurnstileSolverProcess(
+        SolverConfig(
+            url="http://127.0.0.1:5072",
+            threads=2,
+            browser_type="camoufox",
+            headless=False,
+            debug=True,
+        )
+    )
+    process._python_exe = "/usr/bin/python3"
+    process._actual_browser_type = "camoufox"
+
+    cmd = process._build_command("127.0.0.1", 5072)
+    assert "--no-headless" in cmd
+    assert "--debug" in cmd
+
+
 def test_stop_clears_unowned_existing_process_reference() -> None:
     process = TurnstileSolverProcess(
         SolverConfig(url="http://127.0.0.1:5072", auto_start=True)

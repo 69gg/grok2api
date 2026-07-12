@@ -179,8 +179,12 @@ register_threads = 10
 default_count = 100
 # 自动启动本地 Solver；仅对本机 solver_url 生效，也用于 CF 自动刷新
 auto_start_solver = true
-# 启动 Solver 时开启调试日志
+# 启动 Solver 时开启调试日志（本地 Turnstile 解码会输出页面快照、轮询与 CAPTCHA_FAIL 详情）
 solver_debug = false
+# false=有界面浏览器（需 DISPLAY），对 CF 更友好；true=无头
+solver_headless = true
+# 仅给 solver 浏览器用的代理；空则尝试 proxy.base_proxy_url，仍空则直连
+solver_proxy_url = ""
 # 最大错误次数，0 表示自动计算
 max_errors = 0
 # 最大运行时间（分钟），0 表示不限制
