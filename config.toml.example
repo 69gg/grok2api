@@ -156,6 +156,8 @@ mint_headless = false
 free_usage_cooldown_sec = 86400
 default_web_search = false
 timeout_sec = 300
+# 单个 OIDC 账号遇到传输错误时的重试次数；独立于 retry.max_retry 的跨账号轮询
+transport_max_retry = 3
 
 # ==================== 自动注册配置 ====================
 [register]

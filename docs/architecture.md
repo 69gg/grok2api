@@ -41,6 +41,7 @@ Grok 与 Console Chat / Voice / Image 通道都使用进程内轮询游标：每
 - **按需刷新**：请求前若 access 将过期则 `refresh_token` 换新；调度器也周期刷新。
 - **refresh 被吊销**：`invalid_grant` / `Refresh token has been revoked` 时，若有 `sso_source` 则自动 device-auth **重新 mint**（`build.remint_on_revoked`，默认开）；失败则清空该号 OIDC 密钥并按 `build.remint_cooldown_sec`（默认 300s）退避，避免死循环。
 - **请求轮询**：只从**已有 auth** 的 `oidcBuild` 账号 round-robin；无可用号时才触发 on-demand mint。
+- **有界传输重试**：单个 OIDC 账号的连接错误由 `build.transport_max_retry` 独立限制；每次重试前关闭旧的 `curl_cffi` session，避免与跨账号轮询形成资源和次数的乘法放大。
 - 额度耗尽（`free-usage-exhausted` / `personal-team-blocked:spending-limit` / run out of credits）：该 OIDC 号 cooling 约 24h（`build.free_usage_cooldown_sec`），不影响同号 Console/SSO 其它通道。
 - 协议细节见 `docs/build_cli_protocol.md`。
 

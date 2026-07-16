@@ -80,4 +80,5 @@ Headers：`Authorization: Bearer` + `x-grok-client-version` / `x-xai-token-auth`
 
 - 网关：header 透传三端点；`-search` 别名注入 `web_search`
 - 凭证：自动注册（可选）+ device mint；**运行时只靠 refresh 续期**
+- 传输重试：单个 OIDC 账号由 `build.transport_max_retry` 限制（默认 3 次），每次重试前关闭旧 session；账号轮询仍由 `retry.max_retry` 独立控制
 - 人机：Turnstile 失败 → 刷新重试（浏览器路径）；协议路径复用 register turnstile solver

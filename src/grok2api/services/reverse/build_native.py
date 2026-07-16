@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, Mapping, Optional
@@ -266,12 +267,13 @@ class BuildNativeReverse:
                 return await session.post(url, data=body, **kwargs)
             return await session.request(request_method, url, data=body, **kwargs)
 
-        import asyncio
-
-        max_retry = int(
-            get_config("retry.max_retry", BUILD_TRANSPORT_MAX_RETRY)
-            or BUILD_TRANSPORT_MAX_RETRY
+        configured_max_retry = get_config(
+            "build.transport_max_retry", BUILD_TRANSPORT_MAX_RETRY
         )
+        try:
+            max_retry = max(0, int(configured_max_retry))
+        except (TypeError, ValueError):
+            max_retry = BUILD_TRANSPORT_MAX_RETRY
         attempt = 0
         while attempt <= max_retry:
             try:
@@ -337,6 +339,9 @@ class BuildNativeReverse:
                         "headers": _sanitize_headers(response.headers),
                     },
                 )
+            except asyncio.CancelledError:
+                await session.close()
+                raise
             except UpstreamException:
                 raise
             except Exception as exc:
@@ -344,6 +349,7 @@ class BuildNativeReverse:
                 if status_code is None or attempt >= max_retry:
                     await session.close()
                     raise
+                await session.close()
                 if active_proxy_key and should_rotate_proxy(status_code):
                     rotate_proxy(active_proxy_key)
                 await asyncio.sleep(min(0.5 * (2**attempt), 5.0))

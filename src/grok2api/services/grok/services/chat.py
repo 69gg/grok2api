@@ -319,6 +319,14 @@ class GrokChatService:
                 request_overrides=request_overrides,
             )
             logger.info(f"Chat connected: model={model}, stream={stream}")
+        except asyncio.CancelledError:
+            try:
+                await session.close()
+            except Exception as exc:
+                logger.debug("Failed to close cancelled chat session: {}", exc)
+            finally:
+                semaphore.release()
+            raise
         except Exception:
             try:
                 await session.close()
@@ -327,12 +335,17 @@ class GrokChatService:
             semaphore.release()
             raise
 
-        async def _stream():
+        async def _stream() -> AsyncGenerator[Any, None]:
             try:
                 async for line in stream_response:
                     yield line
             finally:
-                semaphore.release()
+                try:
+                    await session.close()
+                except Exception as exc:
+                    logger.debug("Failed to close chat session: {}", exc)
+                finally:
+                    semaphore.release()
 
         return _stream()
 

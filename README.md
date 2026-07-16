@@ -18,6 +18,7 @@ uv run granian --interface asgi grok2api.main:app --host 0.0.0.0 --port 8000
 - `proxy.console_proxy_url`：Console 与 **Free CLI（cli-chat-proxy）** 共用代理；为空时回退 `proxy.base_proxy_url`。
 - `token.console_team_auto_init_enabled`：默认开启。服务会为缺少 `console_team_id` 的 `ssoBasic` 主动调用 Console `CreateTeam`，并把每号 team id 持久化到账号数据；请求命中缺字段账号时也会先补全再访问 Console。
 - `[build]`：Free Grok 4.5 / Composer CLI 通道，**默认全开**（pull 后无需改配置即可用）。后台会像 Console team 一样**静默**为已有 `ssoBasic` 账号铸 OIDC 到 `oidcBuild` 池；请求只轮询**已有 auth** 的号，并按需 `refresh_token` 续期。代理走 `console_proxy_url`。详见 `docs/build_cli_protocol.md`。
+- `build.transport_max_retry`：单个 OIDC 账号发生传输错误时的重试次数，默认 `3`；它与 `retry.max_retry` 的跨账号轮询相互独立，避免两层重试相乘失控。
 
 ## Cloudflare Clearance
 
