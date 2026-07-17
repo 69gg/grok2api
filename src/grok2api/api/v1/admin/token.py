@@ -101,6 +101,164 @@ def _trigger_account_settings_refresh_background(
     asyncio.create_task(_run())
 
 
+def _item_token_key(item) -> str:
+    """提取条目归一化后的 token 键（str 条目或 dict 条目的 token 字段）。"""
+    if isinstance(item, str):
+        return _sanitize_token_text(item)
+    if isinstance(item, dict):
+        return _sanitize_token_text(item.get("token"))
+    return ""
+
+
+def _build_existing_index(existing: dict) -> tuple[set[str], dict]:
+    """扫描存量数据，构建 (跨池 token 集合, {pool_name: {token: 条目字段 dict}})。
+
+    existing_map 中条目的 token 字段已归一化，用作提交数据的合并 base。
+    只扫描一遍，不做 TokenInfo 校验（存量条目原样索引，不丢数据）。
+    同一池内 token 重复时以第一份为合并 base，与合并更新时保留第一处
+    出现位置的策略一致。
+    """
+    existing_set: set[str] = set()
+    existing_map: dict = {}
+    for pool_name, tokens in (existing or {}).items():
+        if not isinstance(tokens, list):
+            continue
+        pool_map: dict = {}
+        for item in tokens:
+            if isinstance(item, str):
+                token_data = {"token": item}
+            elif isinstance(item, dict):
+                token_data = dict(item)
+            else:
+                continue
+            raw_token = token_data.get("token")
+            if raw_token is not None:
+                token_data["token"] = _sanitize_token_text(raw_token)
+            token_key = token_data.get("token")
+            if isinstance(token_key, str) and token_key:
+                existing_set.add(token_key)
+                pool_map.setdefault(token_key, token_data)
+        existing_map[pool_name] = pool_map
+    return existing_set, existing_map
+
+
+def _try_build_token_info(filtered: dict, token_data: dict, pool_name: str):
+    """用合并字段构建 TokenInfo；存量 base 字段损坏时剥离后重试一次。
+
+    提交方自己提供的字段校验失败时不补救（真 invalid，返回 None）；
+    仅 base 带入的损坏字段会被剥离并由模型默认值兜底，使提交可以修复
+    损坏的存量 token，而不是误报 invalid 后原样保留坏数据。
+    """
+    from pydantic import ValidationError
+
+    from grok2api.services.token.models import TokenInfo
+
+    try:
+        return TokenInfo(**filtered)
+    except ValidationError as e:
+        bad_fields = {str(err["loc"][0]) for err in e.errors() if err.get("loc")}
+        if not bad_fields or bad_fields & set(token_data):
+            logger.warning(f"Skip invalid token in pool '{pool_name}': {e}")
+            return None
+        logger.warning(
+            f"Drop invalid existing fields {sorted(bad_fields)} for token "
+            f"'{filtered.get('token')}' in pool '{pool_name}'"
+        )
+        stripped = {k: v for k, v in filtered.items() if k not in bad_fields}
+        try:
+            return TokenInfo(**stripped)
+        except Exception as e2:
+            logger.warning(f"Skip invalid token in pool '{pool_name}': {e2}")
+            return None
+    except Exception as e:
+        logger.warning(f"Skip invalid token in pool '{pool_name}': {e}")
+        return None
+
+
+def _normalize_items(
+    existing_set: set[str],
+    existing_map: dict,
+    data: dict,
+) -> tuple[dict, list[str], int, int]:
+    """归一化提交的 token 数据，并以 existing_map 为 base 按 token 合并。
+
+    base 查找先按目标池精确匹配；目标池不存在该 token 时回退到其他池的
+    存量条目（取第一处出现者），使跨池移动的 token 保留原有字段。
+
+    Args:
+        existing_set: 存量 token 集合（跨池去重）
+        existing_map: _build_existing_index 构建的 {pool_name: {token: 字段 dict}}
+        data: 待归一化的提交数据（{pool_name: [item, ...]}）
+
+    Returns:
+        (normalized, added_tokens, updated_count, invalid_count)
+        - normalized: {pool_name: [TokenInfo.model_dump(), ...]}，可直接 save_tokens；
+          同一 pool 内相同 token 只保留一份（后出现者覆盖先出现者的字段）
+        - added_tokens: 归一化结果中不属于存量的 token（可能跨池重复，调用方自行去重）
+        - updated_count: data 中 token 已存在于存量的有效条目数（按 token 跨池去重）
+        - invalid_count: data 中被丢弃的无效条目数
+    """
+    from grok2api.services.token.models import TokenInfo
+
+    allowed_fields = set(TokenInfo.model_fields.keys())
+    # 跨池 base 索引：token -> 第一处出现的存量条目（目标池查找失败时回退）
+    fallback_map: dict = {}
+    for _pool_map in existing_map.values():
+        for _token_key, _token_fields in _pool_map.items():
+            fallback_map.setdefault(_token_key, _token_fields)
+    normalized: dict = {}
+    added_tokens: list[str] = []
+    updated_seen: set[str] = set()
+    updated_count = 0
+    invalid_count = 0
+    for pool_name, tokens in (data or {}).items():
+        if not isinstance(tokens, list):
+            continue
+        pool_map: dict = {}
+        for item in tokens:
+            if isinstance(item, str):
+                token_data = {"token": item}
+            elif isinstance(item, dict):
+                token_data = dict(item)
+            else:
+                invalid_count += 1
+                continue
+
+            raw_token = token_data.get("token")
+            if raw_token is not None:
+                token_data["token"] = _sanitize_token_text(raw_token)
+            if not token_data.get("token"):
+                logger.warning(f"Skip empty token in pool '{pool_name}'")
+                invalid_count += 1
+                continue
+
+            base = existing_map.get(pool_name, {}).get(token_data.get("token"))
+            if base is None:
+                base = fallback_map.get(token_data.get("token"), {})
+            merged = dict(base)
+            merged.update(token_data)
+            if merged.get("tags") is None:
+                merged["tags"] = []
+
+            filtered = {k: v for k, v in merged.items() if k in allowed_fields}
+            info = _try_build_token_info(filtered, token_data, pool_name)
+            if info is None:
+                invalid_count += 1
+                continue
+
+            if info.token not in pool_map:
+                if info.token in existing_set:
+                    if info.token not in updated_seen:
+                        updated_seen.add(info.token)
+                        updated_count += 1
+                else:
+                    added_tokens.append(info.token)
+            pool_map[info.token] = info.model_dump()
+        normalized[pool_name] = list(pool_map.values())
+
+    return normalized, added_tokens, updated_count, invalid_count
+
+
 @router.get("/tokens/counts", dependencies=[Depends(verify_app_key)])
 async def get_token_counts():
     """获取 Token 池统计计数（轻量，不含完整 token 数据）"""
@@ -138,96 +296,19 @@ async def get_tokens():
 
 @router.post("/tokens", dependencies=[Depends(verify_app_key)])
 async def update_tokens(data: dict):
-    """更新 Token 信息"""
+    """更新 Token 信息（全量替换：仅保存本次提交的 token）"""
     storage = get_storage()
     try:
-        from grok2api.services.token.models import TokenInfo
-
-        existing_tokens: list[str] = []
-        added_tokens: list[str] = []
-
         async with storage.acquire_lock("tokens_save", timeout=10):
             existing = await storage.load_tokens() or {}
-            for pool_name, tokens in existing.items():
-                if not isinstance(tokens, list):
-                    continue
-                for item in tokens:
-                    if isinstance(item, str):
-                        token_val = _sanitize_token_text(item)
-                    elif isinstance(item, dict):
-                        token_val = _sanitize_token_text(item.get("token"))
-                    else:
-                        token_val = ""
-                    if token_val:
-                        existing_tokens.append(token_val)
-
-            normalized = {}
-            allowed_fields = set(TokenInfo.model_fields.keys())
-            existing_map = {}
-            for pool_name, tokens in existing.items():
-                if not isinstance(tokens, list):
-                    continue
-                pool_map = {}
-                for item in tokens:
-                    if isinstance(item, str):
-                        token_data = {"token": item}
-                    elif isinstance(item, dict):
-                        token_data = dict(item)
-                    else:
-                        continue
-                    raw_token = token_data.get("token")
-                    if raw_token is not None:
-                        token_data["token"] = _sanitize_token_text(raw_token)
-                    token_key = token_data.get("token")
-                    if isinstance(token_key, str):
-                        pool_map[token_key] = token_data
-                existing_map[pool_name] = pool_map
-            for pool_name, tokens in (data or {}).items():
-                if not isinstance(tokens, list):
-                    continue
-                pool_list = []
-                for item in tokens:
-                    if isinstance(item, str):
-                        token_data = {"token": item}
-                    elif isinstance(item, dict):
-                        token_data = dict(item)
-                    else:
-                        continue
-
-                    raw_token = token_data.get("token")
-                    if raw_token is not None:
-                        token_data["token"] = _sanitize_token_text(raw_token)
-                    if not token_data.get("token"):
-                        logger.warning(f"Skip empty token in pool '{pool_name}'")
-                        continue
-
-                    base = existing_map.get(pool_name, {}).get(
-                        token_data.get("token"), {}
-                    )
-                    merged = dict(base)
-                    merged.update(token_data)
-                    if merged.get("tags") is None:
-                        merged["tags"] = []
-
-                    filtered = {k: v for k, v in merged.items() if k in allowed_fields}
-                    try:
-                        info = TokenInfo(**filtered)
-                        pool_list.append(info.model_dump())
-                    except Exception as e:
-                        logger.warning(f"Skip invalid token in pool '{pool_name}': {e}")
-                        continue
-                normalized[pool_name] = pool_list
+            existing_set, existing_map = _build_existing_index(existing)
+            normalized, added_tokens, _, _ = _normalize_items(
+                existing_set, existing_map, data
+            )
 
             await storage.save_tokens(normalized)
             mgr = await get_token_manager()
             await mgr.reload()
-
-            existing_set = set(existing_tokens)
-            for pool_tokens in normalized.values():
-                for item in pool_tokens:
-                    token_val = _sanitize_token_text(item.get("token")) if isinstance(item, dict) else ""
-                    if token_val and token_val not in existing_set:
-                        added_tokens.append(token_val)
 
         concurrency = _resolve_nsfw_refresh_concurrency()
         retries = _resolve_nsfw_refresh_retries()
@@ -238,6 +319,107 @@ async def update_tokens(data: dict):
         )
 
         return {"status": "success", "message": "Token 已更新"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/tokens/add", dependencies=[Depends(verify_app_key)])
+async def add_tokens(data: dict):
+    """增量添加 Token。
+
+    保留全部现有 token（存量条目原样保留，不做二次校验，避免静默丢数据）；
+    提交的 token 不存在时新增，已存在时合并更新其字段（同池重复条目收敛为一份）；
+    已有 token 被提交到其他池时视为跨池移动：从原池移除（含重复条目），
+    原有字段保留，计为 updated 且不触发后台刷新。
+    存量条目中损坏的字段在校验失败时会被剥离并以模型默认值兜底，
+    使提交可以修复损坏 token；提交方自己提供的字段校验失败仍计 invalid。
+    仅对新添加的 token 触发后台账户设置刷新。
+    """
+    storage = get_storage()
+    try:
+        async with storage.acquire_lock("tokens_save", timeout=10):
+            existing = await storage.load_tokens() or {}
+            existing_set, existing_map = _build_existing_index(existing)
+            submitted, added_tokens, updated_count, invalid_count = _normalize_items(
+                existing_set, existing_map, data
+            )
+
+            added_tokens = list(dict.fromkeys(added_tokens))
+            if not added_tokens and updated_count == 0:
+                raise HTTPException(status_code=400, detail="No valid tokens provided")
+
+            # 提交 token -> 目标池集合，用于识别跨池移动
+            submitted_pools: dict[str, set[str]] = {}
+            for pool_name, items in submitted.items():
+                for item in items:
+                    submitted_pools.setdefault(item["token"], set()).add(pool_name)
+
+            # 以存量为基底原地合并：存量条目保持位置与内容不变；
+            # 本次提交的条目按 token 覆盖对应位置，新 token 追加到池尾；
+            # 跨池移动的 token 从原池移除（含原池中的重复条目）；
+            # 同池内被提交 token 的重复条目只保留第一份（随后被合并条目覆盖）
+            normalized: dict = {}
+            for pool_name, tokens in existing.items():
+                if not isinstance(tokens, list):
+                    # 非 list 的损坏存量：本次未提交该池时原样透传，避免静默丢数据；
+                    # 提交了该池时由提交数据整体替换（下方 submitted 循环兜底）
+                    if pool_name not in submitted:
+                        normalized[pool_name] = tokens
+                    continue
+                submitted_keys = {
+                    item["token"] for item in submitted.get(pool_name, [])
+                }
+                seen_submitted: set[str] = set()
+                pool_list = []
+                for item in tokens:
+                    key = _item_token_key(item)
+                    target_pools = submitted_pools.get(key) if key else None
+                    if target_pools and pool_name not in target_pools:
+                        continue
+                    if key and key in submitted_keys:
+                        if key in seen_submitted:
+                            continue
+                        seen_submitted.add(key)
+                    pool_list.append(item)
+                positions: dict[str, int] = {}
+                for idx, item in enumerate(pool_list):
+                    key = _item_token_key(item)
+                    if key and key not in positions:
+                        positions[key] = idx
+                for item in submitted.get(pool_name, []):
+                    token_key = item["token"]
+                    if token_key in positions:
+                        pool_list[positions[token_key]] = item
+                    else:
+                        positions[token_key] = len(pool_list)
+                        pool_list.append(item)
+                normalized[pool_name] = pool_list
+            for pool_name, items in submitted.items():
+                if pool_name not in normalized:
+                    normalized[pool_name] = items
+
+            await storage.save_tokens(normalized)
+            mgr = await get_token_manager()
+            await mgr.reload()
+
+        concurrency = _resolve_nsfw_refresh_concurrency()
+        retries = _resolve_nsfw_refresh_retries()
+        _trigger_account_settings_refresh_background(
+            tokens=added_tokens,
+            concurrency=concurrency,
+            retries=retries,
+        )
+
+        return {
+            "status": "success",
+            "summary": {
+                "added": len(added_tokens),
+                "updated": updated_count,
+                "invalid": invalid_count,
+            },
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
