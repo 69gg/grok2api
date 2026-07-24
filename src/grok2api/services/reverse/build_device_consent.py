@@ -113,6 +113,7 @@ def approve_device_with_sso_protocol(
 
     last_err: BaseException | None = None
     for attempt in range(max(retries, 1)):
+        sess: Any | None = None
         try:
             sess = _session(proxy)
             _set_sso_cookies(sess, sso)
@@ -193,6 +194,12 @@ def approve_device_with_sso_protocol(
             import time
 
             time.sleep(1.0 * (attempt + 1))
+        finally:
+            if sess is not None:
+                try:
+                    sess.close()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"protocol consent session close failed: {exc}")
     assert last_err is not None
     raise RuntimeError(f"protocol device consent failed: {last_err}") from last_err
 

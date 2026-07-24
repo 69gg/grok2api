@@ -61,10 +61,25 @@ def test_build_command_no_headless_flag() -> None:
     assert "--debug" in cmd
 
 
-def test_stop_clears_unowned_existing_process_reference() -> None:
+def test_build_command_passes_browser_recycle_limits() -> None:
     process = TurnstileSolverProcess(
-        SolverConfig(url="http://127.0.0.1:5072", auto_start=True)
+        SolverConfig(
+            url="http://127.0.0.1:5072",
+            browser_recycle_seconds=7200,
+            browser_recycle_tasks=42,
+        )
     )
+    process._python_exe = "/usr/bin/python3"
+    process._actual_browser_type = "camoufox"
+
+    cmd = process._build_command("127.0.0.1", 5072)
+
+    assert cmd[cmd.index("--browser-recycle-seconds") + 1] == "7200"
+    assert cmd[cmd.index("--browser-recycle-tasks") + 1] == "42"
+
+
+def test_stop_clears_unowned_existing_process_reference() -> None:
+    process = TurnstileSolverProcess(SolverConfig(url="http://127.0.0.1:5072", auto_start=True))
     process._process = object()  # type: ignore[assignment]
     process._started_by_us = False
 

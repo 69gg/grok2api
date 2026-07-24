@@ -7,6 +7,10 @@ from grok2api.core.auth import verify_app_key
 from grok2api.core.config import config
 from grok2api.core.storage import get_storage as resolve_storage, LocalStorage, RedisStorage, SQLStorage
 from grok2api.core.logger import logger
+from grok2api.services.register.solver import (
+    DEFAULT_SOLVER_BROWSER_RECYCLE_SECONDS,
+    DEFAULT_SOLVER_BROWSER_RECYCLE_TASKS,
+)
 
 router = APIRouter()
 
@@ -24,6 +28,8 @@ REGISTER_DEFAULTS = {
     "solver_debug": False,
     "solver_headless": True,
     "solver_proxy_url": "",
+    "solver_browser_recycle_seconds": DEFAULT_SOLVER_BROWSER_RECYCLE_SECONDS,
+    "solver_browser_recycle_tasks": DEFAULT_SOLVER_BROWSER_RECYCLE_TASKS,
     "max_errors": 0,
     "max_runtime_minutes": 0,
 }

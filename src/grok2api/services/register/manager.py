@@ -13,7 +13,21 @@ from grok2api.core.config import get_config
 from grok2api.core.logger import logger
 from grok2api.services.token.manager import get_token_manager
 from grok2api.services.register.runner import RegisterRunner
-from grok2api.services.register.solver import SolverConfig, TurnstileSolverProcess
+from grok2api.services.register.solver import (
+    DEFAULT_SOLVER_BROWSER_RECYCLE_SECONDS,
+    DEFAULT_SOLVER_BROWSER_RECYCLE_TASKS,
+    SolverConfig,
+    TurnstileSolverProcess,
+)
+
+
+def _as_non_negative_int(value: object, default: int) -> int:
+    if not isinstance(value, (str, int, float)):
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -189,6 +203,20 @@ class AutoRegisterManager:
             or get_config("proxy.base_proxy_url", "")
             or ""
         ).strip()
+        browser_recycle_seconds = _as_non_negative_int(
+            get_config(
+                "register.solver_browser_recycle_seconds",
+                DEFAULT_SOLVER_BROWSER_RECYCLE_SECONDS,
+            ),
+            DEFAULT_SOLVER_BROWSER_RECYCLE_SECONDS,
+        )
+        browser_recycle_tasks = _as_non_negative_int(
+            get_config(
+                "register.solver_browser_recycle_tasks",
+                DEFAULT_SOLVER_BROWSER_RECYCLE_TASKS,
+            ),
+            DEFAULT_SOLVER_BROWSER_RECYCLE_TASKS,
+        )
 
         solver_cfg = SolverConfig(
             url=str(solver_url or "http://127.0.0.1:5072"),
@@ -198,6 +226,8 @@ class AutoRegisterManager:
             auto_start=auto_start_solver,
             proxy_url=solver_proxy,
             headless=solver_headless,
+            browser_recycle_seconds=browser_recycle_seconds,
+            browser_recycle_tasks=browser_recycle_tasks,
         )
         solver = TurnstileSolverProcess(solver_cfg)
         self._solver = solver
@@ -253,6 +283,16 @@ class AutoRegisterManager:
                     job.error = f"Too many failures ({job.errors}/{max_errors}). Check register config/solver."
                     job.stop_event.set()
 
+        def _on_success(
+            _email: str,
+            _password: str,
+            token: str,
+            _done: int,
+            _total: int,
+        ) -> None:
+            job.record_success(token)
+            token_queue.put(token)
+
         async def _watchdog() -> None:
             if not max_runtime_sec:
                 return
@@ -279,10 +319,7 @@ class AutoRegisterManager:
                 target_count=job.total,
                 thread_count=job.register_threads,
                 stop_event=job.stop_event,
-                on_success=lambda _email, _password, token, _done, _total: (
-                    job.record_success(token),
-                    token_queue.put(token),
-                ),
+                on_success=_on_success,
                 on_error=_on_error,
             )
             logger.info(

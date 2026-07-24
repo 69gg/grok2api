@@ -138,6 +138,10 @@ refresh_lead_sec = 300
 auto_refresh_enabled = true
 auto_refresh_interval_sec = 120
 auto_refresh_max_tokens = 50
+# OIDC 后台 auto-init/refresh 整轮失败后的指数退避初始值（秒）；0 表示禁用
+background_failure_backoff_initial_sec = 300
+# OIDC 后台失败指数退避上限（秒）
+background_failure_backoff_max_sec = 3600
 # refresh_token 被吊销（invalid_grant）时，用 sso_source 自动重新 device mint
 remint_on_revoked = true
 # remint 失败后的冷却（秒），避免对失效 SSO 死循环 mint
@@ -187,6 +191,10 @@ solver_debug = false
 solver_headless = true
 # 仅给 solver 浏览器用的代理；空则尝试 proxy.base_proxy_url，仍空则直连
 solver_proxy_url = ""
+# 单个 solver 浏览器的最长存活时间（秒）；到期会在当前任务结束后重建，0 表示禁用
+solver_browser_recycle_seconds = 21600
+# 单个 solver 浏览器完成多少个任务后重建；0 表示禁用
+solver_browser_recycle_tasks = 100
 # 最大错误次数，0 表示不限制（持续重试直到完成 target 或手动 stop）
 max_errors = 0
 # 最大运行时间（分钟），0 表示不限制

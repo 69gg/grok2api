@@ -8,6 +8,7 @@ from typing import AsyncIterator
 import pytest
 
 from grok2api.services.grok.services import chat as chat_module
+from grok2api.services.reverse import build_device_consent as device_consent_module
 from grok2api.services.reverse import build_native as build_native_module
 from grok2api.services.reverse.build_native import (
     BuildNativeResponse,
@@ -24,6 +25,89 @@ class _FakeBuildResponse:
 
 def _no_proxy(*_keys: str) -> CurlCffiProxyKwargs:
     return CurlCffiProxyKwargs(None, None, None)
+
+
+class _FakeCookies:
+    def set(self, _name: str, _value: str, **_kwargs: object) -> None:
+        return None
+
+
+class _FakeConsentResponse:
+    def __init__(
+        self,
+        status_code: int = 200,
+        *,
+        url: str = "https://accounts.x.ai/account",
+        location: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self.url = url
+        self.headers: dict[str, str] = {"location": location}
+        self.text = ""
+
+
+def test_device_consent_closes_session_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.cookies = _FakeCookies()
+            self.close_count = 0
+
+        def get(self, url: str, **_kwargs: object) -> _FakeConsentResponse:
+            return _FakeConsentResponse(url=url)
+
+        def post(self, url: str, **_kwargs: object) -> _FakeConsentResponse:
+            if url == device_consent_module.DEVICE_VERIFY_URL:
+                return _FakeConsentResponse(
+                    status_code=303,
+                    location="/oauth2/device/consent?user_code=ABCD-EFGH",
+                )
+            return _FakeConsentResponse(
+                status_code=303,
+                location="/oauth2/device/done",
+            )
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    session = FakeSession()
+    monkeypatch.setattr(device_consent_module, "_session", lambda _proxy: session)
+
+    device_consent_module.approve_device_with_sso_protocol(
+        user_code="ABCD-EFGH",
+        sso_token="sso-token",
+        retries=1,
+    )
+
+    assert session.close_count == 1
+
+
+def test_device_consent_closes_session_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.cookies = _FakeCookies()
+            self.close_count = 0
+
+        def get(self, _url: str, **_kwargs: object) -> _FakeConsentResponse:
+            raise RuntimeError("connection reset")
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    session = FakeSession()
+    monkeypatch.setattr(device_consent_module, "_session", lambda _proxy: session)
+
+    with pytest.raises(RuntimeError, match="connection reset"):
+        device_consent_module.approve_device_with_sso_protocol(
+            user_code="ABCD-EFGH",
+            sso_token="sso-token",
+            retries=1,
+        )
+
+    assert session.close_count == 1
 
 
 @pytest.mark.asyncio

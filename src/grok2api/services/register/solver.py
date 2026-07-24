@@ -15,6 +15,9 @@ from urllib.parse import urlparse
 from grok2api.core.logger import logger
 from grok2api.core.paths import DATA_DIR, PROJECT_ROOT
 
+DEFAULT_SOLVER_BROWSER_RECYCLE_SECONDS = 6 * 60 * 60
+DEFAULT_SOLVER_BROWSER_RECYCLE_TASKS = 100
+
 
 def _wait_for_port(host: str, port: int, timeout: float = 20.0) -> bool:
     deadline = time.time() + timeout
@@ -37,6 +40,9 @@ class SolverConfig:
     proxy_url: str = ""
     # True = headless browsers; False = headed (needs DISPLAY), often better vs CF.
     headless: bool = True
+    # Recreate long-lived browsers to release renderer/runtime high-water memory.
+    browser_recycle_seconds: int = DEFAULT_SOLVER_BROWSER_RECYCLE_SECONDS
+    browser_recycle_tasks: int = DEFAULT_SOLVER_BROWSER_RECYCLE_TASKS
 
 
 class TurnstileSolverProcess:
@@ -223,6 +229,12 @@ class TurnstileSolverProcess:
             cmd.append("--debug")
         if not self.config.headless:
             cmd.append("--no-headless")
+        cmd += [
+            "--browser-recycle-seconds",
+            str(max(0, int(self.config.browser_recycle_seconds))),
+            "--browser-recycle-tasks",
+            str(max(0, int(self.config.browser_recycle_tasks))),
+        ]
         cmd += ["--host", host, "--port", str(port)]
         return cmd
 
@@ -254,17 +266,18 @@ class TurnstileSolverProcess:
                     "Turnstile solver debug enabled: expect detailed CAPTCHA page snapshots "
                     "and create/poll logs from the solver process"
                 )
-            kwargs = {
-                "cwd": str(script.parent),
-            }
             if sys.platform.startswith("win"):
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                self._process = subprocess.Popen(
+                    cmd,
+                    cwd=str(script.parent),
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
             else:
-                kwargs["start_new_session"] = True
-            self._process = subprocess.Popen(
-                cmd,
-                **kwargs,
-            )
+                self._process = subprocess.Popen(
+                    cmd,
+                    cwd=str(script.parent),
+                    start_new_session=True,
+                )
             self._started_by_us = True
 
             if not _wait_for_port(host, port, timeout=60.0):

@@ -19,6 +19,8 @@ uv run granian --interface asgi grok2api.main:app --host 0.0.0.0 --port 8000
 - `token.console_team_auto_init_enabled`：默认开启。服务会为缺少 `console_team_id` 的 `ssoBasic` 主动调用 Console `CreateTeam`，并把每号 team id 持久化到账号数据；请求命中缺字段账号时也会先补全再访问 Console。
 - `[build]`：Free Grok 4.5 / Composer CLI 通道，**默认全开**（pull 后无需改配置即可用）。后台会像 Console team 一样**静默**为已有 `ssoBasic` 账号铸 OIDC 到 `oidcBuild` 池；请求只轮询**已有 auth** 的号，并按需 `refresh_token` 续期。代理走 `console_proxy_url`。详见 `docs/build_cli_protocol.md`。
 - `build.transport_max_retry`：单个 OIDC 账号发生传输错误时的重试次数，默认 `3`；它与 `retry.max_retry` 的跨账号轮询相互独立，避免两层重试相乘失控。
+- `build.background_failure_backoff_initial_sec` / `build.background_failure_backoff_max_sec`：OIDC 后台补铸或刷新整轮失败时按账号和任务做指数退避，默认从 `300s` 增长到最多 `3600s`。
+- `register.solver_browser_recycle_seconds` / `register.solver_browser_recycle_tasks`：长期运行的本地 solver 会按浏览器存活时长或完成任务数重建实例，释放 Camoufox/Chromium 的内存高水位；任一值设为 `0` 可单独关闭对应条件。
 
 ## Cloudflare Clearance
 

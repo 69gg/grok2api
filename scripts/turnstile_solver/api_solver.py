@@ -35,6 +35,9 @@ COLORS = {
     'RESET': '\033[0m',
 }
 
+DEFAULT_BROWSER_RECYCLE_SECONDS = 6 * 60 * 60
+DEFAULT_BROWSER_RECYCLE_TASKS = 100
+
 
 class CustomLogger(logging.Logger):
     @staticmethod
@@ -67,7 +70,21 @@ logger.addHandler(handler)
 
 class TurnstileAPIServer:
 
-    def __init__(self, headless: bool, useragent: Optional[str], debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool = False, browser_name: Optional[str] = None, browser_version: Optional[str] = None, proxy_url: str = ""):
+    def __init__(
+        self,
+        headless: bool,
+        useragent: Optional[str],
+        debug: bool,
+        browser_type: str,
+        thread: int,
+        proxy_support: bool,
+        use_random_config: bool = False,
+        browser_name: Optional[str] = None,
+        browser_version: Optional[str] = None,
+        proxy_url: str = "",
+        browser_recycle_seconds: int = DEFAULT_BROWSER_RECYCLE_SECONDS,
+        browser_recycle_tasks: int = DEFAULT_BROWSER_RECYCLE_TASKS,
+    ) -> None:
         self.app = Quart(__name__)
         self.debug = debug
         self.browser_type = browser_type
@@ -82,6 +99,10 @@ class TurnstileAPIServer:
         self._shutting_down = False
         self._browser_instances: dict[int, object] = {}
         self._browser_configs: dict[int, dict] = {}
+        self._browser_started_at: dict[int, float] = {}
+        self._browser_completed_tasks: dict[int, int] = {}
+        self.browser_recycle_seconds = max(0, int(browser_recycle_seconds))
+        self.browser_recycle_tasks = max(0, int(browser_recycle_tasks))
         self.use_random_config = use_random_config
         self.browser_name = browser_name
         self.browser_version = browser_version
@@ -274,6 +295,9 @@ class TurnstileAPIServer:
     async def _close_browser(self, index: int, browser, reason: str = "") -> None:
         """Best-effort close for a browser instance."""
         self._browser_instances.pop(index, None)
+        self._browser_configs.pop(index, None)
+        self._browser_started_at.pop(index, None)
+        self._browser_completed_tasks.pop(index, None)
         if self.debug:
             logger.debug(f"Browser {index}: closing browser ({reason or 'no reason'})")
         try:
@@ -315,6 +339,8 @@ class TurnstileAPIServer:
 
         self._browser_instances[index] = browser
         self._browser_configs[index] = config
+        self._browser_started_at[index] = time.monotonic()
+        self._browser_completed_tasks[index] = 0
         return browser
 
     async def _replace_browser(self, index: int, browser, browser_config: dict, reason: str = "") -> None:
@@ -344,6 +370,34 @@ class TurnstileAPIServer:
             logger.warning(f"Browser {index}: failed to inspect browser state, replacing: {str(e)}")
 
         if connected:
+            now = time.monotonic()
+            completed_tasks = self._browser_completed_tasks.get(index, 0) + 1
+            self._browser_completed_tasks[index] = completed_tasks
+            started_at = self._browser_started_at.setdefault(index, now)
+            age_seconds = max(0.0, now - started_at)
+
+            recycle_reason = ""
+            if (
+                self.browser_recycle_tasks > 0
+                and completed_tasks >= self.browser_recycle_tasks
+            ):
+                recycle_reason = f"completed {completed_tasks} tasks"
+            elif (
+                self.browser_recycle_seconds > 0
+                and age_seconds >= self.browser_recycle_seconds
+            ):
+                recycle_reason = f"age {int(age_seconds)}s"
+
+            if recycle_reason:
+                logger.info(f"Browser {index}: recycling after {recycle_reason}")
+                await self._replace_browser(
+                    index,
+                    browser,
+                    browser_config,
+                    reason=f"recycle ({recycle_reason})",
+                )
+                return
+
             self._browser_instances[index] = browser
             self._browser_configs[index] = browser_config
             await self.browser_pool.put((index, browser, browser_config))
@@ -1640,13 +1694,41 @@ def parse_args():
     parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
     parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')
     parser.add_argument('--version', type=str, help='Specify browser version to use (e.g., 139, 141)')
+    parser.add_argument('--browser-recycle-seconds', type=int, default=DEFAULT_BROWSER_RECYCLE_SECONDS, help='Recreate each browser after this many seconds; 0 disables age-based recycling.')
+    parser.add_argument('--browser-recycle-tasks', type=int, default=DEFAULT_BROWSER_RECYCLE_TASKS, help='Recreate each browser after this many completed tasks; 0 disables task-based recycling.')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')
     parser.add_argument('--port', type=str, default='5072', help='Set the port for the API solver to listen on. (Default: 5072)')
     return parser.parse_args()
 
 
-def create_app(headless: bool, useragent: str, debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool, browser_name: str, browser_version: str, proxy_url: str = "") -> Quart:
-    server = TurnstileAPIServer(headless=headless, useragent=useragent, debug=debug, browser_type=browser_type, thread=thread, proxy_support=proxy_support, use_random_config=use_random_config, browser_name=browser_name, browser_version=browser_version, proxy_url=proxy_url)
+def create_app(
+    headless: bool,
+    useragent: Optional[str],
+    debug: bool,
+    browser_type: str,
+    thread: int,
+    proxy_support: bool,
+    use_random_config: bool,
+    browser_name: Optional[str],
+    browser_version: Optional[str],
+    proxy_url: str = "",
+    browser_recycle_seconds: int = DEFAULT_BROWSER_RECYCLE_SECONDS,
+    browser_recycle_tasks: int = DEFAULT_BROWSER_RECYCLE_TASKS,
+) -> Quart:
+    server = TurnstileAPIServer(
+        headless=headless,
+        useragent=useragent,
+        debug=debug,
+        browser_type=browser_type,
+        thread=thread,
+        proxy_support=proxy_support,
+        use_random_config=use_random_config,
+        browser_name=browser_name,
+        browser_version=browser_version,
+        proxy_url=proxy_url,
+        browser_recycle_seconds=browser_recycle_seconds,
+        browser_recycle_tasks=browser_recycle_tasks,
+    )
     return server.app
 
 
@@ -1675,5 +1757,7 @@ if __name__ == '__main__':
             browser_name=args.browser,
             browser_version=args.version,
             proxy_url=proxy_url,
+            browser_recycle_seconds=max(0, args.browser_recycle_seconds),
+            browser_recycle_tasks=max(0, args.browser_recycle_tasks),
         )
         app.run(host=args.host, port=int(args.port))

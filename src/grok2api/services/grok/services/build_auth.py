@@ -23,6 +23,7 @@ from grok2api.services.reverse.build_constants import (
 )
 from grok2api.services.reverse.build_native import BUILD_PROXY_KEYS
 from grok2api.services.reverse.build_oauth import (
+    DeviceCodeSession,
     OAuthDeviceError,
     OAuthRefreshError,
     TokenBundle,
@@ -36,6 +37,14 @@ from grok2api.services.token import get_token_manager
 from grok2api.services.token.models import TokenInfo, TokenStatus
 
 SSO_SOURCE_POOL = "ssoBasic"
+BACKGROUND_INIT_SCOPE = "auto_init"
+BACKGROUND_REFRESH_SCOPE = "auto_refresh"
+DEFAULT_BACKGROUND_FAILURE_BACKOFF_INITIAL_SEC = 300
+DEFAULT_BACKGROUND_FAILURE_BACKOFF_MAX_SEC = 3600
+_BACKGROUND_BACKOFF_MAX_EXPONENT = 20
+
+_BackgroundBackoffKey = tuple[str, str | None]
+_BackgroundBackoffState = tuple[int, float]
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -103,6 +112,7 @@ class BuildAuthService:
 
     _mint_locks: dict[str, asyncio.Lock] = {}
     _mint_locks_guard = asyncio.Lock()
+    _background_backoffs: dict[_BackgroundBackoffKey, _BackgroundBackoffState] = {}
 
     @classmethod
     async def _mint_lock(cls, key: str) -> asyncio.Lock:
@@ -112,6 +122,65 @@ class BuildAuthService:
                 lock = asyncio.Lock()
                 cls._mint_locks[key] = lock
             return lock
+
+    @staticmethod
+    def _background_backoff_limits() -> tuple[int, int]:
+        initial = _as_int(
+            get_config(
+                "build.background_failure_backoff_initial_sec",
+                DEFAULT_BACKGROUND_FAILURE_BACKOFF_INITIAL_SEC,
+            ),
+            DEFAULT_BACKGROUND_FAILURE_BACKOFF_INITIAL_SEC,
+            minimum=0,
+        )
+        maximum = _as_int(
+            get_config(
+                "build.background_failure_backoff_max_sec",
+                DEFAULT_BACKGROUND_FAILURE_BACKOFF_MAX_SEC,
+            ),
+            DEFAULT_BACKGROUND_FAILURE_BACKOFF_MAX_SEC,
+            minimum=0,
+        )
+        if initial <= 0:
+            return 0, 0
+        return initial, max(initial, maximum)
+
+    @classmethod
+    def _background_backoff_remaining(cls, scope: str, key: str | None) -> float:
+        initial, _ = cls._background_backoff_limits()
+        state_key = (scope, key)
+        if initial <= 0:
+            cls._background_backoffs.pop(state_key, None)
+            return 0.0
+        state = cls._background_backoffs.get(state_key)
+        if state is None:
+            return 0.0
+        return max(0.0, state[1] - time.monotonic())
+
+    @classmethod
+    def _background_backoff_has_failures(cls, scope: str, key: str) -> bool:
+        return (scope, key) in cls._background_backoffs
+
+    @classmethod
+    def _record_background_failure(cls, scope: str, key: str | None) -> int:
+        initial, maximum = cls._background_backoff_limits()
+        state_key = (scope, key)
+        if initial <= 0:
+            cls._background_backoffs.pop(state_key, None)
+            return 0
+        previous = cls._background_backoffs.get(state_key)
+        failures = (previous[0] if previous is not None else 0) + 1
+        exponent = min(failures - 1, _BACKGROUND_BACKOFF_MAX_EXPONENT)
+        delay = min(maximum, initial * (2**exponent))
+        cls._background_backoffs[state_key] = (
+            failures,
+            time.monotonic() + delay,
+        )
+        return delay
+
+    @classmethod
+    def _clear_background_failure(cls, scope: str, key: str | None) -> None:
+        cls._background_backoffs.pop((scope, key), None)
 
     @staticmethod
     def _proxy_url() -> Optional[str]:
@@ -341,8 +410,9 @@ class BuildAuthService:
             return False
         return int(time.time() * 1000) - last_fail < cooldown * 1000
 
-    @staticmethod
+    @classmethod
     async def refresh_expiring_cli_tokens(
+        cls,
         *,
         max_tokens: int = 50,
         pool_name: str = CLI_POOL_NAME,
@@ -351,6 +421,13 @@ class BuildAuthService:
 
         Permanently revoked refresh tokens are reminted via linked sso_source.
         """
+        if cls._background_backoff_remaining(BACKGROUND_REFRESH_SCOPE, None) > 0:
+            return 0
+
+        attempt_limit = max(0, int(max_tokens))
+        if attempt_limit == 0:
+            return 0
+
         mgr = await get_token_manager()
         await mgr.reload_if_stale()
         pool = mgr.pools.get(pool_name)
@@ -358,10 +435,9 @@ class BuildAuthService:
             return 0
         lead = _as_int(get_config("build.refresh_lead_sec", REFRESH_LEAD_SEC), REFRESH_LEAD_SEC)
         now_ms = int(time.time() * 1000)
-        refreshed = 0
+        fresh_candidates: list[TokenInfo] = []
+        retry_candidates: list[TokenInfo] = []
         for info in list(pool.list()):
-            if refreshed >= max_tokens:
-                break
             has_refresh = bool((info.refresh_token or "").strip())
             needs_remint_only = (
                 not has_refresh
@@ -373,15 +449,43 @@ class BuildAuthService:
             expired_at = int(info.expired_at or 0)
             if has_refresh and expired_at and now_ms < expired_at - lead * 1000:
                 continue
-            try:
-                updated = await BuildAuthService.refresh_token_info(
-                    info, pool_name, force=True
+            if cls._background_backoff_remaining(BACKGROUND_REFRESH_SCOPE, info.token) > 0:
+                continue
+            target = (
+                retry_candidates
+                if cls._background_backoff_has_failures(
+                    BACKGROUND_REFRESH_SCOPE, info.token
                 )
+                else fresh_candidates
+            )
+            target.append(info)
+            if target is fresh_candidates and len(fresh_candidates) >= attempt_limit:
+                break
+
+        candidates = (fresh_candidates + retry_candidates)[:attempt_limit]
+        refreshed = 0
+        for info in candidates:
+            try:
+                updated = await cls.refresh_token_info(info, pool_name, force=True)
                 if token_has_cli_auth(updated):
+                    cls._clear_background_failure(BACKGROUND_REFRESH_SCOPE, info.token)
                     refreshed += 1
+                else:
+                    cls._record_background_failure(BACKGROUND_REFRESH_SCOPE, info.token)
             except Exception as exc:
                 # refresh_token_info already attempted remint on revoked; still log.
                 logger.warning("CLI scheduled refresh failed {}: {}", info.token[:16], exc)
+                cls._record_background_failure(BACKGROUND_REFRESH_SCOPE, info.token)
+        if refreshed:
+            cls._clear_background_failure(BACKGROUND_REFRESH_SCOPE, None)
+        elif candidates:
+            delay = cls._record_background_failure(BACKGROUND_REFRESH_SCOPE, None)
+            if delay:
+                logger.warning(
+                    "CLI scheduled refresh: all {} attempts failed; backing off {}s",
+                    len(candidates),
+                    delay,
+                )
         if refreshed:
             logger.info("CLI OIDC scheduled refresh: {} tokens", refreshed)
         return refreshed
@@ -413,13 +517,14 @@ class BuildAuthService:
         )
 
         protocol_err: Exception | None = None
-        session = None
+        session: DeviceCodeSession | None = None
 
         for round_idx in range(max_rounds):
-            session = await asyncio.to_thread(request_device_code, proxy=proxy)
+            current_session = await asyncio.to_thread(request_device_code, proxy=proxy)
+            session = current_session
             log(
-                f"device_code ok user_code={session.user_code} "
-                f"uri={session.verification_uri_complete} "
+                f"device_code ok user_code={current_session.user_code} "
+                f"uri={current_session.verification_uri_complete} "
                 f"(round {round_idx + 1}/{max_rounds})"
             )
 
@@ -429,7 +534,7 @@ class BuildAuthService:
             try:
                 await asyncio.to_thread(
                     approve_device_with_sso_protocol,
-                    user_code=session.user_code,
+                    user_code=current_session.user_code,
                     sso_token=sso_token,
                     proxy=proxy,
                     log=log,
@@ -570,6 +675,12 @@ class BuildAuthService:
             return 0
         if not _as_bool(get_config("build.auto_init_from_sso_enabled", True), True):
             return 0
+        if cls._background_backoff_remaining(BACKGROUND_INIT_SCOPE, None) > 0:
+            return 0
+
+        attempt_limit = max(0, int(max_tokens))
+        if attempt_limit == 0:
+            return 0
 
         mgr = await get_token_manager()
         await mgr.reload_if_stale()
@@ -585,7 +696,8 @@ class BuildAuthService:
                 if info.sso_source and token_has_cli_auth(info):
                     existing_sso.add(info.sso_source)
 
-        candidates: list[TokenInfo] = []
+        fresh_candidates: list[TokenInfo] = []
+        retry_candidates: list[TokenInfo] = []
         for info in source.list():
             if info.status != TokenStatus.ACTIVE:
                 continue
@@ -606,9 +718,18 @@ class BuildAuthService:
                         sso_source=info.token,
                     )
                 continue
-            candidates.append(info)
-            if len(candidates) >= max_tokens:
+            if cls._background_backoff_remaining(BACKGROUND_INIT_SCOPE, info.token) > 0:
+                continue
+            target = (
+                retry_candidates
+                if cls._background_backoff_has_failures(BACKGROUND_INIT_SCOPE, info.token)
+                else fresh_candidates
+            )
+            target.append(info)
+            if target is fresh_candidates and len(fresh_candidates) >= attempt_limit:
                 break
+
+        candidates = (fresh_candidates + retry_candidates)[:attempt_limit]
 
         if not candidates:
             return 0
@@ -629,9 +750,22 @@ class BuildAuthService:
                     info.token, email=info.email or "", trigger=trigger
                 )
                 if result is not None:
+                    cls._clear_background_failure(BACKGROUND_INIT_SCOPE, info.token)
                     done += 1
+                else:
+                    cls._record_background_failure(BACKGROUND_INIT_SCOPE, info.token)
 
         await asyncio.gather(*[_one(c) for c in candidates])
+        if done:
+            cls._clear_background_failure(BACKGROUND_INIT_SCOPE, None)
+        else:
+            delay = cls._record_background_failure(BACKGROUND_INIT_SCOPE, None)
+            if delay:
+                logger.warning(
+                    "CLI OIDC auto-init: all {} attempts failed; backing off {}s",
+                    len(candidates),
+                    delay,
+                )
         logger.info("CLI OIDC auto-init done: {}/{} trigger={}", done, len(candidates), trigger)
         return done
 

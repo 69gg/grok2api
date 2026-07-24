@@ -37,6 +37,28 @@ class _FakeSolver:
         self.stopped = True
 
 
+def test_cf_solver_config_includes_browser_recycle_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_get_config(key: str, default: Any = None) -> Any:
+        values: dict[str, Any] = {
+            "register.solver_url": "http://127.0.0.1:5072",
+            "register.solver_browser_type": "camoufox",
+            "register.auto_start_solver": True,
+            "register.solver_browser_recycle_seconds": 1800,
+            "register.solver_browser_recycle_tasks": 12,
+        }
+        return values.get(key, default)
+
+    monkeypatch.setattr(scheduler_module, "get_config", fake_get_config)
+    monkeypatch.setattr(scheduler_module, "get_proxy_url", lambda: "")
+
+    config = scheduler_module._build_cf_solver_config()
+
+    assert config.browser_recycle_seconds == 1800
+    assert config.browser_recycle_tasks == 12
+
+
 @pytest.mark.asyncio
 async def test_cf_refresh_scheduler_stops_solver_and_signals_refresh(
     monkeypatch: pytest.MonkeyPatch,

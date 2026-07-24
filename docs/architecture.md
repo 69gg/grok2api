@@ -8,6 +8,7 @@
   - 本地 Turnstile 解码调试：`register.solver_debug = true` 会给 solver 传 `--debug`，并在主进程 `TurnstileService` 打印 create/poll/CAPTCHA_FAIL 详情；solver 进程会输出页面快照（url/title/iframe/token 长度/console error）及失败原因。
   - 注册 init：先抓 `accounts.x.ai/sign-up` 解析 action_id（带 impersonate 轮换与重试），**再**启动本地 solver，避免 curl_cffi 与 camoufox 并发时偶发 `curl 35 OPENSSL_internal` 直接整 job 失败。
   - 注册 job：默认 `max_errors=0` / `max_runtime_minutes=0` 表示**持续重试直到完成 target**；失败不主动停 job、job 结束也不关 solver（仅进程退出 `stop_job(stop_solver=True)` 时关闭）。
+  - 浏览器回收：每个池内浏览器在完成 `register.solver_browser_recycle_tasks` 个任务或存活 `register.solver_browser_recycle_seconds` 秒后重建，避免长期进程持续保留浏览器运行时的内存高水位；两个条件均支持设为 `0` 禁用。
 - `src/grok2api/services/reverse`：Grok 上游反向调用细节。
 - `src/grok2api/core`：配置、日志、认证、异常、存储和路径。
 - `scripts/turnstile_solver`：本地 solver HTTP 服务，提供 `/turnstile`、`/grok_setup`、`/cf_clearance` 和 `/result`。
@@ -42,6 +43,7 @@ Grok 与 Console Chat / Voice / Image 通道都使用进程内轮询游标：每
 - **refresh 被吊销**：`invalid_grant` / `Refresh token has been revoked` 时，若有 `sso_source` 则自动 device-auth **重新 mint**（`build.remint_on_revoked`，默认开）；失败则清空该号 OIDC 密钥并按 `build.remint_cooldown_sec`（默认 300s）退避，避免死循环。
 - **请求轮询**：只从**已有 auth** 的 `oidcBuild` 账号 round-robin；无可用号时才触发 on-demand mint。
 - **有界传输重试**：单个 OIDC 账号的连接错误由 `build.transport_max_retry` 独立限制；每次重试前关闭旧的 `curl_cffi` session，避免与跨账号轮询形成资源和次数的乘法放大。
+- **后台失败退避**：auto-init / refresh 每轮最多尝试配置数量，而不是以成功数计数；失败账号和全失败任务都会从 `build.background_failure_backoff_initial_sec` 指数退避到 `build.background_failure_backoff_max_sec`，新账号优先于到期重试账号，避免 TLS/代理故障时形成请求风暴。
 - 额度耗尽（`free-usage-exhausted` / `personal-team-blocked:spending-limit` / run out of credits）：该 OIDC 号 cooling 约 24h（`build.free_usage_cooldown_sec`），不影响同号 Console/SSO 其它通道。
 - 协议细节见 `docs/build_cli_protocol.md`。
 

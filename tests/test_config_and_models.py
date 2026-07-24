@@ -63,6 +63,14 @@ def test_build_transport_retry_default_is_bounded() -> None:
     assert config_example["build"]["transport_max_retry"] == 3
 
 
+def test_background_oidc_and_solver_recycle_defaults_are_bounded() -> None:
+    config_example = tomllib.loads((ROOT / "config.toml.example").read_text(encoding="utf-8"))
+    assert config_example["build"]["background_failure_backoff_initial_sec"] == 300
+    assert config_example["build"]["background_failure_backoff_max_sec"] == 3600
+    assert config_example["register"]["solver_browser_recycle_seconds"] == 21600
+    assert config_example["register"]["solver_browser_recycle_tasks"] == 100
+
+
 def test_grok_app_owned_by_includes_platform() -> None:
     assert ModelService.get("grok-4.3-fast").owned_by == "grok-app<grok2api@69gg>"
     assert ModelService.get("grok-4.20-auto").owned_by == "grok-app<grok2api@69gg>"

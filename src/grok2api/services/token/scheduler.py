@@ -9,7 +9,12 @@ from grok2api.core.config import get_config
 from grok2api.core.logger import logger
 from grok2api.core.storage import get_storage, StorageError, RedisStorage
 from grok2api.core.proxy import get_proxy_url
-from grok2api.services.register.solver import SolverConfig, TurnstileSolverProcess
+from grok2api.services.register.solver import (
+    DEFAULT_SOLVER_BROWSER_RECYCLE_SECONDS,
+    DEFAULT_SOLVER_BROWSER_RECYCLE_TASKS,
+    SolverConfig,
+    TurnstileSolverProcess,
+)
 from grok2api.services.token.manager import get_token_manager
 
 CF_CLEARANCE_DEFAULT_INTERVAL_SECONDS = 25 * 60
@@ -101,6 +106,23 @@ def _build_cf_solver_config() -> SolverConfig:
         debug=_as_bool(get_config("register.solver_debug", False), False),
         auto_start=auto_start,
         proxy_url=get_proxy_url(),
+        headless=_as_bool(get_config("register.solver_headless", True), True),
+        browser_recycle_seconds=_as_int(
+            get_config(
+                "register.solver_browser_recycle_seconds",
+                DEFAULT_SOLVER_BROWSER_RECYCLE_SECONDS,
+            ),
+            DEFAULT_SOLVER_BROWSER_RECYCLE_SECONDS,
+            minimum=0,
+        ),
+        browser_recycle_tasks=_as_int(
+            get_config(
+                "register.solver_browser_recycle_tasks",
+                DEFAULT_SOLVER_BROWSER_RECYCLE_TASKS,
+            ),
+            DEFAULT_SOLVER_BROWSER_RECYCLE_TASKS,
+            minimum=0,
+        ),
     )
 
 

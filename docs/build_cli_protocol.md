@@ -43,6 +43,7 @@ POST https://auth.x.ai/oauth2/token
 
 **默认不走浏览器。** `build.mint_allow_browser` 仅作协议失败后的下策。
 TLS/代理失败对 device/token 请求默认多重试（见 `build_oauth._post_form`）。
+后台 auto-init / refresh 会额外对失败账号与全失败任务做进程内指数退避（`build.background_failure_backoff_initial_sec` 到 `build.background_failure_backoff_max_sec`）；每轮上限按实际尝试数计算，避免上游 TLS 故障时扫描整个账号池。
 
 **Consent 重试策略：**
 
@@ -81,4 +82,5 @@ Headers：`Authorization: Bearer` + `x-grok-client-version` / `x-xai-token-auth`
 - 网关：header 透传三端点；`-search` 别名注入 `web_search`
 - 凭证：自动注册（可选）+ device mint；**运行时只靠 refresh 续期**
 - 传输重试：单个 OIDC 账号由 `build.transport_max_retry` 限制（默认 3 次），每次重试前关闭旧 session；账号轮询仍由 `retry.max_retry` 独立控制
+- 后台任务：失败账号与整轮失败分别指数退避，新账号优先于已失败账号；退避状态在进程重启后重置
 - 人机：Turnstile 失败 → 刷新重试（浏览器路径）；协议路径复用 register turnstile solver
